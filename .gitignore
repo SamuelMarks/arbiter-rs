@@ -1,0 +1,199 @@
+# =============================================================================
+# Rust / Cargo
+# =============================================================================
+/target/
+**/target/
+**/*.rs.bk
+*.pdb
+*.dwo
+*.dwp
+
+# Profiling, coverage, and benchmarks
+*.profraw
+*.profdata
+lcov.info
+coverage/
+tarpaulin-report.html
+tarpaulin-report.json
+cobertura.xml
+/flamegraph.svg
+/perf.data*
+/criterion/
+
+# Flamegraph / Valgrind / Heaptrack / Sanitizers
+callgrind.out.*
+cachegrind.out.*
+massif.out.*
+heaptrack.*
+vgcore.*
+core
+core.*
+
+# Cargo-specific / tools
+.cargo-ok
+cargo-timing*.html
+/fuzz/corpus/
+/fuzz/artifacts/
+/fuzz/coverage/
+/mutants.out/
+/mutants.out.old/
+
+# =============================================================================
+# Operating Systems
+# =============================================================================
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+.DocumentRevisions-V100
+.fseventsd
+.Spotlight-V100
+.TemporaryItems
+.Trashes
+.VolumeIcon.icns
+.com.apple.timemachine.donotpresent
+.AppleDB
+.AppleDesktop
+Network Trash Folder
+Temporary Items
+.apdisk
+
+# Linux
+*~
+.fuse_hidden*
+.directory
+.Trash-*
+.nfs*
+
+# Windows
+Thumbs.db
+Thumbs.db:encryptable
+ehthumbs.db
+ehthumbs_vista.db
+*.stackdump
+[Dd]esktop.ini
+$RECYCLE.BIN/
+*.cab
+*.msi
+*.msix
+*.msm
+*.msp
+*.lnk
+
+# =============================================================================
+# IDEs and Editors
+# =============================================================================
+# VS Code / Cursor / Windsurf
+.vscode/*
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+!.vscode/extensions.json
+*.code-workspace
+.history/
+.cursor/
+.windsurf/
+
+# JetBrains (RustRover, IntelliJ, CLion)
+.idea/
+*.iml
+*.iws
+*.ipr
+out/
+cmake-build-*/
+
+# Vim / Neovim
+[._]*.s[a-v][a-z]
+!*.svg
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+[._]sw[a-p]
+Session.vim
+Sessionx.vim
+.netrwhist
+tags
+*.un~
+
+# Emacs
+.#*
+\#*\#
+/.emacs.desktop
+/.emacs.desktop.lock
+*.elc
+auto-save-list
+tramp
+.\#*
+
+# Sublime Text / Helix / Zed
+*.tmlanguage.cache
+*.tmPreferences.cache
+*.stTheme.cache
+*.sublime-workspace
+*.sublime-project
+.zed/
+.helix/
+
+# =============================================================================
+# AI Assistants & CLI Tools
+# =============================================================================
+.gemini/
+.claude/
+.aider*
+.copilot/
+
+# =============================================================================
+# Environment, Secrets, and Certificates
+# =============================================================================
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.pem
+*.key
+*.crt
+*.csr
+*.der
+*.p12
+*.pfx
+secrets/
+credentials/
+
+# =============================================================================
+# Logs, Databases, and Runtime State
+# =============================================================================
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+logs/
+pids/
+*.pid
+*.seed
+*.pid.lock
+
+# Local state / storage / Raft / SQLite / RocksDB
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+*.sqlite3
+*.sqlite3-shm
+*.sqlite3-wal
+data/
+raft-data/
+rocksdb/
+snapshots/
+wal/
+
+# Temporary files
+tmp/
+temp/
+*.tmp
+*.temp
+*.bak
+*.swp
+*.orig
+*.rej

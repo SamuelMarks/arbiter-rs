@@ -1,0 +1,22 @@
+[package]
+name = "arbiter-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Standalone CLI and TUI binary for the Arbiter resource allocator"
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+arbiter-core = { workspace = true }
+arbiter-master = { workspace = true }
+arbiter-sdk = { workspace = true }
+arbiter-tui = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

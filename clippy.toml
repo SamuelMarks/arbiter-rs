@@ -1,0 +1,5 @@
+too-many-arguments-threshold = 10
+type-complexity-threshold = 500
+disallowed-types = [
+    { path = "anyhow::Error", reason = "Use ArbiterError from arbiter-core instead of anyhow" },
+]

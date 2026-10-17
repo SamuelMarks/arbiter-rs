@@ -1,0 +1,88 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/arbiter-core",
+    "crates/arbiter-alloc",
+    "crates/arbiter-store",
+    "crates/arbiter-proto",
+    "crates/arbiter-net",
+    "crates/arbiter-probe",
+    "crates/arbiter-iso",
+    "crates/arbiter-storage",
+    "crates/arbiter-telemetry",
+    "crates/arbiter-master",
+    "crates/arbiter-agent",
+    "crates/arbiter-executor",
+    "crates/arbiter-sdk",
+    "crates/arbiter-tui",
+    "bins/arbiter",
+    "bins/arbiter-master",
+    "bins/arbiter-agent",
+    "bins/arbiter-executor",
+    "bins/arbiter-cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "Apache-2.0 OR MIT"
+repository = "https://github.com/SamuelMarks/arbiter-rs"
+authors = ["Samuel Marks <samuel@offscale.io>"]
+keywords = ["scheduler", "orchestrator", "mesos", "gpu", "tpu"]
+categories = ["concurrency", "network-programming", "os"]
+
+[workspace.dependencies]
+arbiter-core = { path = "crates/arbiter-core", version = "0.1.0" }
+arbiter-alloc = { path = "crates/arbiter-alloc", version = "0.1.0" }
+arbiter-store = { path = "crates/arbiter-store", version = "0.1.0" }
+arbiter-proto = { path = "crates/arbiter-proto", version = "0.1.0" }
+arbiter-net = { path = "crates/arbiter-net", version = "0.1.0" }
+arbiter-probe = { path = "crates/arbiter-probe", version = "0.1.0" }
+arbiter-iso = { path = "crates/arbiter-iso", version = "0.1.0" }
+arbiter-storage = { path = "crates/arbiter-storage", version = "0.1.0" }
+arbiter-telemetry = { path = "crates/arbiter-telemetry", version = "0.1.0" }
+arbiter-master = { path = "crates/arbiter-master", version = "0.1.0" }
+arbiter-agent = { path = "crates/arbiter-agent", version = "0.1.0" }
+arbiter-executor = { path = "crates/arbiter-executor", version = "0.1.0" }
+arbiter-sdk = { path = "crates/arbiter-sdk", version = "0.1.0" }
+arbiter-tui = { path = "crates/arbiter-tui", version = "0.1.0" }
+arbiter-master-bin = { path = "bins/arbiter-master", version = "0.1.0" }
+arbiter-agent-bin = { path = "bins/arbiter-agent", version = "0.1.0" }
+arbiter-executor-bin = { path = "bins/arbiter-executor", version = "0.1.0" }
+arbiter-cli = { path = "bins/arbiter-cli", version = "0.1.0" }
+
+derive_more = { version = "2.0", features = ["display", "error", "from"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+rkyv = "0.8"
+sha2 = "0.10"
+proptest = "=1.6.0"
+
+[workspace.lints.rust]
+missing_docs = "forbid"
+unsafe_code = "forbid"
+
+[workspace.lints.rustdoc]
+broken_intra_doc_links = "forbid"
+private_intra_doc_links = "forbid"
+bare_urls = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+missing_docs_in_private_items = "forbid"
+unwrap_used = "forbid"
+expect_used = "forbid"
+panic = "forbid"
+todo = "forbid"
+unimplemented = "forbid"
+unreachable = "forbid"
+indexing_slicing = "forbid"
+float_arithmetic = "deny"
+multiple_crate_versions = "allow"
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_const_for_fn = "allow"

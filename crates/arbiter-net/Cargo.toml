@@ -1,0 +1,25 @@
+[package]
+name = "arbiter-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Zero-trust security (mTLS, SPIFFE, RBAC/ABAC, AEAD secrets) and dual-protocol QUIC/HTTP transport for Arbiter"
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+arbiter-core = { workspace = true }
+arbiter-proto = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

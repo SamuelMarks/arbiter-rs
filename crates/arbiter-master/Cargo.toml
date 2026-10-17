@@ -1,0 +1,28 @@
+[package]
+name = "arbiter-master"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Master node state machine, scheduling coordinator, and cluster control plane for Arbiter"
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+arbiter-core = { workspace = true }
+arbiter-alloc = { workspace = true }
+arbiter-store = { workspace = true }
+arbiter-proto = { workspace = true }
+arbiter-net = { workspace = true }
+arbiter-telemetry = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true

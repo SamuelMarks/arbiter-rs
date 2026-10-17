@@ -1,0 +1,30 @@
+[package]
+name = "arbiter-agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Agent supervisor loop, local CaaS lease socket, hardware probing, and isolator runner for Arbiter"
+readme = "../../README.md"
+keywords.workspace = true
+categories.workspace = true
+
+[dependencies]
+arbiter-core = { workspace = true }
+arbiter-store = { workspace = true }
+arbiter-proto = { workspace = true }
+arbiter-net = { workspace = true }
+arbiter-probe = { workspace = true }
+arbiter-iso = { workspace = true }
+arbiter-storage = { workspace = true }
+arbiter-telemetry = { workspace = true }
+arbiter-executor = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[lints]
+workspace = true
