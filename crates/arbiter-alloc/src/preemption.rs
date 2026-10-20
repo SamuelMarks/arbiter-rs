@@ -264,6 +264,151 @@ pub fn solve_minimum_disruption_preemption(
     })
 }
 
+/// Computes the scalar disruption cost for evicting `candidate`, applying `caas_primary_penalty`
+/// whenever `candidate.task_id` is in `active_caas_primary_tasks`.
+///
+/// # Arguments
+///
+/// * `candidate` - [`RunningTaskInstance`] being evaluated for eviction.
+/// * `active_caas_primary_tasks` - Set of [`TaskId`]s currently holding a primary `CaaS` election lease.
+/// * `caas_primary_penalty` - Penalty added to `CaaS` primary tasks (e.g., `1_000_000`).
+///
+/// # Returns
+///
+/// Disruption cost score (lower means cheaper to evict).
+pub fn compute_victim_disruption_cost(
+    candidate: &RunningTaskInstance,
+    active_caas_primary_tasks: &BTreeSet<TaskId>,
+    caas_primary_penalty: u64,
+) -> u64 {
+    let base_priority_cost: u64 = match candidate.priority {
+        PriorityClass::Revocable => 10,
+        PriorityClass::SpotPreemptible => 50,
+        PriorityClass::Batch => 100,
+        PriorityClass::ProductionStandard => 1_000,
+        PriorityClass::ProductionHigh => 5_000,
+        PriorityClass::SystemCritical => 10_000,
+    };
+    let revocable_discount: u64 = if candidate.is_revocable { 0 } else { 500 };
+    let primary_cost: u64 = if active_caas_primary_tasks.contains(&candidate.task_id) {
+        caas_primary_penalty
+    } else {
+        0
+    };
+    base_priority_cost
+        .saturating_add(revocable_discount)
+        .saturating_add(primary_cost)
+}
+
+/// Solves for the minimum-disruption victim set on `agent_id` while penalizing active `CaaS` primaries.
+///
+/// Penalizes tasks in `active_caas_primary_tasks` by `caas_primary_penalty` so stateless
+/// tasks and read replicas are always evicted before active primaries.
+///
+/// # Arguments
+///
+/// * `incoming` - Incoming high-priority [`TaskSpec`].
+/// * `agent_id` - Target [`AgentId`].
+/// * `current_free` - Currently unallocated [`ResourceBundle`] on the Agent.
+/// * `running_tasks` - Slice of [`RunningTaskInstance`]s currently executing on the Agent.
+/// * `quota_reclaim` - Whether the incoming task is reclaiming its own guaranteed quota.
+/// * `active_caas_primary_tasks` - Set of [`TaskId`]s currently holding a primary `CaaS` lease.
+/// * `caas_primary_penalty` - Disruption penalty applied to `CaaS` primaries.
+///
+/// # Returns
+///
+/// Minimal [`PreemptionPlan`] ordered by disruption cost.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::PreemptionFailed`] if evicting all eligible victims still cannot
+/// satisfy `incoming.resources`.
+pub fn solve_minimum_disruption_preemption_with_caas_primaries(
+    incoming: &TaskSpec,
+    agent_id: &AgentId,
+    current_free: &ResourceBundle,
+    running_tasks: &[RunningTaskInstance],
+    quota_reclaim: bool,
+    active_caas_primary_tasks: &BTreeSet<TaskId>,
+    caas_primary_penalty: u64,
+) -> ArbiterResult<PreemptionPlan> {
+    if current_free.contains(&incoming.resources) {
+        return Ok(PreemptionPlan {
+            agent_id: agent_id.clone(),
+            victims: Vec::new(),
+            post_eviction_available: current_free.clone(),
+        });
+    }
+
+    let mut eligible: Vec<&RunningTaskInstance> = running_tasks
+        .iter()
+        .filter(|t| {
+            &t.agent_id == agent_id
+                && !matches!(t.preemption_policy, PreemptionPolicy::NonPreemptible)
+                && (t.priority < incoming.priority || (quota_reclaim && t.is_revocable))
+        })
+        .collect();
+
+    eligible.sort_by(|a, b| {
+        let cost_a =
+            compute_victim_disruption_cost(a, active_caas_primary_tasks, caas_primary_penalty);
+        let cost_b =
+            compute_victim_disruption_cost(b, active_caas_primary_tasks, caas_primary_penalty);
+        (cost_a, !a.is_revocable, a.priority, &a.task_id).cmp(&(
+            cost_b,
+            !b.is_revocable,
+            b.priority,
+            &b.task_id,
+        ))
+    });
+
+    let mut accumulated = current_free.clone();
+    let mut selected_ids: BTreeSet<TaskId> = BTreeSet::new();
+    let mut victims: Vec<(TaskId, EvictionAction)> = Vec::new();
+
+    for candidate in &eligible {
+        if selected_ids.contains(&candidate.task_id) {
+            continue;
+        }
+        let batch_to_evict: Vec<&RunningTaskInstance> = candidate.group_id.as_ref().map_or_else(
+            || vec![*candidate],
+            |gid| {
+                eligible
+                    .iter()
+                    .copied()
+                    .filter(|t| {
+                        t.group_id.as_ref() == Some(gid) && !selected_ids.contains(&t.task_id)
+                    })
+                    .collect()
+            },
+        );
+        for victim in batch_to_evict {
+            let action = match victim.preemption_policy {
+                PreemptionPolicy::CheckpointAndSuspend => EvictionAction::CheckpointAndSuspend,
+                PreemptionPolicy::GracefulSigterm => EvictionAction::GracefulSigterm,
+                PreemptionPolicy::ImmediateKill | PreemptionPolicy::NonPreemptible => {
+                    EvictionAction::ImmediateKill
+                }
+            };
+            accumulated = accumulated.try_add(&victim.allocated_resources)?;
+            selected_ids.insert(victim.task_id.clone());
+            victims.push((victim.task_id.clone(), action));
+        }
+        if accumulated.contains(&incoming.resources) {
+            return Ok(PreemptionPlan {
+                agent_id: agent_id.clone(),
+                victims,
+                post_eviction_available: accumulated,
+            });
+        }
+    }
+
+    Err(ArbiterError::PreemptionFailed {
+        workload: incoming.task_id.to_string(),
+        reason: "insufficient preemptible capacity on agent".to_owned(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use arbiter_core::ids::QuotaId;
@@ -522,6 +667,106 @@ mod tests {
                 &max_mem_free,
                 &running,
                 true
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn test_caas_primary_preemption_penalty() {
+        let agent_id = AgentId::new("agent-1").unwrap_or_default();
+        let incoming = make_incoming(16_000, PriorityClass::ProductionHigh);
+        let incoming_22k = make_incoming(22_000, PriorityClass::ProductionHigh);
+        let incoming_64k = make_incoming(64_000, PriorityClass::ProductionHigh);
+        let same_prio_incoming = make_incoming(16_000, PriorityClass::SpotPreemptible);
+        let plenty_free = make_bundle(32_000, 10_000);
+        let low_free = make_bundle(4_000, 2048);
+        let max_mem_free = make_bundle(0, u64::MAX);
+        let running = sample_running_tasks(&agent_id);
+
+        let mut primaries = BTreeSet::new();
+        primaries.insert(TaskId::new("gang-m1").unwrap_or_default());
+
+        for prio in [
+            PriorityClass::Revocable,
+            PriorityClass::SpotPreemptible,
+            PriorityClass::Batch,
+            PriorityClass::ProductionStandard,
+            PriorityClass::ProductionHigh,
+            PriorityClass::SystemCritical,
+        ] {
+            let dummy = RunningTaskInstance {
+                task_id: TaskId::new("gang-m1").unwrap_or_default(),
+                group_id: None,
+                agent_id: agent_id.clone(),
+                role: RoleName::new("r").unwrap_or_default(),
+                priority: prio,
+                preemption_policy: PreemptionPolicy::GracefulSigterm,
+                allocated_resources: make_bundle(1_000, 1024),
+                is_revocable: false,
+            };
+            assert!(compute_victim_disruption_cost(&dummy, &primaries, 1_000_000) > 1_000_000);
+        }
+
+        let plan_free_ok = solve_minimum_disruption_preemption_with_caas_primaries(
+            &incoming,
+            &agent_id,
+            &plenty_free,
+            &[],
+            false,
+            &primaries,
+            1_000_000,
+        )
+        .unwrap_or_default();
+        assert!(plan_free_ok.victims.is_empty());
+
+        // When gang-m1 is a CaaS primary with penalty 1_000_000, batch-1 (cost 600) and gang-m2 (cost 50, which co-evicts gang-m1)
+        // are ordered such that non-primary tasks are considered first.
+        let plan_caas = solve_minimum_disruption_preemption_with_caas_primaries(
+            &incoming_22k,
+            &agent_id,
+            &low_free,
+            &running,
+            true,
+            &primaries,
+            1_000_000,
+        )
+        .unwrap_or_default();
+        assert_eq!(plan_caas.victims.len(), 3);
+
+        assert!(
+            solve_minimum_disruption_preemption_with_caas_primaries(
+                &incoming_64k,
+                &agent_id,
+                &low_free,
+                &running,
+                false,
+                &primaries,
+                1_000_000,
+            )
+            .is_err()
+        );
+        assert!(
+            solve_minimum_disruption_preemption_with_caas_primaries(
+                &same_prio_incoming,
+                &agent_id,
+                &low_free,
+                &running,
+                true,
+                &primaries,
+                1_000_000,
+            )
+            .is_ok()
+        );
+        assert!(
+            solve_minimum_disruption_preemption_with_caas_primaries(
+                &incoming,
+                &agent_id,
+                &max_mem_free,
+                &running,
+                true,
+                &primaries,
+                1_000_000,
             )
             .is_err()
         );

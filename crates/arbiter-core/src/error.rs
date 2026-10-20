@@ -35,6 +35,396 @@ impl From<serde_json::Error> for JsonCodecError {
     }
 }
 
+/// Wrapper error for standard library I/O failures (`std::io::Error`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("I/O operation error ({kind}): {message}")]
+pub struct IoOperationError {
+    /// Canonical `std::io::ErrorKind` name.
+    pub kind: String,
+    /// Human-readable description of the I/O failure.
+    pub message: String,
+}
+
+impl From<std::io::Error> for IoOperationError {
+    /// Converts a `std::io::Error` into an [`IoOperationError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `std::io::Error`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`IoOperationError`].
+    fn from(err: std::io::Error) -> Self {
+        Self {
+            kind: format!("{:?}", err.kind()),
+            message: err.to_string(),
+        }
+    }
+}
+
+/// Wrapper error for zero-copy `rkyv` binary serialization/deserialization failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("rkyv binary codec error: {message}")]
+pub struct RkyvCodecError {
+    /// Human-readable description of the `rkyv` codec failure.
+    pub message: String,
+}
+
+impl From<rkyv::rancor::Error> for RkyvCodecError {
+    /// Converts an `rkyv::rancor::Error` into an [`RkyvCodecError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `rkyv::rancor::Error`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`RkyvCodecError`].
+    fn from(err: rkyv::rancor::Error) -> Self {
+        Self {
+            message: err.to_string(),
+        }
+    }
+}
+
+/// Wrapper error for QUIC transport and stream framing failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("QUIC transport error (stream {stream_id}): {message}")]
+pub struct QuicTransportError {
+    /// Multiplexed QUIC stream identifier (`0` = Control, `1` = Telemetry, `2` = `ArtifactP2p`).
+    pub stream_id: u64,
+    /// Human-readable description of the QUIC failure.
+    pub message: String,
+}
+
+impl QuicTransportError {
+    /// Creates a new [`QuicTransportError`] for `stream_id` and `message`.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream_id` - QUIC stream identifier.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`QuicTransportError`].
+    pub fn new(stream_id: u64, message: &str) -> Self {
+        Self {
+            stream_id,
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for TLS 1.3 handshake and X.509v3 certificate codec failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("TLS codec error: {message}")]
+pub struct RustlsCodecError {
+    /// Human-readable description of the TLS failure.
+    pub message: String,
+}
+
+impl RustlsCodecError {
+    /// Creates a new [`RustlsCodecError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - Diagnostic TLS error message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`RustlsCodecError`].
+    pub fn new(message: &str) -> Self {
+        Self {
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for HTTP/1.1, HTTP/2, and `RecordIO` transport failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("HTTP transport error (status {status_code}): {message}")]
+pub struct HttpTransportError {
+    /// Associated HTTP status code (`400`, `500`, `502`, etc.).
+    pub status_code: u16,
+    /// Human-readable description of the HTTP transport failure.
+    pub message: String,
+}
+
+impl HttpTransportError {
+    /// Creates a new [`HttpTransportError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `status_code` - HTTP status code.
+    /// * `message` - Diagnostic HTTP error message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`HttpTransportError`].
+    pub fn new(status_code: u16, message: &str) -> Self {
+        Self {
+            status_code,
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for RFC 6455 WebSocket upgrade and frame codec failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("WebSocket codec error: {message}")]
+pub struct WebSocketCodecError {
+    /// Human-readable description of the WebSocket failure.
+    pub message: String,
+}
+
+impl WebSocketCodecError {
+    /// Creates a new [`WebSocketCodecError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - Diagnostic WebSocket error message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`WebSocketCodecError`].
+    pub fn new(message: &str) -> Self {
+        Self {
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for external etcd v3 gRPC/HTTP2 client failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("etcd v3 client error on '{endpoint}': {message}")]
+pub struct EtcdClientError {
+    /// Target etcd v3 endpoint URI.
+    pub endpoint: String,
+    /// Human-readable description of the etcd client failure.
+    pub message: String,
+}
+
+impl EtcdClientError {
+    /// Creates a new [`EtcdClientError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `endpoint` - etcd endpoint URI.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`EtcdClientError`].
+    pub fn new(endpoint: &str, message: &str) -> Self {
+        Self {
+            endpoint: endpoint.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for external `PostgreSQL` wire-protocol SQL client failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("PostgreSQL client error (SQLSTATE {sqlstate}): {message}")]
+pub struct PostgresClientError {
+    /// 5-character SQLSTATE code (e.g., `"40001"` serialization failure, `"08006"` connection failure).
+    pub sqlstate: String,
+    /// Human-readable description of the `PostgreSQL` client failure.
+    pub message: String,
+}
+
+impl PostgresClientError {
+    /// Creates a new [`PostgresClientError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `sqlstate` - 5-character SQLSTATE code.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`PostgresClientError`].
+    pub fn new(sqlstate: &str, message: &str) -> Self {
+        Self {
+            sqlstate: sqlstate.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for Tier-2 Out-of-Band Redfish BMC HTTPS power fencing failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("Redfish BMC fence error on '{bmc_endpoint}' (HTTP {status_code}): {message}")]
+pub struct RedfishFenceError {
+    /// Target BMC Redfish endpoint URI.
+    pub bmc_endpoint: String,
+    /// HTTP status code returned by the BMC (`400`, `401`, `500`, `503`, etc.).
+    pub status_code: u16,
+    /// Human-readable diagnostic message from the Redfish response.
+    pub message: String,
+}
+
+impl RedfishFenceError {
+    /// Creates a new [`RedfishFenceError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `bmc_endpoint` - Target BMC Redfish URI.
+    /// * `status_code` - HTTP status code.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`RedfishFenceError`].
+    pub fn new(bmc_endpoint: &str, status_code: u16, message: &str) -> Self {
+        Self {
+            bmc_endpoint: bmc_endpoint.to_owned(),
+            status_code,
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for Tier-2 Out-of-Band IPMI v2 RMCP+ chassis power control failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("IPMI v2 fence error on '{bmc_address}' (code 0x{completion_code:02x}): {reason}")]
+pub struct IpmiFenceError {
+    /// Target BMC address (`host:623`).
+    pub bmc_address: String,
+    /// IPMI completion code byte (`0x00` = normal, `0xC0` = node busy, etc.).
+    pub completion_code: u8,
+    /// Human-readable description of the IPMI failure.
+    pub reason: String,
+}
+
+impl IpmiFenceError {
+    /// Creates a new [`IpmiFenceError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `bmc_address` - Target BMC IP/host address.
+    /// * `completion_code` - Raw IPMI completion code byte.
+    /// * `reason` - Diagnostic failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`IpmiFenceError`].
+    pub fn new(bmc_address: &str, completion_code: u8, reason: &str) -> Self {
+        Self {
+            bmc_address: bmc_address.to_owned(),
+            completion_code,
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for Tier-2 `NVMe` Persistent Reservation (`PROUT` Preempt-and-Abort) storage fencing failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("NVMe reservation error on '{device_path}' (status 0x{nvme_status:04x}): {reason}")]
+pub struct NvmeReservationError {
+    /// Block or character device path (e.g., `"/dev/nvme0n1"`).
+    pub device_path: String,
+    /// 16-bit `NVMe` status code (e.g., `0x0083` Reservation Conflict).
+    pub nvme_status: u16,
+    /// Human-readable description of the `NVMe` reservation failure.
+    pub reason: String,
+}
+
+impl NvmeReservationError {
+    /// Creates a new [`NvmeReservationError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `device_path` - Target `NVMe` device path.
+    /// * `nvme_status` - Raw 16-bit `NVMe` status code.
+    /// * `reason` - Diagnostic failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`NvmeReservationError`].
+    pub fn new(device_path: &str, nvme_status: u16, reason: &str) -> Self {
+        Self {
+            device_path: device_path.to_owned(),
+            nvme_status,
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for OCI Distribution Specification v1.1 image manifest and layer pull failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display(
+    "OCI registry error on '{registry_uri}' (status {status_code}, digest '{digest}'): {reason}"
+)]
+pub struct OciRegistryError {
+    /// OCI registry endpoint or image reference URI.
+    pub registry_uri: String,
+    /// HTTP status code returned by the registry.
+    pub status_code: u16,
+    /// Content digest (`sha256:...`) being fetched.
+    pub digest: String,
+    /// Human-readable failure reason.
+    pub reason: String,
+}
+
+impl OciRegistryError {
+    /// Creates a new [`OciRegistryError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `registry_uri` - Target OCI registry URI.
+    /// * `status_code` - HTTP status code.
+    /// * `digest` - Layer or manifest digest string.
+    /// * `reason` - Diagnostic failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`OciRegistryError`].
+    pub fn new(registry_uri: &str, status_code: u16, digest: &str, reason: &str) -> Self {
+        Self {
+            registry_uri: registry_uri.to_owned(),
+            status_code,
+            digest: digest.to_owned(),
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for OpenTelemetry (`OTLP/HTTP`) metric and trace export failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("OTLP export error on '{collector_endpoint}' (status {status_code}): {reason}")]
+pub struct OtlpExportError {
+    /// Target OTLP collector endpoint URI.
+    pub collector_endpoint: String,
+    /// HTTP status code returned by the collector.
+    pub status_code: u16,
+    /// Human-readable failure reason.
+    pub reason: String,
+}
+
+impl OtlpExportError {
+    /// Creates a new [`OtlpExportError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `collector_endpoint` - Target OTLP collector endpoint URI.
+    /// * `status_code` - HTTP status code.
+    /// * `reason` - Diagnostic failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`OtlpExportError`].
+    pub fn new(collector_endpoint: &str, status_code: u16, reason: &str) -> Self {
+        Self {
+            collector_endpoint: collector_endpoint.to_owned(),
+            status_code,
+            reason: reason.to_owned(),
+        }
+    }
+}
+
 /// Comprehensive, strongly-typed error enum covering all failure modes in Arbiter.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error, From)]
 pub enum ArbiterError {
@@ -372,6 +762,71 @@ pub enum ArbiterError {
     #[from]
     JsonCodec(JsonCodecError),
 
+    /// Standard I/O operation error automatically converted via `From<IoOperationError>`.
+    #[display("I/O failure: {_0}")]
+    #[from]
+    IoOperation(IoOperationError),
+
+    /// Zero-copy `rkyv` binary codec error automatically converted via `From<RkyvCodecError>`.
+    #[display("rkyv binary codec failure: {_0}")]
+    #[from]
+    RkyvCodec(RkyvCodecError),
+
+    /// QUIC transport error automatically converted via `From<QuicTransportError>`.
+    #[display("QUIC transport failure: {_0}")]
+    #[from]
+    QuicTransport(QuicTransportError),
+
+    /// TLS 1.3 codec error automatically converted via `From<RustlsCodecError>`.
+    #[display("TLS codec failure: {_0}")]
+    #[from]
+    RustlsCodec(RustlsCodecError),
+
+    /// HTTP transport error automatically converted via `From<HttpTransportError>`.
+    #[display("HTTP transport failure: {_0}")]
+    #[from]
+    HttpTransport(HttpTransportError),
+
+    /// WebSocket codec error automatically converted via `From<WebSocketCodecError>`.
+    #[display("WebSocket codec failure: {_0}")]
+    #[from]
+    WebSocketCodec(WebSocketCodecError),
+
+    /// etcd v3 client error automatically converted via `From<EtcdClientError>`.
+    #[display("etcd v3 client failure: {_0}")]
+    #[from]
+    EtcdClient(EtcdClientError),
+
+    /// `PostgreSQL` client error automatically converted via `From<PostgresClientError>`.
+    #[display("PostgreSQL client failure: {_0}")]
+    #[from]
+    PostgresClient(PostgresClientError),
+
+    /// Tier-2 Out-of-Band Redfish BMC power fencing error automatically converted via `From<RedfishFenceError>`.
+    #[display("Redfish BMC fence failure: {_0}")]
+    #[from]
+    RedfishFence(RedfishFenceError),
+
+    /// Tier-2 Out-of-Band IPMI v2 chassis control error automatically converted via `From<IpmiFenceError>`.
+    #[display("IPMI v2 fence failure: {_0}")]
+    #[from]
+    IpmiFence(IpmiFenceError),
+
+    /// Tier-2 `NVMe` Persistent Reservation fencing error automatically converted via `From<NvmeReservationError>`.
+    #[display("NVMe reservation failure: {_0}")]
+    #[from]
+    NvmeReservation(NvmeReservationError),
+
+    /// OCI image registry pull error automatically converted via `From<OciRegistryError>`.
+    #[display("OCI registry failure: {_0}")]
+    #[from]
+    OciRegistry(OciRegistryError),
+
+    /// OpenTelemetry OTLP export error automatically converted via `From<OtlpExportError>`.
+    #[display("OTLP export failure: {_0}")]
+    #[from]
+    OtlpExport(OtlpExportError),
+
     /// Multi-key state store transaction was aborted.
     #[display("Transaction aborted: {reason}")]
     TransactionAborted {
@@ -676,6 +1131,118 @@ pub enum ArbiterError {
         /// Maximum permitted drift in basis points.
         max_allowed_bps: u64,
     },
+
+    /// Failed to bind a TCP, UDP, or Unix Domain Socket listener endpoint.
+    #[display("Socket bind error on '{endpoint}': {reason}")]
+    SocketBindError {
+        /// Endpoint address or UDS path.
+        endpoint: String,
+        /// Operating system or validation failure reason.
+        reason: String,
+    },
+
+    /// Read or write operation on an open network or IPC socket failed.
+    #[display("Socket I/O error on '{endpoint}': {reason}")]
+    SocketIoError {
+        /// Endpoint address or stream identifier.
+        endpoint: String,
+        /// Operating system I/O failure reason.
+        reason: String,
+    },
+
+    /// X.509 certificate chain, validity window, or URI Subject Alternative Name validation failed.
+    #[display("X.509 certificate validation error for '{subject}': {reason}")]
+    X509ValidationError {
+        /// Subject or URI SAN being verified.
+        subject: String,
+        /// Validation failure reason.
+        reason: String,
+    },
+
+    /// Operating system child process creation (`fork`/`exec`/`CreateProcess`) failed.
+    #[display("Failed to spawn process '{command}': {reason}")]
+    ProcessSpawnError {
+        /// Executable command or path.
+        command: String,
+        /// OS failure reason.
+        reason: String,
+    },
+
+    /// Delivering a signal (`SIGTERM`, `SIGKILL`, `SIGUSR1`) or Job Object termination to a PID failed.
+    #[display("Failed to deliver signal '{signal}' to PID {pid}: {reason}")]
+    ProcessSignalError {
+        /// Target OS process identifier.
+        pid: u32,
+        /// Signal name or number.
+        signal: String,
+        /// OS failure reason.
+        reason: String,
+    },
+
+    /// Container Storage Interface (`CSI` v1.9) controller or node RPC failed.
+    #[display("CSI RPC '{method}' failed for volume '{volume_id}': {reason}")]
+    CsiRpcError {
+        /// CSI gRPC method name (`NodeStageVolume`, `NodePublishVolume`, etc.).
+        method: String,
+        /// Target volume identifier.
+        volume_id: String,
+        /// Plugin failure reason.
+        reason: String,
+    },
+
+    /// Cluster DNS or SRV service discovery resolution failed.
+    #[display("DNS resolution error for '{fqdn}': {reason}")]
+    DnsResolutionError {
+        /// Queried fully-qualified domain name.
+        fqdn: String,
+        /// Resolution failure reason.
+        reason: String,
+    },
+
+    /// Archive extraction or sandbox path materialization failed.
+    #[display("Archive extraction error for '{archive}': {reason}")]
+    ArchiveExtractionError {
+        /// Archive URI or file name.
+        archive: String,
+        /// Extraction or path security failure reason.
+        reason: String,
+    },
+
+    /// ASN.1 DER or PEM X.509v3 certificate parsing failed.
+    #[display("X.509 ASN.1 parse error in '{context}': {reason}")]
+    X509Asn1ParseError {
+        /// Certificate section or extension OID context.
+        context: String,
+        /// Detailed ASN.1 decoding failure reason.
+        reason: String,
+    },
+
+    /// Asymmetric cryptographic signature creation or verification (`Ed25519` / `ECDSA-P256`) failed.
+    #[display("Cryptographic signature error ({algorithm}): {reason}")]
+    CryptographicSignatureError {
+        /// Signature algorithm name (`EdDSA`, `ES256`, `HS256`).
+        algorithm: String,
+        /// Verification or signing failure reason.
+        reason: String,
+    },
+
+    /// Hardware watchdog device (`/dev/watchdog`) open, pet, or timeout operation failed.
+    #[display("Hardware watchdog device error on '{device_path}': {reason}")]
+    WatchdogDeviceError {
+        /// Watchdog device path (e.g., `"/dev/watchdog"`).
+        device_path: String,
+        /// Device I/O or timeout failure reason.
+        reason: String,
+    },
+
+    /// UDP or TCP RFC 1035 DNS wire packet parsing or encoding failed.
+    #[display("DNS wire protocol error for '{query_name}': {reason}")]
+    DnsProtocolError {
+        /// Queried DNS label or packet context.
+        query_name: String,
+        /// Wire format error reason.
+        reason: String,
+    },
 }
 
 #[cfg(test)]
@@ -964,6 +1531,56 @@ mod tests {
                 observed_drift_bps: 650,
                 max_allowed_bps: 500,
             },
+            ArbiterError::SocketBindError {
+                endpoint: "0.0.0.0:5050".to_owned(),
+                reason: "address in use".to_owned(),
+            },
+            ArbiterError::SocketIoError {
+                endpoint: "127.0.0.1:5050".to_owned(),
+                reason: "broken pipe".to_owned(),
+            },
+            ArbiterError::X509ValidationError {
+                subject: "spiffe://arbiter.internal/node/a1".to_owned(),
+                reason: "certificate expired".to_owned(),
+            },
+            ArbiterError::ProcessSpawnError {
+                command: "/bin/nonexistent".to_owned(),
+                reason: "ENOENT".to_owned(),
+            },
+            ArbiterError::ProcessSignalError {
+                pid: 4242,
+                signal: "SIGKILL".to_owned(),
+                reason: "ESRCH".to_owned(),
+            },
+            ArbiterError::CsiRpcError {
+                method: "NodePublishVolume".to_owned(),
+                volume_id: "vol-1".to_owned(),
+                reason: "socket timeout".to_owned(),
+            },
+            ArbiterError::DnsResolutionError {
+                fqdn: "pg-0.db.arbiter.internal".to_owned(),
+                reason: "NXDOMAIN".to_owned(),
+            },
+            ArbiterError::ArchiveExtractionError {
+                archive: "bundle.tar.zst".to_owned(),
+                reason: "corrupt header".to_owned(),
+            },
+            ArbiterError::X509Asn1ParseError {
+                context: "OID 2.5.29.17".to_owned(),
+                reason: "truncated DER tag".to_owned(),
+            },
+            ArbiterError::CryptographicSignatureError {
+                algorithm: "EdDSA".to_owned(),
+                reason: "invalid Ed25519 curve point".to_owned(),
+            },
+            ArbiterError::WatchdogDeviceError {
+                device_path: "/dev/watchdog".to_owned(),
+                reason: "watchdog timer expired".to_owned(),
+            },
+            ArbiterError::DnsProtocolError {
+                query_name: "pg-0.db.prod.arbiter.internal".to_owned(),
+                reason: "truncated DNS header".to_owned(),
+            },
         ];
 
         for err in &variants {
@@ -985,5 +1602,127 @@ mod tests {
         let arbiter_err = ArbiterError::from(codec_err);
         assert!(arbiter_err.to_string().contains("JSON codec failure:"));
         assert!(std::error::Error::source(&arbiter_err).is_some());
+
+        let io_err = std::io::Error::new(std::io::ErrorKind::BrokenPipe, "socket closed");
+        let io_wrap = IoOperationError::from(io_err);
+        assert!(io_wrap.to_string().contains("BrokenPipe"));
+        assert!(std::error::Error::source(&io_wrap).is_none());
+        let arbiter_io = ArbiterError::from(io_wrap);
+        assert!(arbiter_io.to_string().contains("I/O failure:"));
+        assert!(std::error::Error::source(&arbiter_io).is_some());
+
+        let rkyv_err = <rkyv::rancor::Error as rkyv::rancor::Source>::new(IoOperationError {
+            kind: "InvalidData".to_owned(),
+            message: "bad archive".to_owned(),
+        });
+        let rkyv_wrap = RkyvCodecError::from(rkyv_err);
+        assert!(rkyv_wrap.to_string().contains("rkyv binary codec error:"));
+        assert!(std::error::Error::source(&rkyv_wrap).is_none());
+        let arbiter_rkyv = ArbiterError::from(rkyv_wrap);
+        assert!(
+            arbiter_rkyv
+                .to_string()
+                .contains("rkyv binary codec failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_rkyv).is_some());
+    }
+
+    #[test]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+    fn test_transport_and_store_wrapper_errors() {
+        let quic_wrap = QuicTransportError::new(1, "stream reset");
+        assert!(quic_wrap.to_string().contains("QUIC transport error"));
+        assert!(std::error::Error::source(&quic_wrap).is_none());
+        let arbiter_quic = ArbiterError::from(quic_wrap);
+        assert!(arbiter_quic.to_string().contains("QUIC transport failure:"));
+        assert!(std::error::Error::source(&arbiter_quic).is_some());
+
+        let tls_wrap = RustlsCodecError::new("bad certificate");
+        assert!(tls_wrap.to_string().contains("TLS codec error:"));
+        assert!(std::error::Error::source(&tls_wrap).is_none());
+        let arbiter_tls = ArbiterError::from(tls_wrap);
+        assert!(arbiter_tls.to_string().contains("TLS codec failure:"));
+        assert!(std::error::Error::source(&arbiter_tls).is_some());
+
+        let http_wrap = HttpTransportError::new(502, "bad gateway");
+        assert!(http_wrap.to_string().contains("HTTP transport error"));
+        assert!(std::error::Error::source(&http_wrap).is_none());
+        let arbiter_http = ArbiterError::from(http_wrap);
+        assert!(arbiter_http.to_string().contains("HTTP transport failure:"));
+        assert!(std::error::Error::source(&arbiter_http).is_some());
+
+        let ws_wrap = WebSocketCodecError::new("invalid frame mask");
+        assert!(ws_wrap.to_string().contains("WebSocket codec error:"));
+        assert!(std::error::Error::source(&ws_wrap).is_none());
+        let arbiter_ws = ArbiterError::from(ws_wrap);
+        assert!(arbiter_ws.to_string().contains("WebSocket codec failure:"));
+        assert!(std::error::Error::source(&arbiter_ws).is_some());
+
+        let etcd_wrap = EtcdClientError::new("http://127.0.0.1:2379", "unavailable");
+        assert!(etcd_wrap.to_string().contains("etcd v3 client error"));
+        assert!(std::error::Error::source(&etcd_wrap).is_none());
+        let arbiter_etcd = ArbiterError::from(etcd_wrap);
+        assert!(arbiter_etcd.to_string().contains("etcd v3 client failure:"));
+        assert!(std::error::Error::source(&arbiter_etcd).is_some());
+
+        let pg_wrap = PostgresClientError::new("40001", "serialization_failure");
+        assert!(pg_wrap.to_string().contains("PostgreSQL client error"));
+        assert!(std::error::Error::source(&pg_wrap).is_none());
+        let arbiter_pg = ArbiterError::from(pg_wrap);
+        assert!(
+            arbiter_pg
+                .to_string()
+                .contains("PostgreSQL client failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_pg).is_some());
+
+        let redfish_wrap = RedfishFenceError::new("https://bmc.node1/redfish/v1", 503, "BMC busy");
+        assert!(redfish_wrap.to_string().contains("Redfish BMC fence error"));
+        assert!(std::error::Error::source(&redfish_wrap).is_none());
+        let arbiter_redfish = ArbiterError::from(redfish_wrap);
+        assert!(
+            arbiter_redfish
+                .to_string()
+                .contains("Redfish BMC fence failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_redfish).is_some());
+
+        let ipmi_wrap = IpmiFenceError::new("10.0.0.10:623", 0xC0, "Node Busy");
+        assert!(ipmi_wrap.to_string().contains("IPMI v2 fence error"));
+        assert!(std::error::Error::source(&ipmi_wrap).is_none());
+        let arbiter_ipmi = ArbiterError::from(ipmi_wrap);
+        assert!(arbiter_ipmi.to_string().contains("IPMI v2 fence failure:"));
+        assert!(std::error::Error::source(&arbiter_ipmi).is_some());
+
+        let nvme_wrap = NvmeReservationError::new("/dev/nvme0n1", 0x0083, "Reservation Conflict");
+        assert!(nvme_wrap.to_string().contains("NVMe reservation error"));
+        assert!(std::error::Error::source(&nvme_wrap).is_none());
+        let arbiter_nvme = ArbiterError::from(nvme_wrap);
+        assert!(
+            arbiter_nvme
+                .to_string()
+                .contains("NVMe reservation failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_nvme).is_some());
+
+        let oci_wrap = OciRegistryError::new(
+            "https://registry-1.docker.io",
+            404,
+            "sha256:deadbeef",
+            "manifest unknown",
+        );
+        assert!(oci_wrap.to_string().contains("OCI registry error"));
+        assert!(std::error::Error::source(&oci_wrap).is_none());
+        let arbiter_oci = ArbiterError::from(oci_wrap);
+        assert!(arbiter_oci.to_string().contains("OCI registry failure:"));
+        assert!(std::error::Error::source(&arbiter_oci).is_some());
+
+        let otlp_wrap =
+            OtlpExportError::new("http://127.0.0.1:4318/v1/metrics", 502, "collector down");
+        assert!(otlp_wrap.to_string().contains("OTLP export error"));
+        assert!(std::error::Error::source(&otlp_wrap).is_none());
+        let arbiter_otlp = ArbiterError::from(otlp_wrap);
+        assert!(arbiter_otlp.to_string().contains("OTLP export failure:"));
+        assert!(std::error::Error::source(&arbiter_otlp).is_some());
     }
 }

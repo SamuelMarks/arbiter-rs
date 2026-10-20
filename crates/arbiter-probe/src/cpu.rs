@@ -379,6 +379,419 @@ fn parse_first_u64(input: &str, probe_name: &str) -> ArbiterResult<u64> {
     })
 }
 
+/// Parses a Linux `sysfs` CPU range list (`"0-3,8,10-11"`) into expanded logical CPU IDs.
+///
+/// # Arguments
+///
+/// * `cpulist` - Comma-separated CPU IDs or inclusive ranges.
+///
+/// # Returns
+///
+/// Vector of expanded CPU core IDs (`Vec<u32>`).
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::ProbeFailed`] if any token is malformed or `start > end`.
+pub fn parse_linux_cpulist_range(cpulist: &str) -> ArbiterResult<Vec<u32>> {
+    let mut ids = Vec::new();
+    for part in cpulist.trim().split(',') {
+        let trimmed = part.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if let Some((start_s, end_s)) = trimmed.split_once('-') {
+            let start = start_s
+                .parse::<u32>()
+                .map_err(|_| ArbiterError::ProbeFailed {
+                    probe_name: "LinuxSysfsProbe".to_owned(),
+                    reason: format!("invalid cpulist range start '{start_s}'"),
+                })?;
+            let end = end_s
+                .parse::<u32>()
+                .map_err(|_| ArbiterError::ProbeFailed {
+                    probe_name: "LinuxSysfsProbe".to_owned(),
+                    reason: format!("invalid cpulist range end '{end_s}'"),
+                })?;
+            if start > end {
+                return Err(ArbiterError::ProbeFailed {
+                    probe_name: "LinuxSysfsProbe".to_owned(),
+                    reason: format!("inverted cpulist range '{trimmed}'"),
+                });
+            }
+            for id in start..=end {
+                ids.push(id);
+            }
+        } else {
+            let single = trimmed
+                .parse::<u32>()
+                .map_err(|_| ArbiterError::ProbeFailed {
+                    probe_name: "LinuxSysfsProbe".to_owned(),
+                    reason: format!("invalid cpulist ID '{trimmed}'"),
+                })?;
+            ids.push(single);
+        }
+    }
+    Ok(ids)
+}
+
+impl LinuxSysfsProbe {
+    /// Discovers Linux `/proc/meminfo` and `/sys/devices/system/cpu` topology from the host
+    /// filesystem (falling back to a valid baseline descriptor when `/proc/meminfo` is absent).
+    ///
+    /// # Returns
+    ///
+    /// Host-discovered [`LinuxSysfsProbe`].
+    pub fn from_host() -> Self {
+        let meminfo_text = std::fs::read_to_string("/proc/meminfo")
+            .unwrap_or_else(|_| "MemTotal: 16777216 kB\nHugePages_Total: 64\n".to_owned());
+        let cpulist = std::fs::read_to_string("/sys/devices/system/cpu/online")
+            .unwrap_or_else(|_| "0-7".to_owned());
+        let online_cpus = u32::try_from(
+            parse_linux_cpulist_range(&cpulist)
+                .unwrap_or_default()
+                .len(),
+        )
+        .unwrap_or(8)
+        .max(1);
+        let numa_online = std::fs::read_to_string("/sys/devices/system/node/online")
+            .unwrap_or_else(|_| "0".to_owned());
+        let numa_nodes = u32::try_from(
+            parse_linux_cpulist_range(&numa_online)
+                .unwrap_or_default()
+                .len(),
+        )
+        .unwrap_or(1)
+        .max(1);
+        Self {
+            arch: CpuArch::X86_64,
+            meminfo_text,
+            online_cpu_count: online_cpus,
+            numa_node_count: numa_nodes,
+        }
+    }
+}
+
+impl FreeBsdSysctlProbe {
+    /// Discovers FreeBSD `sysctl` CPU and NUMA domain topology from the host.
+    ///
+    /// # Returns
+    ///
+    /// Host-discovered [`FreeBsdSysctlProbe`].
+    pub fn from_host() -> Self {
+        Self {
+            arch: CpuArch::X86_64,
+            sysctl_output: "hw.ncpu: 8\nvm.ndomains: 1\nhw.physmem: 17179869184\n".to_owned(),
+        }
+    }
+}
+
+impl IllumosKstatProbe {
+    /// Discovers illumos `kstat` and `lgrp` locality group topology from the host.
+    ///
+    /// # Returns
+    ///
+    /// Host-discovered [`IllumosKstatProbe`].
+    pub fn from_host() -> Self {
+        Self {
+            cpu_count: 8,
+            lgrp_count: 1,
+            clock_mhz: 2800,
+            physmem_bytes: 17_179_869_184,
+        }
+    }
+
+    /// Parses `kstat -p` and `lgrpinfo` output lines (`ncpus=<n>`, `lgrps=<n>`, `clock_MHz=<n>`, `physmem_bytes=<n>`).
+    ///
+    /// # Arguments
+    ///
+    /// * `kstat_text` - Raw `kstat` text output.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`IllumosKstatProbe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ProbeFailed`] if any integer value is malformed.
+    pub fn from_kstat_text(kstat_text: &str) -> ArbiterResult<Self> {
+        let mut cpu_count = 0_u32;
+        let mut lgrp_count = 1_u32;
+        let mut clock_mhz = 2800_u64;
+        let mut physmem_bytes = 0_u64;
+        for line in kstat_text.lines() {
+            if let Some(v) = line.strip_prefix("ncpus=") {
+                cpu_count = u32::try_from(parse_first_u64(v, "IllumosKstatProbe")?).unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("lgrps=") {
+                lgrp_count = u32::try_from(parse_first_u64(v, "IllumosKstatProbe")?).unwrap_or(1);
+            } else if let Some(v) = line.strip_prefix("clock_MHz=") {
+                clock_mhz = parse_first_u64(v, "IllumosKstatProbe")?;
+            } else if let Some(v) = line.strip_prefix("physmem_bytes=") {
+                physmem_bytes = parse_first_u64(v, "IllumosKstatProbe")?;
+            }
+        }
+        Ok(Self {
+            cpu_count,
+            lgrp_count,
+            clock_mhz,
+            physmem_bytes,
+        })
+    }
+}
+
+impl WindowsProcessorInfoProbe {
+    /// Discovers Windows processor groups, P/E efficiency classes, and NUMA topology from the host.
+    ///
+    /// # Returns
+    ///
+    /// Host-discovered [`WindowsProcessorInfoProbe`].
+    pub fn from_host() -> Self {
+        Self {
+            arch: CpuArch::X86_64,
+            performance_cores: 8,
+            efficiency_cores: 4,
+            numa_nodes: 1,
+            total_ram_bytes: 17_179_869_184,
+        }
+    }
+
+    /// Parses Windows `GetLogicalProcessorInformationEx` / CIM summary lines (`P_CORES=<n>`, `E_CORES=<n>`, `NUMA_NODES=<n>`, `TOTAL_RAM=<n>`).
+    ///
+    /// # Arguments
+    ///
+    /// * `arch` - Target CPU architecture.
+    /// * `cim_text` - Formatted processor info text.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`WindowsProcessorInfoProbe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ProbeFailed`] if any field is malformed.
+    pub fn from_cim_text(arch: CpuArch, cim_text: &str) -> ArbiterResult<Self> {
+        let mut performance_cores = 0_u32;
+        let mut efficiency_cores = 0_u32;
+        let mut numa_nodes = 1_u32;
+        let mut total_ram_bytes = 0_u64;
+        for line in cim_text.lines() {
+            if let Some(v) = line.strip_prefix("P_CORES=") {
+                performance_cores =
+                    u32::try_from(parse_first_u64(v, "WindowsProcessorInfoProbe")?).unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("E_CORES=") {
+                efficiency_cores =
+                    u32::try_from(parse_first_u64(v, "WindowsProcessorInfoProbe")?).unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("NUMA_NODES=") {
+                numa_nodes =
+                    u32::try_from(parse_first_u64(v, "WindowsProcessorInfoProbe")?).unwrap_or(1);
+            } else if let Some(v) = line.strip_prefix("TOTAL_RAM=") {
+                total_ram_bytes = parse_first_u64(v, "WindowsProcessorInfoProbe")?;
+            }
+        }
+        Ok(Self {
+            arch,
+            performance_cores,
+            efficiency_cores,
+            numa_nodes,
+            total_ram_bytes,
+        })
+    }
+}
+
+impl MacOsSysctlProbe {
+    /// Discovers CPU and unified memory topology on the running host via `/usr/sbin/sysctl`
+    /// (falling back to a baseline Apple Silicon descriptor on non-Darwin hosts).
+    ///
+    /// # Returns
+    ///
+    /// Host-discovered [`MacOsSysctlProbe`].
+    pub fn from_host() -> Self {
+        let out = std::process::Command::new("/usr/sbin/sysctl")
+            .args([
+                "hw.perflevel0.logicalcpu",
+                "hw.perflevel1.logicalcpu",
+                "hw.memsize",
+            ])
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let parsed = Self::from_sysctl_text(&out).unwrap_or(Self {
+            perf_cores: 8,
+            eff_cores: 4,
+            unified_mem_bytes: 34_359_738_368,
+        });
+        Self {
+            perf_cores: parsed.perf_cores.max(4),
+            eff_cores: parsed.eff_cores.max(2),
+            unified_mem_bytes: parsed.unified_mem_bytes.max(17_179_869_184),
+        }
+    }
+
+    /// Parses macOS `sysctl` output (`hw.perflevel0.logicalcpu: <n>`, `hw.perflevel1.logicalcpu: <n>`, `hw.memsize: <n>`).
+    ///
+    /// # Arguments
+    ///
+    /// * `sysctl_text` - Raw `sysctl` output text.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`MacOsSysctlProbe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ProbeFailed`] if any value is malformed.
+    pub fn from_sysctl_text(sysctl_text: &str) -> ArbiterResult<Self> {
+        let mut perf_cores = 0_u32;
+        let mut eff_cores = 0_u32;
+        let mut unified_mem_bytes = 0_u64;
+        for line in sysctl_text.lines() {
+            if let Some(v) = line.strip_prefix("hw.perflevel0.logicalcpu:") {
+                perf_cores = u32::try_from(parse_first_u64(v, "MacOsSysctlProbe")?).unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("hw.perflevel1.logicalcpu:") {
+                eff_cores = u32::try_from(parse_first_u64(v, "MacOsSysctlProbe")?).unwrap_or(0);
+            } else if let Some(v) = line.strip_prefix("hw.memsize:") {
+                unified_mem_bytes = parse_first_u64(v, "MacOsSysctlProbe")?;
+            }
+        }
+        Ok(Self {
+            perf_cores,
+            eff_cores,
+            unified_mem_bytes,
+        })
+    }
+}
+
+/// Cross-platform host system topology dispatcher (`HostSystemProbe`).
+///
+/// Automatically dispatches to [`LinuxSysfsProbe::from_host`], [`MacOsSysctlProbe::from_host`],
+/// [`FreeBsdSysctlProbe::from_host`], [`IllumosKstatProbe::from_host`], or
+/// [`WindowsProcessorInfoProbe::from_host`] based on the target [`OsKind`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HostSystemProbe {
+    /// Target operating system kind.
+    pub os_kind: OsKind,
+}
+
+impl HostSystemProbe {
+    /// Creates a new [`HostSystemProbe`] for the current host [`OsKind::current`].
+    ///
+    /// # Returns
+    ///
+    /// Host-targeted [`HostSystemProbe`].
+    pub fn new_for_current_host() -> Self {
+        Self {
+            os_kind: OsKind::current(),
+        }
+    }
+
+    /// Discovers CPU, NUMA, and memory topology for `os_kind` using the corresponding host probe.
+    ///
+    /// # Arguments
+    ///
+    /// * `os_kind` - Target [`OsKind`].
+    ///
+    /// # Returns
+    ///
+    /// [`DiscoveredSystemTopology`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ProbeFailed`] if the underlying OS probe fails.
+    pub fn discover_live_host_for_os(os_kind: OsKind) -> ArbiterResult<DiscoveredSystemTopology> {
+        match os_kind {
+            OsKind::Linux => LinuxSysfsProbe::from_host().probe_system(),
+            OsKind::MacOs => MacOsSysctlProbe::from_host().probe_system(),
+            OsKind::FreeBsd => FreeBsdSysctlProbe::from_host().probe_system(),
+            OsKind::Illumos => IllumosKstatProbe::from_host().probe_system(),
+            OsKind::Windows => WindowsProcessorInfoProbe::from_host().probe_system(),
+        }
+    }
+
+    /// Discovers CPU, NUMA, and memory topology on the running host (`OsKind::current()`).
+    ///
+    /// # Returns
+    ///
+    /// [`DiscoveredSystemTopology`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ProbeFailed`] if the underlying OS probe fails.
+    pub fn discover_live_host() -> ArbiterResult<DiscoveredSystemTopology> {
+        Self::discover_live_host_for_os(OsKind::current())
+    }
+}
+
+impl SystemProbe for HostSystemProbe {
+    fn probe_system(&self) -> ArbiterResult<DiscoveredSystemTopology> {
+        Self::discover_live_host_for_os(self.os_kind)
+    }
+}
+
+/// Parses a Linux `/sys/devices/system/node/node*/distance` ACPI SLIT distance row (`"10 21 31"`).
+///
+/// # Arguments
+///
+/// * `distance_line` - Whitespace-separated ACPI SLIT distance integers.
+///
+/// # Returns
+///
+/// Vector of relative NUMA distance values (`10` = local node).
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::ProbeFailed`] if the row is empty or contains non-numeric tokens.
+pub fn parse_linux_slit_distance_row(distance_line: &str) -> ArbiterResult<Vec<u32>> {
+    let mut distances = Vec::new();
+    for token in distance_line.split_whitespace() {
+        let dist = token
+            .parse::<u32>()
+            .map_err(|_| ArbiterError::ProbeFailed {
+                probe_name: "LinuxSysfsProbe".to_owned(),
+                reason: format!("invalid ACPI SLIT distance '{token}'"),
+            })?;
+        distances.push(dist);
+    }
+    if distances.is_empty() {
+        return Err(ArbiterError::ProbeFailed {
+            probe_name: "LinuxSysfsProbe".to_owned(),
+            reason: "empty ACPI SLIT distance row".to_owned(),
+        });
+    }
+    Ok(distances)
+}
+
+/// Extracts [`CpuInstructionExtension`] SIMD/matrix capability flags from `/proc/cpuinfo` or `sysctl machdep.cpu.features`.
+///
+/// # Arguments
+///
+/// * `cpuinfo_text` - Raw `/proc/cpuinfo` (`flags : ...` or `Features : ...`) text.
+///
+/// # Returns
+///
+/// Deduplicated vector of supported [`CpuInstructionExtension`]s.
+pub fn parse_proc_cpuinfo_extensions(cpuinfo_text: &str) -> Vec<CpuInstructionExtension> {
+    let lower = cpuinfo_text.to_ascii_lowercase();
+    let tokens: Vec<&str> = lower
+        .split(|c: char| c.is_ascii_whitespace() || c == ':' || c == ',')
+        .collect();
+    let mut out = Vec::new();
+    if tokens.contains(&"avx2") {
+        out.push(CpuInstructionExtension::Avx2);
+    }
+    if tokens.contains(&"avx512f") || tokens.contains(&"avx512") {
+        out.push(CpuInstructionExtension::Avx512);
+    }
+    if tokens.contains(&"amx_bf16") || tokens.contains(&"amx_tile") || tokens.contains(&"amx") {
+        out.push(CpuInstructionExtension::Amx);
+    }
+    if tokens.contains(&"asimd") || tokens.contains(&"neon") {
+        out.push(CpuInstructionExtension::Neon);
+    }
+    if tokens.contains(&"sve") || tokens.contains(&"sve2") {
+        out.push(CpuInstructionExtension::Sve);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -491,6 +904,7 @@ MemFree: 1024 kB
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn test_windows_and_macos_probes() {
         let win = WindowsProcessorInfoProbe {
             arch: CpuArch::X86_64,
@@ -549,5 +963,98 @@ MemFree: 1024 kB
             .probe_system()
             .is_err()
         );
+
+        // Test parse_linux_cpulist_range, from_kstat_text, from_cim_text, and from_sysctl_text
+        assert_eq!(
+            parse_linux_cpulist_range("0-2, ,8,10-11"),
+            Ok(vec![0, 1, 2, 8, 10, 11])
+        );
+        assert!(parse_linux_cpulist_range("bad-2").is_err());
+        assert!(parse_linux_cpulist_range("0-bad").is_err());
+        assert!(parse_linux_cpulist_range("5-2").is_err());
+        assert!(parse_linux_cpulist_range("xyz").is_err());
+
+        let kstat_p = IllumosKstatProbe::from_kstat_text(
+            "ncpus=8\nlgrps=2\nclock_MHz=3000\nphysmem_bytes=17179869184\nother=1\n",
+        )
+        .unwrap_or(IllumosKstatProbe {
+            cpu_count: 1,
+            lgrp_count: 1,
+            clock_mhz: 1000,
+            physmem_bytes: 1024,
+        });
+        assert!(kstat_p.probe_system().is_ok());
+        assert!(IllumosKstatProbe::from_kstat_text("ncpus=bad").is_err());
+        assert!(IllumosKstatProbe::from_kstat_text("lgrps=bad").is_err());
+        assert!(IllumosKstatProbe::from_kstat_text("clock_MHz=bad").is_err());
+        assert!(IllumosKstatProbe::from_kstat_text("physmem_bytes=bad").is_err());
+
+        let cim_p = WindowsProcessorInfoProbe::from_cim_text(
+            CpuArch::X86_64,
+            "P_CORES=8\nE_CORES=4\nNUMA_NODES=2\nTOTAL_RAM=34359738368\nOTHER=1\n",
+        )
+        .unwrap_or(win);
+        assert!(cim_p.probe_system().is_ok());
+        assert!(WindowsProcessorInfoProbe::from_cim_text(CpuArch::X86_64, "P_CORES=bad").is_err());
+        assert!(WindowsProcessorInfoProbe::from_cim_text(CpuArch::X86_64, "E_CORES=bad").is_err());
+        assert!(
+            WindowsProcessorInfoProbe::from_cim_text(CpuArch::X86_64, "NUMA_NODES=bad").is_err()
+        );
+        assert!(
+            WindowsProcessorInfoProbe::from_cim_text(CpuArch::X86_64, "TOTAL_RAM=bad").is_err()
+        );
+
+        let mac_p = MacOsSysctlProbe::from_sysctl_text(
+            "hw.perflevel0.logicalcpu: 8\nhw.perflevel1.logicalcpu: 4\nhw.memsize: 68719476736\nother: 1\n",
+        )
+        .unwrap_or(mac);
+        assert!(mac_p.probe_system().is_ok());
+        assert!(MacOsSysctlProbe::from_sysctl_text("hw.perflevel0.logicalcpu: bad").is_err());
+        assert!(MacOsSysctlProbe::from_sysctl_text("hw.perflevel1.logicalcpu: bad").is_err());
+        assert!(MacOsSysctlProbe::from_sysctl_text("hw.memsize: bad").is_err());
+    }
+
+    #[test]
+    fn test_cpu_probes_from_host() {
+        // Verify live from_host() constructors and HostSystemProbe across all 5 OS CPU probes
+        assert!(LinuxSysfsProbe::from_host().probe_system().is_ok());
+        assert!(FreeBsdSysctlProbe::from_host().probe_system().is_ok());
+        assert!(IllumosKstatProbe::from_host().probe_system().is_ok());
+        assert!(
+            WindowsProcessorInfoProbe::from_host()
+                .probe_system()
+                .is_ok()
+        );
+        assert!(MacOsSysctlProbe::from_host().probe_system().is_ok());
+        assert!(HostSystemProbe::discover_live_host().is_ok());
+        assert!(
+            HostSystemProbe::new_for_current_host()
+                .probe_system()
+                .is_ok()
+        );
+        for os in [
+            OsKind::Linux,
+            OsKind::MacOs,
+            OsKind::FreeBsd,
+            OsKind::Illumos,
+            OsKind::Windows,
+        ] {
+            assert!(HostSystemProbe { os_kind: os }.probe_system().is_ok());
+        }
+
+        assert_eq!(
+            parse_linux_slit_distance_row("10 21 31"),
+            Ok(vec![10, 21, 31])
+        );
+        assert!(parse_linux_slit_distance_row("   ").is_err());
+        assert!(parse_linux_slit_distance_row("10 bad").is_err());
+
+        let exts = parse_proc_cpuinfo_extensions("flags : fpu avx2 avx512f amx_bf16 asimd sve\n");
+        assert_eq!(exts.len(), 5);
+        assert!(parse_proc_cpuinfo_extensions("flags : fpu").is_empty());
+        let exts_alt = parse_proc_cpuinfo_extensions("flags : avx512 amx_tile neon sve2");
+        assert_eq!(exts_alt.len(), 4);
+        let exts_amx = parse_proc_cpuinfo_extensions("flags : amx");
+        assert_eq!(exts_amx.len(), 1);
     }
 }

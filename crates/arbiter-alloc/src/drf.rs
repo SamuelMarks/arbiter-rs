@@ -222,13 +222,25 @@ pub fn rank_hdrf_candidates(
         }
         role_totals.insert(state.role.clone(), updated);
 
-        if let Some(ref parent_name) = role_def.parent {
+        // Walk the full ancestor chain (child -> parent -> grandparent -> root), aggregating usage
+        // and enforcing every ancestor's hard_max ceiling.
+        let mut cursor_parent = role_def.parent.clone();
+        while let Some(parent_name) = cursor_parent {
+            let parent_def = hierarchy.get_role(&parent_name)?;
             let parent_curr = role_totals
-                .get(parent_name)
+                .get(&parent_name)
                 .cloned()
                 .unwrap_or_else(ResourceBundle::zero);
             let parent_updated = parent_curr.try_add(&state.allocated)?;
-            role_totals.insert(parent_name.clone(), parent_updated);
+            if !parent_def.quota.hard_max.contains(&parent_updated) {
+                return Err(ArbiterError::QuotaExceeded {
+                    role: parent_name.to_string(),
+                    resource: "ancestor_hard_max".to_owned(),
+                });
+            }
+            let next_parent = parent_def.parent.clone();
+            role_totals.insert(parent_name, parent_updated);
+            cursor_parent = next_parent;
         }
 
         let (raw_share, dom_dim) = compute_dominant_share(&state.allocated, total_capacity)?;
@@ -312,6 +324,148 @@ pub fn is_below_guaranteed_quota(
     !allocated.contains(guaranteed_min)
 }
 
+/// Computes the aggregate unsatisfied `guaranteed_min` quota headroom across all roles in `hierarchy`
+/// (Apache Mesos quota headroom parity).
+///
+/// For each top-level or leaf role with a non-empty `guaranteed_min`, computes the per-dimension
+/// shortfall `max(0, guaranteed_min - (allocated + offered))` and sums the shortfalls so non-quota
+/// roles cannot starve quota-guaranteed roles of their minimum guarantee.
+///
+/// # Arguments
+///
+/// * `hierarchy` - Registered [`RoleHierarchy`].
+/// * `states` - Slice of current [`RoleAllocationState`]s.
+/// * `outstanding_offers` - Per-role [`ResourceBundle`] of active leased offers.
+///
+/// # Returns
+///
+/// Aggregate [`ResourceBundle`] of unsatisfied quota headroom that must be held back for quota roles.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::RoleNotFound`] if a state references an unregistered role, or
+/// [`ArbiterError::ArithmeticOverflow`] if headroom summation overflows.
+pub fn compute_unsatisfied_quota_headroom(
+    hierarchy: &RoleHierarchy,
+    states: &[RoleAllocationState],
+    outstanding_offers: &BTreeMap<RoleName, ResourceBundle>,
+) -> ArbiterResult<ResourceBundle> {
+    let mut role_usage: BTreeMap<RoleName, ResourceBundle> = BTreeMap::new();
+    for role_def in hierarchy.roles() {
+        let offered = outstanding_offers
+            .get(&role_def.name)
+            .cloned()
+            .unwrap_or_else(ResourceBundle::zero);
+        role_usage.insert(role_def.name.clone(), offered);
+    }
+    for state in states {
+        let role_def = hierarchy.get_role(&state.role)?;
+        let curr = role_usage
+            .get(&state.role)
+            .cloned()
+            .unwrap_or_else(ResourceBundle::zero);
+        role_usage.insert(state.role.clone(), curr.try_add(&state.allocated)?);
+
+        let mut cursor_parent = role_def.parent.clone();
+        while let Some(parent_name) = cursor_parent {
+            let parent_def = hierarchy.get_role(&parent_name)?;
+            let parent_curr = role_usage
+                .get(&parent_name)
+                .cloned()
+                .unwrap_or_else(ResourceBundle::zero);
+            let next_parent = parent_def.parent.clone();
+            role_usage.insert(parent_name, parent_curr.try_add(&state.allocated)?);
+            cursor_parent = next_parent;
+        }
+    }
+
+    let mut total_headroom = ResourceBundle::zero();
+    for role_def in hierarchy.roles() {
+        let used = role_usage
+            .get(&role_def.name)
+            .cloned()
+            .unwrap_or_else(ResourceBundle::zero);
+        let g = &role_def.quota.guaranteed_min;
+        let shortfall = ResourceBundle {
+            cpu: g.cpu.saturating_sub(used.cpu),
+            memory: g.memory.saturating_sub(used.memory),
+            hugepages: g.hugepages.saturating_sub(used.hugepages),
+            gpu_compute: g.gpu_compute.saturating_sub(used.gpu_compute),
+            gpu_vram: g.gpu_vram.saturating_sub(used.gpu_vram),
+            tpu_chips: g.tpu_chips.saturating_sub(used.tpu_chips),
+            disk: g.disk.saturating_sub(used.disk),
+            network_bandwidth: g.network_bandwidth.saturating_sub(used.network_bandwidth),
+            ports: arbiter_core::units::PortSet::empty(),
+        };
+        total_headroom = total_headroom.try_add(&shortfall)?;
+    }
+    Ok(total_headroom)
+}
+
+/// Evaluates and sorts active roles/frameworks according to `HDRF` while accounting for both
+/// allocated resources and outstanding leased `ResourceOffer`s (`allocated + offered`).
+///
+/// # Arguments
+///
+/// * `hierarchy` - Registered [`RoleHierarchy`].
+/// * `states` - Slice of current [`RoleAllocationState`]s.
+/// * `outstanding_offers` - Per-role [`ResourceBundle`] of active leased offers.
+/// * `total_capacity` - Total cluster [`ResourceBundle`].
+///
+/// # Returns
+///
+/// Deterministically sorted vector of [`DominantShareEntry`]s.
+///
+/// # Errors
+///
+/// Returns an [`ArbiterError`] if role lookup, quota bounds, or share arithmetic fails.
+pub fn rank_hdrf_candidates_with_offers(
+    hierarchy: &RoleHierarchy,
+    states: &[RoleAllocationState],
+    outstanding_offers: &BTreeMap<RoleName, ResourceBundle>,
+    total_capacity: &ResourceBundle,
+) -> ArbiterResult<Vec<DominantShareEntry>> {
+    let mut combined_states = Vec::with_capacity(states.len());
+    for state in states {
+        let offered = outstanding_offers
+            .get(&state.role)
+            .cloned()
+            .unwrap_or_else(ResourceBundle::zero);
+        combined_states.push(RoleAllocationState {
+            role: state.role.clone(),
+            framework_id: state.framework_id.clone(),
+            allocated: state.allocated.try_add(&offered)?,
+            allocation_count: state.allocation_count,
+        });
+    }
+    rank_hdrf_candidates(hierarchy, &combined_states, total_capacity)
+}
+
+/// Computes the Mesos-style shared persistent volume disk charge (`volume_capacity / max(1, ref_count)`).
+///
+/// `SharedReadOnly` and `SharedReadWrite` volumes are charged proportionally (`1 / N`) across
+/// each sharing task in HDRF calculations.
+///
+/// # Arguments
+///
+/// * `volume_capacity` - Total disk [`arbiter_core::units::Bytes`] of the shared persistent volume.
+/// * `active_consumer_count` - Number of tasks currently mounting this shared volume (`>= 1`).
+///
+/// # Returns
+///
+/// Per-consumer disk [`arbiter_core::units::Bytes`] charge.
+pub const fn compute_shared_volume_fair_share(
+    volume_capacity: arbiter_core::units::Bytes,
+    active_consumer_count: u64,
+) -> arbiter_core::units::Bytes {
+    let divisor = if active_consumer_count == 0 {
+        1
+    } else {
+        active_consumer_count
+    };
+    arbiter_core::units::Bytes::new(volume_capacity.get() / divisor)
+}
+
 /// Helper to construct a standard [`WeightBasisPoints`] when building test or default role configs.
 ///
 /// # Returns
@@ -379,6 +533,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_rank_hdrf_candidates_and_tie_breaking() {
         let cap = sample_capacity();
         let mut hierarchy = RoleHierarchy::new();
@@ -476,6 +631,60 @@ mod tests {
             allocation_count: 1,
         }];
         assert!(rank_hdrf_candidates(&hierarchy, &over_states, &cap).is_err());
+
+        // Multi-level ancestor hard_max ceiling enforcement (2 child allocations under r_prod_ml
+        // each within hard_max individually if split across two sibling sub-roles, but exceeding parent r_prod hard_max)
+        let mut ancestor_hier = RoleHierarchy::new();
+        let mut parent_small = cap.clone();
+        parent_small.cpu = Millicores::new(30_000);
+        let r_root = RoleName::new("dept").unwrap_or_default();
+        let r_sub1 = RoleName::new("dept.team1").unwrap_or_default();
+        let r_sub2 = RoleName::new("dept.team2").unwrap_or_default();
+        let mut child_q = cap;
+        child_q.cpu = Millicores::new(15_000);
+        let _ = ancestor_hier.add_role(Role {
+            name: r_root.clone(),
+            parent: None,
+            quota: Quota {
+                id: QuotaId::new("q-root").unwrap_or_default(),
+                guaranteed_min: ResourceBundle::zero(),
+                hard_max: parent_small,
+                allow_burst_borrowing: true,
+                weight: default_role_weight(),
+            },
+        });
+        for sub in [&r_sub1, &r_sub2] {
+            let _ = ancestor_hier.add_role(Role {
+                name: sub.clone(),
+                parent: Some(r_root.clone()),
+                quota: Quota {
+                    id: QuotaId::new("q-sub").unwrap_or_default(),
+                    guaranteed_min: ResourceBundle::zero(),
+                    hard_max: child_q.clone(),
+                    allow_burst_borrowing: true,
+                    weight: default_role_weight(),
+                },
+            });
+        }
+        let mut alloc_20k = ResourceBundle::zero();
+        alloc_20k.cpu = Millicores::new(15_000);
+        let mut alloc_root_20k = ResourceBundle::zero();
+        alloc_root_20k.cpu = Millicores::new(20_000);
+        let ancestor_exceeded_states = vec![
+            RoleAllocationState {
+                role: r_root,
+                framework_id: None,
+                allocated: alloc_root_20k,
+                allocation_count: 1,
+            },
+            RoleAllocationState {
+                role: r_sub1,
+                framework_id: None,
+                allocated: alloc_20k,
+                allocation_count: 1,
+            },
+        ];
+        assert!(rank_hdrf_candidates(&ancestor_hier, &ancestor_exceeded_states, &child_q).is_err());
     }
 
     #[test]
@@ -569,6 +778,109 @@ mod tests {
             },
         ];
         assert!(rank_hdrf_candidates(&max_hier, &step2_overflow, &one_cpu).is_err());
+    }
+
+    #[test]
+    fn test_quota_headroom_offers_and_shared_volume_share() {
+        let mut max_cap = ResourceBundle::zero();
+        max_cap.cpu = Millicores::MAX;
+        let mut h_headroom = RoleHierarchy::new();
+        let r_root = RoleName::new("dept").unwrap_or_default();
+        let r_leaf = RoleName::new("dept.ml").unwrap_or_default();
+        let mut g_root = ResourceBundle::zero();
+        g_root.cpu = Millicores::new(20_000);
+        let mut g_leaf = ResourceBundle::zero();
+        g_leaf.cpu = Millicores::new(10_000);
+        for (r_name, parent_opt, q_name, g_min) in [
+            (r_root.clone(), None, "q-r", g_root),
+            (r_leaf.clone(), Some(r_root.clone()), "q-l", g_leaf),
+        ] {
+            let _ = h_headroom.add_role(Role {
+                name: r_name,
+                parent: parent_opt,
+                quota: Quota {
+                    id: QuotaId::new(q_name).unwrap_or_default(),
+                    guaranteed_min: g_min,
+                    hard_max: max_cap.clone(),
+                    allow_burst_borrowing: true,
+                    weight: WeightBasisPoints::STANDARD,
+                },
+            });
+        }
+        let mut alloc_leaf = ResourceBundle::zero();
+        alloc_leaf.cpu = Millicores::new(4_000);
+        let mut offered_map = BTreeMap::new();
+        let mut off_leaf = ResourceBundle::zero();
+        off_leaf.cpu = Millicores::new(2_000);
+        offered_map.insert(r_leaf.clone(), off_leaf);
+        let st_headroom = vec![RoleAllocationState {
+            role: r_leaf.clone(),
+            framework_id: None,
+            allocated: alloc_leaf,
+            allocation_count: 1,
+        }];
+        let headroom = compute_unsatisfied_quota_headroom(&h_headroom, &st_headroom, &offered_map)
+            .unwrap_or_default();
+        assert_eq!(headroom.cpu, Millicores::new(20_000));
+
+        let bad_st = vec![RoleAllocationState {
+            role: RoleName::new("unknown").unwrap_or_default(),
+            framework_id: None,
+            allocated: ResourceBundle::zero(),
+            allocation_count: 0,
+        }];
+        assert!(compute_unsatisfied_quota_headroom(&h_headroom, &bad_st, &offered_map).is_err());
+
+        let mut max_offered = BTreeMap::new();
+        let mut max_b = ResourceBundle::zero();
+        max_b.cpu = Millicores::MAX;
+        max_offered.insert(r_leaf, max_b.clone());
+        assert!(
+            compute_unsatisfied_quota_headroom(&h_headroom, &st_headroom, &max_offered).is_err()
+        );
+        let mut parent_max_offered = BTreeMap::new();
+        parent_max_offered.insert(r_root.clone(), max_b.clone());
+        assert!(
+            compute_unsatisfied_quota_headroom(&h_headroom, &st_headroom, &parent_max_offered)
+                .is_err()
+        );
+        let mut h_shortfall_overflow = RoleHierarchy::new();
+        for (r_name, q_name) in [
+            (r_root, "q1"),
+            (RoleName::new("dept2").unwrap_or_default(), "q2"),
+        ] {
+            let _ = h_shortfall_overflow.add_role(Role {
+                name: r_name,
+                parent: None,
+                quota: Quota {
+                    id: QuotaId::new(q_name).unwrap_or_default(),
+                    guaranteed_min: max_b.clone(),
+                    hard_max: max_cap.clone(),
+                    allow_burst_borrowing: true,
+                    weight: WeightBasisPoints::STANDARD,
+                },
+            });
+        }
+        assert!(
+            compute_unsatisfied_quota_headroom(&h_shortfall_overflow, &[], &BTreeMap::new())
+                .is_err()
+        );
+
+        let ranked_with_offers =
+            rank_hdrf_candidates_with_offers(&h_headroom, &st_headroom, &offered_map, &max_cap)
+                .unwrap_or_default();
+        assert_eq!(ranked_with_offers.len(), 1);
+        assert!(
+            rank_hdrf_candidates_with_offers(&h_headroom, &st_headroom, &max_offered, &max_cap)
+                .is_err()
+        );
+
+        for (cnt, expected) in [(0_u64, 1_000_u64), (4_u64, 250_u64)] {
+            assert_eq!(
+                compute_shared_volume_fair_share(Bytes::new(1_000), cnt),
+                Bytes::new(expected)
+            );
+        }
     }
 
     proptest! {

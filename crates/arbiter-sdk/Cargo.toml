@@ -18,10 +18,6 @@ arbiter-store = { workspace = true }
 arbiter-proto = { workspace = true }
 arbiter-net = { workspace = true }
 arbiter-master = { workspace = true }
-serde = { workspace = true }
-
-[dev-dependencies]
-proptest = { workspace = true }
 
 [lints]
 workspace = true

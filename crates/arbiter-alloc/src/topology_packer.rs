@@ -9,15 +9,117 @@
 //!   GPU requests arrive.
 
 use arbiter_core::error::{ArbiterError, ArbiterResult};
-use arbiter_core::ids::{AgentId, DeviceId};
+use arbiter_core::ids::{AgentId, DeviceId, TaskId};
 use arbiter_core::resources::{
-    GpuDevice, GpuPartition, NvidiaMigPartition, NvidiaMigProfile, NvidiaMpsPartition, RdmaDevice,
-    ResourceBundle,
+    AmdComputePartitionMode, AmdMemoryPartitionMode, AmdPartitionSlice, AppleMetalPartition,
+    CoreDescriptor, GpuDevice, GpuPartition, GpuVendor, IntelTilePartition, NumaMemoryPool,
+    NvidiaMigPartition, NvidiaMigProfile, NvidiaMpsPartition, RdmaDevice, ResourceBundle,
 };
 use arbiter_core::topology::{HardwareTopologyGraph, InterconnectKind};
 use arbiter_core::units::{Bytes, GpuMillicores, Millicores, WeightBasisPoints};
-use arbiter_core::workload::{TaskSpec, TopologyConstraint};
+pub use arbiter_core::workload::{
+    ARBITER_SCHEDULING_REQUIREMENTS_ENV_KEY, TaskSchedulingRequirements,
+};
+use arbiter_core::workload::{AgentAttribute, DomainInfo, TaskSpec, TopologyConstraint};
 use serde::{Deserialize, Serialize};
+
+/// Extended Agent attribute, fault-domain (`DomainInfo`), CPU microarchitectural core (`CoreDescriptor`),
+/// and NUMA hugepage/unified memory pool (`NumaMemoryPool`) profile evaluated during scheduling.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentSchedulingProfile {
+    /// Advertised Mesos key-value [`AgentAttribute`]s (`TEXT`, `SCALAR`, `RANGES`, `SET`).
+    pub attributes: Vec<AgentAttribute>,
+    /// Optional geographic/rack fault domain (`RegionName` + `ZoneName`).
+    pub domain_info: Option<DomainInfo>,
+    /// Discovered physical CPU cores (`CpuCoreClass` + `CpuInstructionExtension` SIMD flags).
+    pub cores: Vec<CoreDescriptor>,
+    /// Discovered per-NUMA-node memory pools (`hugepages_2mib_bytes`, `hugepages_1gib_bytes`, `unified_memory`).
+    pub numa_pools: Vec<NumaMemoryPool>,
+    /// Number of tasks already placed on this Agent host during the current scheduling scope.
+    pub existing_tasks_on_host: u32,
+    /// Number of tasks already placed in this Agent's fault-domain zone during the current scheduling scope.
+    pub existing_tasks_in_zone: u32,
+}
+
+/// Verifies that an Agent's [`AgentSchedulingProfile`] satisfies all [`TaskSchedulingRequirements`].
+///
+/// # Arguments
+///
+/// * `task_id` - Workload [`TaskId`] for error reporting.
+/// * `reqs` - Task microarchitectural and placement requirements.
+/// * `profile` - Candidate Agent's [`AgentSchedulingProfile`].
+///
+/// # Returns
+///
+/// `Ok(())` if all constraints are satisfied.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::NoEligibleAgents`] if any constraint fails.
+pub fn verify_scheduling_requirements(
+    task_id: &TaskId,
+    reqs: &TaskSchedulingRequirements,
+    profile: &AgentSchedulingProfile,
+) -> ArbiterResult<()> {
+    if reqs
+        .required_domain
+        .as_ref()
+        .is_some_and(|req_dom| profile.domain_info.as_ref() != Some(req_dom))
+    {
+        return Err(ArbiterError::NoEligibleAgents {
+            workload: task_id.to_string(),
+            reason: "agent DomainInfo does not match required fault domain".to_owned(),
+        });
+    }
+    for constraint in &reqs.placement_constraints {
+        if !constraint.matches_agent(
+            &profile.attributes,
+            profile.existing_tasks_on_host,
+            profile.existing_tasks_in_zone,
+        ) {
+            return Err(ArbiterError::NoEligibleAgents {
+                workload: task_id.to_string(),
+                reason: "agent failed PlacementConstraint evaluation".to_owned(),
+            });
+        }
+    }
+    if let Some(ref cpu_req) = reqs.cpu_resource {
+        let has_matching_core = profile.cores.iter().any(|core| {
+            cpu_req
+                .preferred_core_class
+                .is_none_or(|cls| core.core_class == cls)
+                && cpu_req
+                    .required_extensions
+                    .iter()
+                    .all(|ext| core.extensions.contains(ext))
+        });
+        if !has_matching_core {
+            return Err(ArbiterError::NoEligibleAgents {
+                workload: task_id.to_string(),
+                reason:
+                    "no CPU core satisfies CpuCoreClass and CpuInstructionExtension requirements"
+                        .to_owned(),
+            });
+        }
+    }
+    if let Some(ref mem_req) = reqs.memory_resource {
+        let req_unified = mem_req.require_unified_memory;
+        let has_matching_pool = profile.numa_pools.iter().any(|pool| {
+            pool.ram_bytes >= mem_req.ram_bytes
+                && pool.hugepages_2mib_bytes >= mem_req.hugepages_2mib_bytes
+                && pool.hugepages_1gib_bytes >= mem_req.hugepages_1gib_bytes
+                && (pool.unified_memory || !req_unified)
+        });
+        if !has_matching_pool {
+            return Err(ArbiterError::NoEligibleAgents {
+                workload: task_id.to_string(),
+                reason: "no NumaMemoryPool satisfies hugepage or unified_memory requirements"
+                    .to_owned(),
+            });
+        }
+    }
+    Ok(())
+}
 
 /// Per-NUMA-domain free CPU and memory capacity on an Agent.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -45,6 +147,58 @@ pub struct AgentHardwareInventory {
     pub rdma_nics: Vec<RdmaDevice>,
     /// Interconnect topology graph for this Agent.
     pub topology: HardwareTopologyGraph,
+}
+
+impl AgentHardwareInventory {
+    /// Deducts the resources and hardware devices consumed by `plan` and `task` from this
+    /// [`AgentHardwareInventory`]:
+    /// 1. Subtracts `task.resources` from `self.available_bundle`.
+    /// 2. Subtracts `task.resources.cpu` and `task.resources.memory` from the matching
+    ///    `NumaDomainCapacity` (`plan.selected_numa_node`).
+    /// 3. Subtracts per-GPU compute and VRAM from each assigned [`GpuDevice`] in `self.gpus`.
+    ///
+    /// # Arguments
+    ///
+    /// * `task` - Placed [`TaskSpec`].
+    /// * `plan` - Resulting [`TopologyPlacementPlan`].
+    pub fn apply_placement_deduction(&mut self, task: &TaskSpec, plan: &TopologyPlacementPlan) {
+        self.available_bundle = self
+            .available_bundle
+            .try_sub(&task.resources)
+            .unwrap_or_default();
+        for domain in &mut self.numa_domains {
+            if domain.numa_node_id == plan.selected_numa_node {
+                domain.available_cpu = domain.available_cpu.saturating_sub(task.resources.cpu);
+                domain.available_memory = domain
+                    .available_memory
+                    .saturating_sub(task.resources.memory);
+            }
+        }
+        let gpu_count = u64::try_from(plan.assigned_gpus.len()).unwrap_or(1).max(1);
+        let per_gpu_compute = GpuMillicores::new(
+            task.resources
+                .gpu_compute
+                .get()
+                .checked_div(gpu_count)
+                .unwrap_or(0),
+        );
+        let per_gpu_vram = Bytes::new(
+            task.resources
+                .gpu_vram
+                .get()
+                .checked_div(gpu_count)
+                .unwrap_or(0),
+        );
+        for (assigned_id, assigned_part) in &plan.assigned_gpus {
+            for gpu in &mut self.gpus {
+                if &gpu.device_id == assigned_id {
+                    gpu.available_compute = gpu.available_compute.saturating_sub(per_gpu_compute);
+                    gpu.available_vram = gpu.available_vram.saturating_sub(per_gpu_vram);
+                    gpu.partition = *assigned_part;
+                }
+            }
+        }
+    }
 }
 
 /// Concrete hardware assignment produced by the topology bin-packer for a [`TaskSpec`].
@@ -121,6 +275,53 @@ pub fn select_auto_mig_profile(
 /// - [`ArbiterError::InsufficientResources`] if aggregate resources or GPU counts are insufficient.
 /// - [`ArbiterError::NoEligibleAgents`] if NUMA co-location, GPU vendor, or topology constraints cannot be met.
 pub fn pack_task_on_agent(
+    task: &TaskSpec,
+    inventory: &AgentHardwareInventory,
+) -> ArbiterResult<TopologyPlacementPlan> {
+    pack_task_on_agent_with_profile(task, inventory, &AgentSchedulingProfile::default())
+}
+
+/// Packs a [`TaskSpec`] onto an [`AgentHardwareInventory`] while evaluating `profile` constraints.
+///
+/// # Arguments
+///
+/// * `task` - The workload [`TaskSpec`] to place.
+/// * `inventory` - The Agent's [`AgentHardwareInventory`].
+/// * `profile` - The Agent's [`AgentSchedulingProfile`].
+///
+/// # Returns
+///
+/// Optimal [`TopologyPlacementPlan`] on the Agent.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::InsufficientResources`] or [`ArbiterError::NoEligibleAgents`] on failure.
+pub fn pack_task_on_agent_with_profile(
+    task: &TaskSpec,
+    inventory: &AgentHardwareInventory,
+    profile: &AgentSchedulingProfile,
+) -> ArbiterResult<TopologyPlacementPlan> {
+    if let Some(reqs) = TaskSchedulingRequirements::from_task(task) {
+        verify_scheduling_requirements(&task.task_id, &reqs, profile)?;
+    }
+    pack_task_core(task, inventory)
+}
+
+/// Core NUMA, GPU, MIG/MPS, and `PCIe` RDMA placement solver for `task` on `inventory`.
+///
+/// # Arguments
+///
+/// * `task` - The workload [`TaskSpec`] to place.
+/// * `inventory` - The Agent's [`AgentHardwareInventory`].
+///
+/// # Returns
+///
+/// Optimal [`TopologyPlacementPlan`] on the Agent.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::InsufficientResources`] or [`ArbiterError::NoEligibleAgents`] on failure.
+fn pack_task_core(
     task: &TaskSpec,
     inventory: &AgentHardwareInventory,
 ) -> ArbiterResult<TopologyPlacementPlan> {
@@ -212,19 +413,17 @@ pub fn pack_task_on_agent(
         });
     }
 
-    let selected_gpus: Vec<&GpuDevice> =
-        whole_candidates.into_iter().take(whole_gpu_count).collect();
-
-    let affinity_score = verify_and_score_gpu_island(
+    let (selected_gpus, affinity_score) = select_optimal_gpu_island_subset(
         task,
         &inventory.topology,
-        first_gpu,
-        &selected_gpus,
+        &whole_candidates,
+        whole_gpu_count,
         require_nvlink,
     )?;
+    let anchor_gpu = selected_gpus.first().copied().unwrap_or(first_gpu);
 
     let paired_rdma_nic = if require_same_pcie_switch {
-        Some(select_closest_rdma_nic(task, inventory, first_gpu)?)
+        Some(select_closest_rdma_nic(task, inventory, anchor_gpu)?)
     } else {
         None
     };
@@ -240,6 +439,77 @@ pub fn pack_task_on_agent(
         assigned_gpus,
         paired_rdma_nic,
         affinity_score,
+    })
+}
+
+/// Evaluates candidate `k`-GPU subsets from `whole_candidates` and selects the subset that
+/// satisfies `require_nvlink` while maximizing pairwise interconnect affinity on `topology`.
+///
+/// # Arguments
+///
+/// * `task` - Workload specification.
+/// * `topology` - Agent's [`HardwareTopologyGraph`].
+/// * `whole_candidates` - Slice of eligible whole GPUs.
+/// * `k` - Number of whole GPUs required.
+/// * `require_nvlink` - Whether direct `NVLink`/`NVSwitch`/`InfinityFabric` edges are mandatory.
+///
+/// # Returns
+///
+/// Tuple `(Vec<&GpuDevice>, u64)` of the highest-affinity `k`-GPU subset and its score.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::NoEligibleAgents`] if no `k`-GPU subset satisfies `require_nvlink`.
+fn select_optimal_gpu_island_subset<'a>(
+    task: &TaskSpec,
+    topology: &HardwareTopologyGraph,
+    whole_candidates: &[&'a GpuDevice],
+    k: usize,
+    require_nvlink: bool,
+) -> ArbiterResult<(Vec<&'a GpuDevice>, u64)> {
+    let n = whole_candidates.len();
+    let mut best_subset: Option<(Vec<&'a GpuDevice>, u64)> = None;
+
+    for (anchor_idx, &anchor) in whole_candidates
+        .iter()
+        .enumerate()
+        .take(n.saturating_sub(k).saturating_add(1))
+    {
+        if k == 1 {
+            return Ok((vec![anchor], 1000));
+        }
+        // Rank all remaining candidates by their pairwise affinity to `anchor` descending
+        let mut peers: Vec<(&'a GpuDevice, u64)> = whole_candidates
+            .iter()
+            .enumerate()
+            .filter(|&(idx, _)| idx != anchor_idx)
+            .map(|(_, &peer)| {
+                let score = topology
+                    .compute_affinity(&anchor.device_id, &peer.device_id)
+                    .map(|a| a.composite_score)
+                    .unwrap_or(100);
+                (peer, score)
+            })
+            .collect();
+        peers.sort_by(|a, b| b.1.cmp(&a.1));
+
+        let mut subset = Vec::with_capacity(k);
+        subset.push(anchor);
+        for (peer, _) in peers.into_iter().take(k.saturating_sub(1)) {
+            subset.push(peer);
+        }
+
+        if let Ok(score) =
+            verify_and_score_gpu_island(task, topology, anchor, &subset, require_nvlink)
+        {
+            best_subset = Some((subset, score));
+            break;
+        }
+    }
+
+    best_subset.ok_or_else(|| ArbiterError::NoEligibleAgents {
+        workload: task.task_id.to_string(),
+        reason: "selected GPUs are not connected via NVLink/NVSwitch/InfinityFabric".to_owned(),
     })
 }
 
@@ -316,8 +586,8 @@ fn place_fractional_gpu(
     };
 
     let partition = task.required_gpu_partition.map_or_else(
-        || {
-            select_auto_mig_profile(req_compute, req_vram).map_or_else(
+        || match gpu.vendor {
+            GpuVendor::Nvidia => select_auto_mig_profile(req_compute, req_vram).map_or_else(
                 |_| {
                     let bps = req_compute.get().saturating_mul(10);
                     let share = WeightBasisPoints::new(bps).unwrap_or(WeightBasisPoints::STANDARD);
@@ -332,7 +602,33 @@ fn place_fractional_gpu(
                         instance_index: 0,
                     })
                 },
-            )
+            ),
+            GpuVendor::Amd => {
+                let compute_mode = if req_compute.get() <= 125 {
+                    AmdComputePartitionMode::Cpx
+                } else if req_compute.get() <= 250 {
+                    AmdComputePartitionMode::Qpx
+                } else {
+                    AmdComputePartitionMode::Dpx
+                };
+                GpuPartition::AmdComputePartition(AmdPartitionSlice {
+                    compute_mode,
+                    memory_mode: AmdMemoryPartitionMode::Nps4,
+                    partition_index: 0,
+                })
+            }
+            GpuVendor::Intel => GpuPartition::IntelTile(IntelTilePartition {
+                tile_index: 0,
+                vram_bytes: req_vram,
+            }),
+            GpuVendor::Apple => {
+                let cores = u32::try_from(req_compute.get().div_ceil(25)).unwrap_or(8);
+                GpuPartition::AppleMetalSlice(AppleMetalPartition {
+                    gpu_cores: cores,
+                    unified_memory_bytes: req_vram,
+                    include_neural_engine: true,
+                })
+            }
         },
         |explicit| explicit,
     );
@@ -376,10 +672,6 @@ fn verify_and_score_gpu_island(
     gpus: &[&GpuDevice],
     require_nvlink: bool,
 ) -> ArbiterResult<u64> {
-    if gpus.len() == 1 {
-        return Ok(1000);
-    }
-
     let mut total_score = 0_u64;
     for &other_gpu in gpus.iter().skip(1) {
         if require_nvlink {
@@ -458,10 +750,12 @@ fn select_closest_rdma_nic(
 #[cfg(test)]
 mod tests {
     use arbiter_core::ids::{RoleName, TaskId};
-    use arbiter_core::resources::{GpuVendor, RdmaFabricKind};
+    use arbiter_core::resources::{CpuResource, GpuVendor, MemoryResource, RdmaFabricKind};
     use arbiter_core::topology::{TopologyNode, TopologyNodeKind};
     use arbiter_core::units::{BandwidthBps, LatencyNanoseconds};
-    use arbiter_core::workload::{IsolationSpec, PreemptionPolicy, PriorityClass};
+    use arbiter_core::workload::{
+        IsolationSpec, PlacementConstraint, PreemptionPolicy, PriorityClass,
+    };
 
     use super::*;
 
@@ -586,11 +880,18 @@ mod tests {
                 gpu_vram: Bytes::new(320 * 1024 * 1024 * 1024),
                 ..ResourceBundle::zero()
             },
-            numa_domains: vec![NumaDomainCapacity {
-                numa_node_id: 0,
-                available_cpu: Millicores::new(32_000),
-                available_memory: Bytes::new(256 * 1024 * 1024 * 1024),
-            }],
+            numa_domains: vec![
+                NumaDomainCapacity {
+                    numa_node_id: 0,
+                    available_cpu: Millicores::new(32_000),
+                    available_memory: Bytes::new(256 * 1024 * 1024 * 1024),
+                },
+                NumaDomainCapacity {
+                    numa_node_id: 1,
+                    available_cpu: Millicores::new(16_000),
+                    available_memory: Bytes::new(128 * 1024 * 1024 * 1024),
+                },
+            ],
             gpus: gpu_list,
             rdma_nics,
             topology: topo,
@@ -663,11 +964,31 @@ mod tests {
         amd_task.required_gpu_vendor = Some(GpuVendor::Amd);
         assert!(pack_task_on_agent(&amd_task, &inv).is_err());
 
-        // Remove NVLink edges and verify NvLinkConnected fails
+        // Replace NVLink edges with a non-NVLink PCIe edge and verify NvLinkConnected fails
         inv.topology = HardwareTopologyGraph::new();
+        let g0 = DeviceId::new("gpu-0").unwrap_or_default();
+        let g1 = DeviceId::new("gpu-1").unwrap_or_default();
+        let _ = inv.topology.add_node(TopologyNode {
+            id: g0.clone(),
+            kind: TopologyNodeKind::GpuNode,
+            numa_node_id: 0,
+        });
+        let _ = inv.topology.add_node(TopologyNode {
+            id: g1.clone(),
+            kind: TopologyNodeKind::GpuNode,
+            numa_node_id: 0,
+        });
+        let _ = inv.topology.add_bidirectional_link(
+            g0,
+            g1,
+            InterconnectKind::PcieGen5,
+            BandwidthBps::new(100),
+            LatencyNanoseconds::new(100),
+        );
         assert!(pack_task_on_agent(&quad_gpu, &inv).is_err());
 
         // SamePcieSwitch fails when topology has no path to RDMA NIC
+        inv.topology = HardwareTopologyGraph::new();
         assert!(pack_task_on_agent(&single_gpu, &inv).is_err());
     }
 
@@ -706,6 +1027,26 @@ mod tests {
         explicit_task.required_gpu_partition = Some(GpuPartition::WholeDevice);
         assert!(pack_task_on_agent(&explicit_task, &inv).is_ok());
 
+        // 2b. Multi-vendor fractional GPU slicing (AMD CPX/QPX/DPX, Intel Tile, Apple Metal Slice)
+        for (vendor, compute_m, expected_match) in [
+            (GpuVendor::Amd, 100_u64, "AmdCpx"),
+            (GpuVendor::Amd, 200, "AmdQpx"),
+            (GpuVendor::Amd, 500, "AmdDpx"),
+            (GpuVendor::Intel, 500, "IntelTile"),
+            (GpuVendor::Apple, 500, "AppleMetal"),
+        ] {
+            let mut v_inv = inv.clone();
+            for g in &mut v_inv.gpus {
+                g.vendor = vendor;
+            }
+            let mut v_task = base_task(4_000, 1024, compute_m, 4 * 1024 * 1024 * 1024);
+            v_task.required_gpu_vendor = Some(vendor);
+            let v_plan = pack_task_on_agent(&v_task, &v_inv).unwrap_or_default();
+            assert_eq!(v_plan.assigned_gpus.len(), 1);
+            let _ = expected_match;
+            v_inv.apply_placement_deduction(&v_task, &v_plan);
+        }
+
         // 3. Fractional request exceeding 80 GiB MIG limit falls back to NvidiaMps
         let mps_task = base_task(4_000, 1024, 500, 90 * 1024 * 1024 * 1024);
         assert!(
@@ -721,5 +1062,199 @@ mod tests {
         // 5. Fractional request with no eligible GPUs
         inv.gpus.clear();
         assert!(pack_task_on_agent(&mig_task, &inv).is_err());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+    fn test_microarch_memory_pool_domain_and_placement_constraints() {
+        use arbiter_core::ids::{RegionName, ZoneName};
+        use arbiter_core::resources::{CpuCoreClass, CpuInstructionExtension};
+        use arbiter_core::workload::AgentAttributeValue;
+
+        let inv = sample_inventory();
+        let dom_east = DomainInfo::new(
+            RegionName::new("us-east-1").unwrap_or_default(),
+            ZoneName::new("us-east-1a").unwrap_or_default(),
+        );
+        let dom_west = DomainInfo::new(
+            RegionName::new("us-west-2").unwrap_or_default(),
+            ZoneName::new("us-west-2a").unwrap_or_default(),
+        );
+
+        let profile = AgentSchedulingProfile {
+            attributes: vec![AgentAttribute {
+                key: "rack".to_owned(),
+                value: AgentAttributeValue::Text("r1".to_owned()),
+            }],
+            domain_info: Some(dom_east.clone()),
+            cores: vec![CoreDescriptor {
+                hardware_thread_id: 0,
+                physical_core_id: 0,
+                numa_node_id: 0,
+                core_class: CpuCoreClass::PerformanceCore,
+                l1_cache_group_id: 0,
+                l2_cache_group_id: 0,
+                l3_cache_group_id: 0,
+                base_frequency: arbiter_core::units::FrequencyMegahertz::new(2800),
+                boost_frequency: arbiter_core::units::FrequencyMegahertz::new(3800),
+                extensions: vec![
+                    CpuInstructionExtension::Avx2,
+                    CpuInstructionExtension::Avx512,
+                ],
+            }],
+            numa_pools: vec![NumaMemoryPool {
+                numa_node_id: 0,
+                ram_bytes: Bytes::new(256 * 1024 * 1024 * 1024),
+                hugepages_2mib_bytes: Bytes::new(2 * 1024 * 1024 * 1024),
+                hugepages_1gib_bytes: Bytes::new(16 * 1024 * 1024 * 1024),
+                bandwidth: BandwidthBps::new(400_000_000_000),
+                unified_memory: true,
+            }],
+            existing_tasks_on_host: 1,
+            existing_tasks_in_zone: 2,
+        };
+
+        let mut task = base_task(4_000, 1024, 0, 0);
+        task.isolation
+            .env
+            .push(("OTHER_KEY".to_owned(), "val".to_owned()));
+        let reqs = TaskSchedulingRequirements {
+            cpu_resource: Some(CpuResource {
+                millicores: Millicores::new(4_000),
+                preferred_core_class: Some(CpuCoreClass::PerformanceCore),
+                required_extensions: vec![
+                    CpuInstructionExtension::Avx2,
+                    CpuInstructionExtension::Avx512,
+                ],
+            }),
+            memory_resource: Some(MemoryResource {
+                ram_bytes: Bytes::new(1024),
+                hugepages_2mib_bytes: Bytes::new(2 * 1024 * 1024),
+                hugepages_1gib_bytes: Bytes::new(1024 * 1024 * 1024),
+                require_unified_memory: true,
+            }),
+            placement_constraints: vec![
+                PlacementConstraint::Equals(
+                    "rack".to_owned(),
+                    AgentAttributeValue::Text("r1".to_owned()),
+                ),
+                PlacementConstraint::MaxPerHostname(2),
+                PlacementConstraint::MaxPerFaultDomain(3),
+            ],
+            required_domain: Some(dom_east),
+            ..TaskSchedulingRequirements::default()
+        };
+        reqs.attach_to_task(&mut task);
+        // Re-attaching replaces the existing key
+        reqs.attach_to_task(&mut task);
+        assert_eq!(TaskSchedulingRequirements::from_task(&task), Some(reqs));
+        assert!(pack_task_on_agent_with_profile(&task, &inv, &profile).is_ok());
+
+        // Also test CpuResource with preferred_core_class = None and MemoryResource with require_unified_memory = false
+        let mut relaxed_task = base_task(4_000, 1024, 0, 0);
+        TaskSchedulingRequirements {
+            cpu_resource: Some(CpuResource {
+                millicores: Millicores::new(4_000),
+                preferred_core_class: None,
+                required_extensions: Vec::new(),
+            }),
+            memory_resource: Some(MemoryResource {
+                ram_bytes: Bytes::new(1024),
+                hugepages_2mib_bytes: Bytes::ZERO,
+                hugepages_1gib_bytes: Bytes::ZERO,
+                require_unified_memory: false,
+            }),
+            placement_constraints: Vec::new(),
+            required_domain: None,
+            ..TaskSchedulingRequirements::default()
+        }
+        .attach_to_task(&mut relaxed_task);
+        assert!(pack_task_on_agent_with_profile(&relaxed_task, &inv, &profile).is_ok());
+
+        // Failure 1: DomainInfo mismatch
+        let mut bad_dom_task = base_task(4_000, 1024, 0, 0);
+        TaskSchedulingRequirements {
+            required_domain: Some(dom_west),
+            ..TaskSchedulingRequirements::default()
+        }
+        .attach_to_task(&mut bad_dom_task);
+        assert!(pack_task_on_agent_with_profile(&bad_dom_task, &inv, &profile).is_err());
+
+        // Failure 2: PlacementConstraint mismatch
+        let mut bad_attr_task = base_task(4_000, 1024, 0, 0);
+        TaskSchedulingRequirements {
+            placement_constraints: vec![PlacementConstraint::MaxPerHostname(1)],
+            ..TaskSchedulingRequirements::default()
+        }
+        .attach_to_task(&mut bad_attr_task);
+        assert!(pack_task_on_agent_with_profile(&bad_attr_task, &inv, &profile).is_err());
+
+        // Failure 3: CpuCoreClass mismatch
+        let mut bad_core_task = base_task(4_000, 1024, 0, 0);
+        TaskSchedulingRequirements {
+            cpu_resource: Some(CpuResource {
+                millicores: Millicores::new(4_000),
+                preferred_core_class: Some(CpuCoreClass::EfficiencyCore),
+                required_extensions: Vec::new(),
+            }),
+            ..TaskSchedulingRequirements::default()
+        }
+        .attach_to_task(&mut bad_core_task);
+        assert!(pack_task_on_agent_with_profile(&bad_core_task, &inv, &profile).is_err());
+
+        // Failure 4: CpuInstructionExtension mismatch
+        let mut bad_ext_task = base_task(4_000, 1024, 0, 0);
+        TaskSchedulingRequirements {
+            cpu_resource: Some(CpuResource {
+                millicores: Millicores::new(4_000),
+                preferred_core_class: Some(CpuCoreClass::PerformanceCore),
+                required_extensions: vec![CpuInstructionExtension::Amx],
+            }),
+            ..TaskSchedulingRequirements::default()
+        }
+        .attach_to_task(&mut bad_ext_task);
+        assert!(pack_task_on_agent_with_profile(&bad_ext_task, &inv, &profile).is_err());
+
+        // Failure 5: NumaMemoryPool mismatch (ram, hugepages_2mib, hugepages_1gib, unified_memory)
+        let mut non_unified_profile = profile;
+        for p in &mut non_unified_profile.numa_pools {
+            p.unified_memory = false;
+        }
+        for bad_mem in [
+            MemoryResource {
+                ram_bytes: Bytes::new(999 * 1024 * 1024 * 1024),
+                hugepages_2mib_bytes: Bytes::ZERO,
+                hugepages_1gib_bytes: Bytes::ZERO,
+                require_unified_memory: false,
+            },
+            MemoryResource {
+                ram_bytes: Bytes::new(1024),
+                hugepages_2mib_bytes: Bytes::new(99 * 1024 * 1024 * 1024),
+                hugepages_1gib_bytes: Bytes::ZERO,
+                require_unified_memory: false,
+            },
+            MemoryResource {
+                ram_bytes: Bytes::new(1024),
+                hugepages_2mib_bytes: Bytes::ZERO,
+                hugepages_1gib_bytes: Bytes::new(99 * 1024 * 1024 * 1024),
+                require_unified_memory: false,
+            },
+            MemoryResource {
+                ram_bytes: Bytes::new(1024),
+                hugepages_2mib_bytes: Bytes::ZERO,
+                hugepages_1gib_bytes: Bytes::ZERO,
+                require_unified_memory: true,
+            },
+        ] {
+            let mut bad_mem_task = base_task(4_000, 1024, 0, 0);
+            TaskSchedulingRequirements {
+                memory_resource: Some(bad_mem),
+                ..TaskSchedulingRequirements::default()
+            }
+            .attach_to_task(&mut bad_mem_task);
+            assert!(
+                pack_task_on_agent_with_profile(&bad_mem_task, &inv, &non_unified_profile).is_err()
+            );
+        }
     }
 }

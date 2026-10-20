@@ -268,8 +268,40 @@ impl ElectionPlane {
             fencing_token,
             expires_at_tick: current_tick.saturating_add(group.lease_ttl_ticks),
         };
+        let lease_key = format!("/caas_leases/{group_id}");
+        let _ = store.put(&lease_key, serde_json::to_vec(&grant).unwrap_or_default());
         group.current_lease = Some(grant.clone());
         Ok(grant)
+    }
+
+    /// Returns an immutable reference to all registered [`ElectionGroup`]s.
+    ///
+    /// # Returns
+    ///
+    /// Map of [`ElectionGroupId`] to [`ElectionGroup`].
+    pub const fn groups(&self) -> &BTreeMap<ElectionGroupId, ElectionGroup> {
+        &self.groups
+    }
+
+    /// Restores a recovered [`LeaseGrant`] into the election plane upon Master state store recovery.
+    ///
+    /// # Arguments
+    ///
+    /// * `grant` - Recovered [`LeaseGrant`] from `/caas_leases/*`.
+    pub fn restore_lease(&mut self, grant: LeaseGrant) {
+        let group = self
+            .groups
+            .entry(grant.group_id.clone())
+            .or_insert_with(|| ElectionGroup {
+                group_id: grant.group_id.clone(),
+                members: vec![(
+                    grant.primary_task_id.clone(),
+                    grant.hosting_agent_id.clone(),
+                )],
+                current_lease: None,
+                lease_ttl_ticks: 100,
+            });
+        group.current_lease = Some(grant);
     }
 
     /// Processes a single-wire [`MultiplexedAgentHeartbeat`], renewing active primary leases for all
@@ -511,6 +543,12 @@ mod tests {
             .elect_or_promote_primary(&mut store, &gid, &t1, 160, None)
             .unwrap_or_default();
         assert_eq!(grant3.fencing_token.get(), 3);
+        assert_eq!(plane.groups().len(), 1);
+
+        let mut recovered_plane = ElectionPlane::new();
+        recovered_plane.restore_lease(grant3.clone());
+        recovered_plane.restore_lease(grant3);
+        assert_eq!(recovered_plane.groups().len(), 1);
 
         // Store fault on next_fencing_token propagates cleanly
         store.set_fault(Some(crate::memory::MemoryStoreFault::FailWrites));

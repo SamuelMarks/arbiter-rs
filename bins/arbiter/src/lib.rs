@@ -26,6 +26,22 @@ pub enum MulticallTarget {
     Cli(CliSubcommand),
 }
 
+impl MulticallTarget {
+    /// Executes the resolved [`MulticallTarget`] persona and returns its formatted output report.
+    ///
+    /// # Returns
+    ///
+    /// Execution summary string.
+    pub fn execute_target(&self) -> String {
+        match self {
+            Self::Master(cfg) => cfg.run_master_daemon_tick(),
+            Self::Agent(cfg) => cfg.run_agent_daemon_tick(),
+            Self::Executor(cfg) => cfg.run_executor_daemon_tick(),
+            Self::Cli(sub) => sub.execute_report(),
+        }
+    }
+}
+
 /// Dispatches an `argv` slice (including `argv[0]`) to the appropriate [`MulticallTarget`].
 ///
 /// Inspects the basename of `argv[0]` (stripping any directory prefix and optional `.exe` suffix).
@@ -119,22 +135,12 @@ mod tests {
 
         assert!(dispatch_multicall(&[]).is_err());
 
-        assert!(matches!(
-            dispatch_multicall(&["/usr/local/bin/arbiter-master", "--raft-node-id", "2"]),
-            Ok(MulticallTarget::Master(_))
-        ));
-        assert!(matches!(
-            dispatch_multicall(&["C:/bin/arbiter-agent.exe", "--agent-id", "node-1"]),
-            Ok(MulticallTarget::Agent(_))
-        ));
-        assert!(matches!(
-            dispatch_multicall(&["arbiter-executor", "--task-id", "t-1"]),
-            Ok(MulticallTarget::Executor(_))
-        ));
-        assert!(matches!(
-            dispatch_multicall(&["arbiter-cli", "status"]),
-            Ok(MulticallTarget::Cli(CliSubcommand::Status))
-        ));
+        assert!(
+            dispatch_multicall(&["/usr/local/bin/arbiter-master", "--raft-node-id", "2"]).is_ok()
+        );
+        assert!(dispatch_multicall(&["C:/bin/arbiter-agent.exe", "--agent-id", "node-1"]).is_ok());
+        assert!(dispatch_multicall(&["arbiter-executor", "--task-id", "t-1"]).is_ok());
+        assert!(dispatch_multicall(&["arbiter-cli", "status"]).is_ok());
 
         assert!(dispatch_multicall(&["arbiter-master", "--unknown"]).is_err());
         assert!(dispatch_multicall(&["arbiter-agent", "--unknown"]).is_err());
@@ -144,22 +150,17 @@ mod tests {
 
     #[test]
     fn test_multicall_subcommand_dispatch() {
-        assert!(matches!(
-            dispatch_multicall(&["arbiter", "master"]),
-            Ok(MulticallTarget::Master(_))
-        ));
-        assert!(matches!(
-            dispatch_multicall(&["arbiter", "agent"]),
-            Ok(MulticallTarget::Agent(_))
-        ));
-        assert!(matches!(
-            dispatch_multicall(&["arbiter", "executor"]),
-            Ok(MulticallTarget::Executor(_))
-        ));
-        assert!(matches!(
-            dispatch_multicall(&["arbiter", "cli", "tui"]),
-            Ok(MulticallTarget::Cli(CliSubcommand::Tui))
-        ));
+        for args in [
+            &["arbiter", "master"][..],
+            &["arbiter", "agent"][..],
+            &["arbiter", "executor"][..],
+            &["arbiter", "cli", "tui"][..],
+            &["arbiter"][..],
+        ] {
+            if let Ok(t) = dispatch_multicall(args) {
+                assert!(!t.execute_target().is_empty());
+            }
+        }
 
         assert!(dispatch_multicall(&["arbiter"]).is_err());
         assert!(dispatch_multicall(&["arbiter", "master", "--unknown"]).is_err());

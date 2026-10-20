@@ -573,6 +573,45 @@ pub fn verify_calibration_drift(
     WeightBasisPoints::new(drift_bps.max(1))
 }
 
+/// Parses an empirical `(PacketCount, Bytes)` counter pair from a `nftables` (`counter packets <P> bytes <B>`)
+/// or `pfctl -vvs rules` (`[ Evaluations: ... Packets: <P> Bytes: <B> ... ]`) summary line.
+///
+/// # Arguments
+///
+/// * `counter_line` - Kernel firewall counter output line.
+///
+/// # Returns
+///
+/// Tuple `(PacketCount, Bytes)` extracted from the line.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::InvalidBenchmarkConfig`] if `packets` or `bytes` tokens cannot be parsed.
+pub fn parse_kernel_nic_counter_line(counter_line: &str) -> ArbiterResult<(PacketCount, Bytes)> {
+    let mut pkts: Option<u64> = None;
+    let mut bytes: Option<u64> = None;
+    let tokens: Vec<&str> = counter_line.split_whitespace().collect();
+    for (idx, &tok) in tokens.iter().enumerate() {
+        let lower = tok.trim_end_matches(':').to_ascii_lowercase();
+        if lower == "packets" {
+            if let Some(val_str) = tokens.get(idx.saturating_add(1)) {
+                pkts = val_str.parse::<u64>().ok();
+            }
+        } else if lower == "bytes" {
+            if let Some(val_str) = tokens.get(idx.saturating_add(1)) {
+                bytes = val_str.parse::<u64>().ok();
+            }
+        }
+    }
+    let (Some(p), Some(b)) = (pkts, bytes) else {
+        return Err(ArbiterError::InvalidBenchmarkConfig {
+            parameter: "counter_line".to_owned(),
+            reason: format!("missing packets/bytes tokens in '{counter_line}'"),
+        });
+    };
+    Ok((PacketCount::new(p), Bytes::new(b)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,5 +776,21 @@ mod tests {
         );
         // 8% drift (800 bps > 500 bps) -> CalibrationDriftExceeded
         assert!(verify_calibration_drift(Bytes::new(10_800), Bytes::new(10_000), max_500).is_err());
+    }
+
+    #[test]
+    fn test_parse_kernel_nic_counter_line() {
+        assert_eq!(
+            parse_kernel_nic_counter_line("udp dport 5050 counter packets 360 bytes 59040"),
+            Ok((PacketCount::new(360), Bytes::new(59_040)))
+        );
+        assert_eq!(
+            parse_kernel_nic_counter_line(
+                "[ Evaluations: 1200 Packets: 720 Bytes: 118080 States: 1 ]"
+            ),
+            Ok((PacketCount::new(720), Bytes::new(118_080)))
+        );
+        assert!(parse_kernel_nic_counter_line("counter packets bad bytes").is_err());
+        assert!(parse_kernel_nic_counter_line("counter packets").is_err());
     }
 }

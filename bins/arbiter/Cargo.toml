@@ -13,11 +13,6 @@ categories.workspace = true
 
 [dependencies]
 arbiter-core = { workspace = true }
-arbiter-master = { workspace = true }
-arbiter-agent = { workspace = true }
-arbiter-executor = { workspace = true }
-arbiter-sdk = { workspace = true }
-arbiter-tui = { workspace = true }
 arbiter-master-bin = { workspace = true }
 arbiter-agent-bin = { workspace = true }
 arbiter-executor-bin = { workspace = true }

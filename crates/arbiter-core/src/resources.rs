@@ -30,7 +30,6 @@ use crate::units::{
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum CpuCoreClass {
     /// High-performance core (e.g., Apple Silicon P-core, Intel P-core).
     PerformanceCore,
@@ -56,7 +55,6 @@ pub enum CpuCoreClass {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum CpuInstructionExtension {
     /// x86 256-bit Advanced Vector Extensions 2.
     Avx2,
@@ -83,7 +81,6 @@ pub enum CpuInstructionExtension {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct CoreDescriptor {
     /// Logical OS hardware thread ID.
     pub hardware_thread_id: u32,
@@ -121,7 +118,6 @@ pub struct CoreDescriptor {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct CpuResource {
     /// Total compute capacity in millicores.
     pub millicores: Millicores,
@@ -147,7 +143,6 @@ pub struct CpuResource {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum HugePageSize {
     /// 2 MiB huge pages.
     Size2MiB,
@@ -168,7 +163,6 @@ pub enum HugePageSize {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct NumaMemoryPool {
     /// NUMA domain identifier.
     pub numa_node_id: u32,
@@ -199,7 +193,6 @@ pub struct NumaMemoryPool {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct MemoryResource {
     /// Standard system RAM in bytes.
     pub ram_bytes: Bytes,
@@ -227,7 +220,6 @@ pub struct MemoryResource {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum GpuVendor {
     /// NVIDIA Data Center / Workstation GPUs (`H100`, `H200`, `B200`, `A100`, `L40S`).
     Nvidia,
@@ -255,7 +247,6 @@ pub enum GpuVendor {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum NvidiaMigProfile {
     /// 1 compute slice (1/7), 5 GB VRAM (`A100 40GB`).
     Mig1g5gb,
@@ -395,7 +386,6 @@ impl NvidiaMigProfile {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum AmdComputePartitionMode {
     /// Single Partition Accelerator (`SPX` - 1 logical device).
     Spx,
@@ -425,7 +415,6 @@ pub enum AmdComputePartitionMode {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum AmdMemoryPartitionMode {
     /// Single memory NUMA domain across all HBM stacks.
     Nps1,
@@ -449,7 +438,6 @@ pub enum AmdMemoryPartitionMode {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct NvidiaMigPartition {
     /// MIG profile specification.
     pub profile: NvidiaMigProfile,
@@ -471,7 +459,6 @@ pub struct NvidiaMigPartition {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct NvidiaMpsPartition {
     /// Compute weight share in basis points (`1..=10_000`).
     pub compute_share: WeightBasisPoints,
@@ -493,7 +480,6 @@ pub struct NvidiaMpsPartition {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct AmdPartitionSlice {
     /// Spatial compute mode.
     pub compute_mode: AmdComputePartitionMode,
@@ -517,7 +503,6 @@ pub struct AmdPartitionSlice {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct IntelTilePartition {
     /// Tile index (`0` or `1` on PVC).
     pub tile_index: u32,
@@ -539,7 +524,6 @@ pub struct IntelTilePartition {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct AppleMetalPartition {
     /// Number of Apple GPU cores reserved.
     pub gpu_cores: u32,
@@ -563,7 +547,6 @@ pub struct AppleMetalPartition {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum GpuPartition {
     /// Exclusive allocation of the entire physical GPU.
     WholeDevice,
@@ -592,7 +575,6 @@ pub enum GpuPartition {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct GpuDevice {
     /// Unique hardware device identifier.
     pub device_id: DeviceId,
@@ -626,7 +608,6 @@ pub struct GpuDevice {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum TpuGeneration {
     /// Google Cloud TPU v4 (3D optical circuit switched torus).
     CloudTpuV4,
@@ -671,7 +652,6 @@ impl TpuGeneration {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct TorusCoordinate {
     /// X coordinate on the ICI torus.
     pub x: u32,
@@ -694,7 +674,6 @@ pub struct TorusCoordinate {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct TpuDevice {
     /// Unique TPU chip device ID.
     pub device_id: DeviceId,
@@ -727,7 +706,6 @@ pub struct TpuDevice {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct TpuTopologySlice {
     /// Identifier of the TPU slice.
     pub slice_id: SliceId,
@@ -831,7 +809,6 @@ impl TpuTopologySlice {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum DiskClass {
     /// Local `PCIe` `NVMe` flash drive.
     Nvme,
@@ -860,7 +837,6 @@ pub enum DiskClass {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct StorageResource {
     /// Disk capacity in bytes.
     pub capacity_bytes: Bytes,
@@ -888,7 +864,6 @@ pub struct StorageResource {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum RdmaFabricKind {
     /// Native `InfiniBand` (`NDR` / `HDR` / `EDR`).
     InfiniBand,
@@ -915,7 +890,6 @@ pub enum RdmaFabricKind {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct RdmaDevice {
     /// Hardware device identifier (e.g., `mlx5_0`).
     pub device_id: DeviceId,
@@ -943,7 +917,6 @@ pub struct RdmaDevice {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct NetworkResource {
     /// Allocated or available network port ranges.
     pub ports: PortSet,
@@ -973,7 +946,6 @@ pub struct NetworkResource {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct ResourceBundle {
     /// CPU compute capacity in millicores.
     pub cpu: Millicores,
@@ -1294,6 +1266,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines, clippy::type_complexity)]
     fn test_resource_bundle_add_sub_and_empty() {
         let empty = ResourceBundle::zero();
         assert!(empty.is_empty());
@@ -1334,6 +1307,147 @@ mod tests {
 
         assert!(bundle_a.contains(&bundle_b));
         assert!(!bundle_b.contains(&bundle_a));
+
+        let rkyv_tuple_1 = (
+            CoreDescriptor {
+                hardware_thread_id: 0,
+                physical_core_id: 0,
+                numa_node_id: 0,
+                l1_cache_group_id: 0,
+                l2_cache_group_id: 0,
+                l3_cache_group_id: 0,
+                core_class: CpuCoreClass::PerformanceCore,
+                base_frequency: FrequencyMegahertz::ZERO,
+                boost_frequency: FrequencyMegahertz::ZERO,
+                extensions: Vec::new(),
+            },
+            CpuResource::default(),
+            NumaMemoryPool {
+                numa_node_id: 0,
+                ram_bytes: Bytes::ZERO,
+                hugepages_2mib_bytes: Bytes::ZERO,
+                hugepages_1gib_bytes: Bytes::ZERO,
+                bandwidth: BandwidthBps::ZERO,
+                unified_memory: false,
+            },
+            MemoryResource::default(),
+            vec![
+                GpuPartition::WholeDevice,
+                GpuPartition::NvidiaMig(NvidiaMigPartition {
+                    profile: NvidiaMigProfile::Mig1g5gb,
+                    instance_index: 0,
+                }),
+                GpuPartition::NvidiaMps(NvidiaMpsPartition {
+                    compute_share: WeightBasisPoints::STANDARD,
+                    vram_cap: Bytes::ZERO,
+                }),
+                GpuPartition::AmdComputePartition(AmdPartitionSlice {
+                    compute_mode: AmdComputePartitionMode::Spx,
+                    memory_mode: AmdMemoryPartitionMode::Nps1,
+                    partition_index: 0,
+                }),
+                GpuPartition::IntelTile(IntelTilePartition {
+                    tile_index: 0,
+                    vram_bytes: Bytes::ZERO,
+                }),
+                GpuPartition::AppleMetalSlice(AppleMetalPartition {
+                    gpu_cores: 1,
+                    unified_memory_bytes: Bytes::ZERO,
+                    include_neural_engine: false,
+                }),
+            ],
+        );
+        let rkyv_tuple_2 = (
+            GpuDevice {
+                device_id: DeviceId::default(),
+                vendor: GpuVendor::Nvidia,
+                model_name: String::new(),
+                numa_node_id: 0,
+                available_compute: GpuMillicores::ZERO,
+                available_vram: Bytes::ZERO,
+                partition: GpuPartition::WholeDevice,
+            },
+            TpuDevice {
+                device_id: DeviceId::default(),
+                generation: TpuGeneration::CloudTpuV4,
+                chip_index: 0,
+                hbm_bytes: Bytes::ZERO,
+                coordinate: TorusCoordinate { x: 0, y: 0, z: 0 },
+                ici_links_healthy: true,
+                wrap_around_links: false,
+                slice_id: SliceId::default(),
+            },
+            TpuTopologySlice {
+                slice_id: SliceId::default(),
+                generation: TpuGeneration::CloudTpuV4,
+                dim_x: 1,
+                dim_y: 1,
+                dim_z: 1,
+                require_wrap_around: false,
+            },
+            StorageResource::default(),
+            RdmaDevice {
+                device_id: DeviceId::default(),
+                fabric_kind: RdmaFabricKind::InfiniBand,
+                numa_node_id: 0,
+                bandwidth: BandwidthBps::ZERO,
+                sriov_vfs: 0,
+            },
+            NetworkResource::default(),
+            bundle_a.clone(),
+        );
+        let rkyv_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&(rkyv_tuple_1, rkyv_tuple_2))
+            .unwrap_or_default();
+        for i in 0..rkyv_bytes.len() {
+            let mut corrupted = rkyv_bytes.clone();
+            for (j, b) in corrupted.iter_mut().enumerate() {
+                if i == j {
+                    *b ^= 0xFF;
+                }
+            }
+            let _: Result<
+                (
+                    (
+                        CoreDescriptor,
+                        CpuResource,
+                        NumaMemoryPool,
+                        MemoryResource,
+                        Vec<GpuPartition>,
+                    ),
+                    (
+                        GpuDevice,
+                        TpuDevice,
+                        TpuTopologySlice,
+                        StorageResource,
+                        RdmaDevice,
+                        NetworkResource,
+                        ResourceBundle,
+                    ),
+                ),
+                rkyv::rancor::Error,
+            > = rkyv::from_bytes(&corrupted);
+        }
+        let _: Result<_, rkyv::rancor::Error> = rkyv::from_bytes::<
+            (
+                (
+                    CoreDescriptor,
+                    CpuResource,
+                    NumaMemoryPool,
+                    MemoryResource,
+                    Vec<GpuPartition>,
+                ),
+                (
+                    GpuDevice,
+                    TpuDevice,
+                    TpuTopologySlice,
+                    StorageResource,
+                    RdmaDevice,
+                    NetworkResource,
+                    ResourceBundle,
+                ),
+            ),
+            rkyv::rancor::Error,
+        >(&rkyv_bytes);
 
         let diff = bundle_a.try_sub(&bundle_b).unwrap_or_default();
         assert_eq!(diff.try_add(&bundle_b), Ok(bundle_a));

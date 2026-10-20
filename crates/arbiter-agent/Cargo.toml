@@ -19,12 +19,9 @@ arbiter-net = { workspace = true }
 arbiter-probe = { workspace = true }
 arbiter-iso = { workspace = true }
 arbiter-storage = { workspace = true }
-arbiter-telemetry = { workspace = true }
 arbiter-executor = { workspace = true }
 serde = { workspace = true }
-
-[dev-dependencies]
-proptest = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

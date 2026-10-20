@@ -85,10 +85,7 @@ macro_rules! define_string_id {
             RkyvSerialize,
             RkyvDeserialize,
         )]
-        #[rkyv(
-            compare(PartialEq, PartialOrd),
-            derive(Debug, PartialEq, Eq, PartialOrd, Ord, Hash)
-        )]
+        #[rkyv(derive(PartialEq, Eq, PartialOrd, Ord, Hash))]
         pub struct $name(pub(crate) String);
 
         impl $name {
@@ -255,6 +252,756 @@ define_string_id!(
     "QuotaId"
 );
 
+define_string_id!(
+    /// Unique identifier for a Mesos v1 Offer Operation (`RESERVE`, `UNRESERVE`, `CREATE`, `DESTROY`, `LAUNCH`).
+    OperationId,
+    "OperationId"
+);
+
+define_string_id!(
+    /// Unique identifier for a scheduled Agent Maintenance Window.
+    MaintenanceWindowId,
+    "MaintenanceWindowId"
+);
+
+define_string_id!(
+    /// Unique identifier for an at-least-once task or operation status update requiring acknowledgment.
+    StatusUpdateUuid,
+    "StatusUpdateUuid"
+);
+
+define_string_id!(
+    /// Unique identifier for a local or external CSI Resource Provider on an Agent.
+    ResourceProviderId,
+    "ResourceProviderId"
+);
+
+define_string_id!(
+    /// Fault-domain geographic region identifier (Mesos `DomainInfo::FaultDomain::RegionInfo`).
+    RegionName,
+    "RegionName"
+);
+
+define_string_id!(
+    /// Fault-domain availability zone or rack identifier (Mesos `DomainInfo::FaultDomain::ZoneInfo`).
+    ZoneName,
+    "ZoneName"
+);
+
+define_string_id!(
+    /// Unique identifier for an OCI container instance (`crun`, `runc`, `containerd`, `ocijail`, `runhcs`).
+    ContainerId,
+    "ContainerId"
+);
+
+define_string_id!(
+    /// Unique identifier for a lightweight `MicroVM` instance (`Firecracker`, `bhyve`, `Hyper-V`, `Virtualization.framework`).
+    VmId,
+    "VmId"
+);
+
+define_string_id!(
+    /// Validated Linux `cgroup v2` relative hierarchy identifier.
+    CgroupPath,
+    "CgroupPath"
+);
+
+/// Validated FreeBSD Jail numeric identifier (`jid >= 1`).
+#[must_use]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct JailId(i32);
+
+impl Default for JailId {
+    /// Returns the default valid [`JailId`] (`1`).
+    ///
+    /// # Returns
+    ///
+    /// `JailId(1)`.
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+impl JailId {
+    /// Constructs a validated FreeBSD [`JailId`] (`>= 1`).
+    ///
+    /// # Arguments
+    ///
+    /// * `jid` - Raw FreeBSD jail identifier (`>= 1`).
+    ///
+    /// # Returns
+    ///
+    /// Validated [`JailId`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidResourceQuantity`] if `jid <= 0`.
+    pub fn new(jid: i32) -> ArbiterResult<Self> {
+        if jid <= 0 {
+            return Err(ArbiterError::InvalidResourceQuantity {
+                resource: "JailId".to_owned(),
+                quantity: 0,
+                reason: "FreeBSD jail ID must be >= 1".to_owned(),
+            });
+        }
+        Ok(Self(jid))
+    }
+
+    /// Returns the underlying `i32` jail identifier.
+    ///
+    /// # Returns
+    ///
+    /// Raw `i32` jail ID.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+impl fmt::Display for JailId {
+    /// Formats the FreeBSD jail ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Validated illumos Zone numeric identifier (`zoneid >= 1` for non-global zones).
+#[must_use]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct ZoneId(i32);
+
+impl Default for ZoneId {
+    /// Returns the default valid non-global [`ZoneId`] (`1`).
+    ///
+    /// # Returns
+    ///
+    /// `ZoneId(1)`.
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+impl ZoneId {
+    /// Constructs a validated illumos non-global [`ZoneId`] (`>= 1`).
+    ///
+    /// # Arguments
+    ///
+    /// * `zid` - Raw illumos zone identifier (`>= 1`).
+    ///
+    /// # Returns
+    ///
+    /// Validated [`ZoneId`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidResourceQuantity`] if `zid <= 0`.
+    pub fn new(zid: i32) -> ArbiterResult<Self> {
+        if zid <= 0 {
+            return Err(ArbiterError::InvalidResourceQuantity {
+                resource: "ZoneId".to_owned(),
+                quantity: 0,
+                reason: "illumos non-global zone ID must be >= 1".to_owned(),
+            });
+        }
+        Ok(Self(zid))
+    }
+
+    /// Returns the underlying `i32` zone identifier.
+    ///
+    /// # Returns
+    ///
+    /// Raw `i32` zone ID.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+impl fmt::Display for ZoneId {
+    /// Formats the illumos zone ID.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Validated network or local IPC socket endpoint (`host:port` or Unix Domain Socket / Named Pipe path).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct SocketEndpoint(String);
+
+impl SocketEndpoint {
+    /// Validates and constructs a [`SocketEndpoint`].
+    ///
+    /// Accepts either a `host:port` TCP/UDP address (with port in `1..=65535`) or a non-empty
+    /// Unix Domain Socket (`/path/to.sock`) / Windows Named Pipe (`\\.\pipe\name`) path without null bytes.
+    ///
+    /// # Arguments
+    ///
+    /// * `endpoint` - Candidate endpoint string slice.
+    ///
+    /// # Returns
+    ///
+    /// Validated [`SocketEndpoint`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::EmptyIdentifier`] if `endpoint` is empty, or
+    /// [`ArbiterError::InvalidIdentifierCharacters`] if malformed.
+    pub fn new(endpoint: &str) -> ArbiterResult<Self> {
+        if endpoint.is_empty() {
+            return Err(ArbiterError::EmptyIdentifier {
+                kind: "SocketEndpoint".to_owned(),
+            });
+        }
+        if endpoint.contains('\0') {
+            return Err(ArbiterError::InvalidIdentifierCharacters {
+                kind: "SocketEndpoint".to_owned(),
+                value: endpoint.to_owned(),
+                reason: "endpoint must not contain null bytes".to_owned(),
+            });
+        }
+        if endpoint.starts_with('/') || endpoint.starts_with(r"\\.\pipe\") {
+            if endpoint.len() <= 1 || endpoint == r"\\.\pipe\" {
+                return Err(ArbiterError::InvalidIdentifierCharacters {
+                    kind: "SocketEndpoint".to_owned(),
+                    value: endpoint.to_owned(),
+                    reason: "IPC socket path must include a filename".to_owned(),
+                });
+            }
+            return Ok(Self(endpoint.to_owned()));
+        }
+        let Some((host, port_str)) = endpoint.rsplit_once(':') else {
+            return Err(ArbiterError::InvalidIdentifierCharacters {
+                kind: "SocketEndpoint".to_owned(),
+                value: endpoint.to_owned(),
+                reason: "network endpoint must be in 'host:port' format or start with '/'"
+                    .to_owned(),
+            });
+        };
+        if host.is_empty() {
+            return Err(ArbiterError::InvalidIdentifierCharacters {
+                kind: "SocketEndpoint".to_owned(),
+                value: endpoint.to_owned(),
+                reason: "host portion of endpoint cannot be empty".to_owned(),
+            });
+        }
+        let port =
+            port_str
+                .parse::<u16>()
+                .map_err(|_| ArbiterError::InvalidIdentifierCharacters {
+                    kind: "SocketEndpoint".to_owned(),
+                    value: endpoint.to_owned(),
+                    reason: "port must be an integer in 1..=65535".to_owned(),
+                })?;
+        if port == 0 {
+            return Err(ArbiterError::InvalidResourceQuantity {
+                resource: "SocketEndpoint::port".to_owned(),
+                quantity: 0,
+                reason: "port number must be non-zero".to_owned(),
+            });
+        }
+        Ok(Self(endpoint.to_owned()))
+    }
+
+    /// Returns the underlying endpoint string slice.
+    ///
+    /// # Returns
+    ///
+    /// Endpoint `&str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns `true` if this endpoint refers to a local Unix Domain Socket or Windows Named Pipe.
+    ///
+    /// # Returns
+    ///
+    /// `true` if local IPC path.
+    pub fn is_local_ipc(&self) -> bool {
+        self.0.starts_with('/') || self.0.starts_with(r"\\.\pipe\")
+    }
+}
+
+impl fmt::Display for SocketEndpoint {
+    /// Formats the socket endpoint string.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Validated 64-character lowercase hexadecimal SHA-256 content digest.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct Sha256Digest(String);
+
+impl Sha256Digest {
+    /// Exact length of a hex-encoded SHA-256 digest (`64` ASCII hex characters).
+    pub const HEX_LEN: usize = 64;
+
+    /// Validates and constructs a [`Sha256Digest`] from a 64-character hexadecimal string,
+    /// normalizing uppercase hex digits to canonical lowercase.
+    ///
+    /// # Arguments
+    ///
+    /// * `hex_str` - Candidate 64-character hex string.
+    ///
+    /// # Returns
+    ///
+    /// Validated lowercase [`Sha256Digest`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidIdentifierCharacters`] if `hex_str` is not exactly 64 hex characters.
+    pub fn new(hex_str: &str) -> ArbiterResult<Self> {
+        if hex_str.len() != Self::HEX_LEN {
+            return Err(ArbiterError::InvalidIdentifierCharacters {
+                kind: "Sha256Digest".to_owned(),
+                value: hex_str.to_owned(),
+                reason: format!(
+                    "SHA-256 hex digest must be exactly {} characters",
+                    Self::HEX_LEN
+                ),
+            });
+        }
+        if !hex_str.bytes().all(|b| b.is_ascii_hexdigit()) {
+            return Err(ArbiterError::InvalidIdentifierCharacters {
+                kind: "Sha256Digest".to_owned(),
+                value: hex_str.to_owned(),
+                reason: "contains non-hexadecimal character".to_owned(),
+            });
+        }
+        Ok(Self(hex_str.to_ascii_lowercase()))
+    }
+
+    /// Returns the canonical 64-character lowercase hex digest string slice.
+    ///
+    /// # Returns
+    ///
+    /// Hex string slice `&str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Sha256Digest {
+    /// Formats the SHA-256 hex digest.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Validated relative sandbox path that rejects path traversal (`..`), leading slashes (`/`),
+/// backslashes (`\`), and null bytes at construction time.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct SandboxPath(String);
+
+impl SandboxPath {
+    /// Validates and constructs a safe relative [`SandboxPath`].
+    ///
+    /// # Arguments
+    ///
+    /// * `rel_path` - Candidate relative path inside a task sandbox.
+    ///
+    /// # Returns
+    ///
+    /// Validated [`SandboxPath`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::EmptyIdentifier`] if `rel_path` is empty, or
+    /// [`ArbiterError::SandboxError`] if `rel_path` starts with `/`, contains `\`, `\0`, or `..` segments.
+    pub fn new(rel_path: &str) -> ArbiterResult<Self> {
+        if rel_path.is_empty() {
+            return Err(ArbiterError::EmptyIdentifier {
+                kind: "SandboxPath".to_owned(),
+            });
+        }
+        if rel_path.starts_with('/') || rel_path.contains('\\') || rel_path.contains('\0') {
+            return Err(ArbiterError::SandboxError {
+                mechanism: "SandboxPath".to_owned(),
+                reason: format!(
+                    "disallowed absolute, backslash, or null character in '{rel_path}'"
+                ),
+            });
+        }
+        let mut normalized_parts = Vec::new();
+        for seg in rel_path.split('/') {
+            if seg.is_empty() || seg == "." {
+                continue;
+            }
+            if seg == ".." {
+                return Err(ArbiterError::SandboxError {
+                    mechanism: "SandboxPath".to_owned(),
+                    reason: format!("path traversal '..' rejected in '{rel_path}'"),
+                });
+            }
+            normalized_parts.push(seg);
+        }
+        if normalized_parts.is_empty() {
+            return Err(ArbiterError::EmptyIdentifier {
+                kind: "SandboxPath".to_owned(),
+            });
+        }
+        Ok(Self(normalized_parts.join("/")))
+    }
+
+    /// Returns the normalized relative path string slice.
+    ///
+    /// # Returns
+    ///
+    /// Relative path `&str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for SandboxPath {
+    /// Formats the relative sandbox path.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+/// Strongly-typed non-zero operating system process identifier (`PID`).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct OsProcessId(u32);
+
+impl Default for OsProcessId {
+    /// Returns PID `1` as the default valid [`OsProcessId`].
+    ///
+    /// # Returns
+    ///
+    /// `OsProcessId(1)`.
+    fn default() -> Self {
+        Self(1)
+    }
+}
+
+impl OsProcessId {
+    /// Constructs a validated non-zero [`OsProcessId`].
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - Raw OS process ID (`>= 1`).
+    ///
+    /// # Returns
+    ///
+    /// Validated [`OsProcessId`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidResourceQuantity`] if `pid == 0`.
+    pub fn new(pid: u32) -> ArbiterResult<Self> {
+        if pid == 0 {
+            return Err(ArbiterError::InvalidResourceQuantity {
+                resource: "OsProcessId".to_owned(),
+                quantity: 0,
+                reason: "process ID must be non-zero".to_owned(),
+            });
+        }
+        Ok(Self(pid))
+    }
+
+    /// Returns the raw `u32` process identifier.
+    ///
+    /// # Returns
+    ///
+    /// Raw `u32` PID.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for OsProcessId {
+    /// Formats the OS PID.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Canonical type alias for [`OsProcessId`].
+pub type ProcessId = OsProcessId;
+
+/// Strongly-typed non-negative POSIX file descriptor identifier (`fd >= 0`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct FileDescriptorId(i32);
+
+impl FileDescriptorId {
+    /// Constructs a validated non-negative [`FileDescriptorId`].
+    ///
+    /// # Arguments
+    ///
+    /// * `fd` - Raw OS file descriptor (`>= 0`).
+    ///
+    /// # Returns
+    ///
+    /// Validated [`FileDescriptorId`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidResourceQuantity`] if `fd < 0`.
+    pub fn new(fd: i32) -> ArbiterResult<Self> {
+        if fd < 0 {
+            return Err(ArbiterError::InvalidResourceQuantity {
+                resource: "FileDescriptorId".to_owned(),
+                quantity: 0,
+                reason: "file descriptor must be non-negative (>= 0)".to_owned(),
+            });
+        }
+        Ok(Self(fd))
+    }
+
+    /// Returns the raw `i32` file descriptor number.
+    ///
+    /// # Returns
+    ///
+    /// Raw `i32` descriptor.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+impl fmt::Display for FileDescriptorId {
+    /// Formats the file descriptor number.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Strongly-typed process exit code with POSIX signal-termination decoding (`128 + signum`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct ExitCode(i32);
+
+impl ExitCode {
+    /// Canonical clean exit code (`0`).
+    pub const SUCCESS: Self = Self(0);
+
+    /// Wraps a raw process exit status code.
+    ///
+    /// # Arguments
+    ///
+    /// * `code` - Raw process exit code (`0` = success, `128 + sig` = signal termination).
+    ///
+    /// # Returns
+    ///
+    /// [`ExitCode`].
+    pub const fn new(code: i32) -> Self {
+        Self(code)
+    }
+
+    /// Returns the raw `i32` exit status code.
+    ///
+    /// # Returns
+    ///
+    /// Raw `i32` code.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+
+    /// Returns `true` if the process exited cleanly (`code == 0`).
+    ///
+    /// # Returns
+    ///
+    /// `true` if `0`.
+    pub const fn is_success(self) -> bool {
+        self.0 == 0
+    }
+
+    /// If the exit code follows the POSIX `128 + signal` convention (`129..=192`), returns the signal number.
+    ///
+    /// # Returns
+    ///
+    /// `Some(signal_number)` if terminated by a signal in `1..=64`, otherwise `None`.
+    pub const fn terminating_signal(self) -> Option<i32> {
+        if self.0 > 128 && self.0 <= 192 {
+            Some(self.0 - 128)
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Display for ExitCode {
+    /// Formats the process exit code.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Strictly monotonic 64-bit fencing token issued during leader/primary elections.
 #[derive(
     Debug,
@@ -271,7 +1018,6 @@ define_string_id!(
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct FencingToken(u64);
 
 impl Default for FencingToken {
@@ -421,7 +1167,6 @@ impl FromStr for FencingToken {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct SpiffeId {
     /// Full canonical SPIFFE URI.
     uri: String,
@@ -598,19 +1343,119 @@ mod tests {
     check_id_type!(test_volume_id, VolumeId, "vol-zfs-1");
     check_id_type!(test_secret_id, SecretId, "sec-jwt-1");
     check_id_type!(test_quota_id, QuotaId, "quota-prod");
+    check_id_type!(test_operation_id, OperationId, "op-res-1");
+    check_id_type!(
+        test_maintenance_window_id,
+        MaintenanceWindowId,
+        "mw-rack-01"
+    );
+    check_id_type!(test_status_update_uuid, StatusUpdateUuid, "uuid-status-1");
+    check_id_type!(test_resource_provider_id, ResourceProviderId, "rp-csi-1");
+    check_id_type!(test_region_name, RegionName, "us-east-1");
+    check_id_type!(test_zone_name, ZoneName, "us-east-1a:rack-04");
+    check_id_type!(test_container_id, ContainerId, "ctr-task-01");
+    check_id_type!(test_vm_id, VmId, "vm-fc-01");
+    check_id_type!(test_cgroup_path, CgroupPath, "arbiter.slice:task-01");
+
+    #[test]
+    fn test_jail_id_and_zone_id() {
+        assert_eq!(JailId::default().get(), 1);
+        assert!(JailId::new(0).is_err());
+        assert!(JailId::new(-5).is_err());
+        let jid = JailId::new(12).unwrap_or_default();
+        assert_eq!(jid.get(), 12);
+        assert_eq!(jid.to_string(), "12");
+
+        assert_eq!(ZoneId::default().get(), 1);
+        assert!(ZoneId::new(0).is_err());
+        assert!(ZoneId::new(-1).is_err());
+        let zid = ZoneId::new(7).unwrap_or_default();
+        assert_eq!(zid.get(), 7);
+        assert_eq!(zid.to_string(), "7");
+
+        let _ = rkyv::to_bytes::<rkyv::rancor::Error>(&(jid, zid));
+    }
+
+    #[test]
+    fn test_socket_endpoint_and_sha256() {
+        let tcp_ep = SocketEndpoint::new("127.0.0.1:5050").unwrap_or_default();
+        assert_eq!(tcp_ep.as_str(), "127.0.0.1:5050");
+        assert_eq!(tcp_ep.to_string(), "127.0.0.1:5050");
+        assert!(!tcp_ep.is_local_ipc());
+
+        let uds_ep = SocketEndpoint::new("/var/run/arbiter/caas.sock").unwrap_or_default();
+        assert!(uds_ep.is_local_ipc());
+
+        let pipe_ep = SocketEndpoint::new(r"\\.\pipe\arbiter-caas").unwrap_or_default();
+        assert!(pipe_ep.is_local_ipc());
+
+        for bad_ep in [
+            "",
+            "127.0.0.1\0:5050",
+            "/",
+            r"\\.\pipe\",
+            "no-port",
+            ":5050",
+            "127.0.0.1:notanumber",
+            "127.0.0.1:0",
+        ] {
+            assert!(SocketEndpoint::new(bad_ep).is_err());
+        }
+
+        let valid_hex = "A".repeat(64);
+        let dig = Sha256Digest::new(&valid_hex).unwrap_or_default();
+        assert_eq!(dig.as_str(), "a".repeat(64));
+        assert_eq!(dig.to_string(), "a".repeat(64));
+        assert!(Sha256Digest::new("short").is_err());
+        assert!(Sha256Digest::new(&"z".repeat(64)).is_err());
+    }
+
+    #[test]
+    fn test_sandbox_path_pid_and_exit_code() {
+        let sp = SandboxPath::new("./bin//worker/./app").unwrap_or_default();
+        assert_eq!(sp.as_str(), "bin/worker/app");
+        assert_eq!(sp.to_string(), "bin/worker/app");
+        for bad_sp in [
+            "",
+            "./.",
+            "/etc/passwd",
+            r"bin\app",
+            "bin\0app",
+            "bin/../etc/passwd",
+        ] {
+            assert!(SandboxPath::new(bad_sp).is_err());
+        }
+
+        assert_eq!(OsProcessId::default().get(), 1);
+        assert!(OsProcessId::new(0).is_err());
+        let pid = ProcessId::new(4242).unwrap_or_default();
+        assert_eq!(pid.get(), 4242);
+        assert_eq!(pid.to_string(), "4242");
+
+        assert_eq!(FileDescriptorId::default().get(), 0);
+        assert!(FileDescriptorId::new(-1).is_err());
+        let fd = FileDescriptorId::new(3).unwrap_or_default();
+        assert_eq!(fd.get(), 3);
+        assert_eq!(fd.to_string(), "3");
+        let _ = rkyv::to_bytes::<rkyv::rancor::Error>(&fd);
+
+        let ok_code = ExitCode::SUCCESS;
+        assert_eq!(ok_code.get(), 0);
+        assert!(ok_code.is_success());
+        assert_eq!(ok_code.terminating_signal(), None);
+        assert_eq!(ok_code.to_string(), "0");
+
+        let sigkill_code = ExitCode::new(137);
+        assert!(!sigkill_code.is_success());
+        assert_eq!(sigkill_code.terminating_signal(), Some(9));
+        assert_eq!(ExitCode::new(255).terminating_signal(), None);
+    }
 
     #[test]
     fn test_identifier_bounds_and_invalid_chars() {
         let long_str = "a".repeat(MAX_IDENTIFIER_LEN + 1);
-        assert!(matches!(
-            TaskId::new(&long_str),
-            Err(ArbiterError::InvalidIdentifierCharacters { .. })
-        ));
-
-        assert!(matches!(
-            RoleName::new("invalid/slash"),
-            Err(ArbiterError::InvalidIdentifierCharacters { .. })
-        ));
+        assert!(TaskId::new(&long_str).is_err());
+        assert!(RoleName::new("invalid:char@").is_err());
     }
 
     #[test]
@@ -691,6 +1536,17 @@ mod tests {
     #[test]
     fn test_rkyv_and_serde_roundtrip_for_ids() {
         let id = AgentId(String::from("agent-rkyv-1"));
+        let all_ids = (
+            id.clone(),
+            SocketEndpoint::default(),
+            Sha256Digest::default(),
+            SandboxPath::default(),
+            OsProcessId::default(),
+            ExitCode::default(),
+            FencingToken::default(),
+            SpiffeId::default(),
+        );
+        let _ = rkyv::to_bytes::<rkyv::rancor::Error>(&all_ids);
         let bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&id);
         assert!(bytes.is_ok());
         let encoded = bytes.unwrap_or_default();

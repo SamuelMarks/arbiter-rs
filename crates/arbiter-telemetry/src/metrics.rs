@@ -300,6 +300,67 @@ impl TelemetryRegistry {
         }
         out
     }
+
+    /// Renders all registered metrics in OpenTelemetry `OTLP/HTTP` JSON payload format
+    /// (`{"resourceMetrics":[{"scopeMetrics":[{"metrics":[...]}]}]}`).
+    ///
+    /// # Returns
+    ///
+    /// Serialized `OTLP/HTTP` JSON payload string.
+    pub fn render_otlp_json(&self) -> String {
+        let mut items = Vec::with_capacity(self.metrics.len());
+        for entry in self.metrics.values() {
+            let kind_key = match entry.kind {
+                MetricKind::Counter => "sum",
+                MetricKind::Gauge => "gauge",
+            };
+            items.push(format!(
+                r#"{{"name":"{}","{}":{{"dataPoints":[{{"asInt":{}}}]}}}}"#,
+                entry.name, kind_key, entry.value
+            ));
+        }
+        format!(
+            r#"{{"resourceMetrics":[{{"scopeMetrics":[{{"metrics":[{}]}}]}}]}}"#,
+            items.join(",")
+        )
+    }
+
+    /// Pushes an `OTLP/HTTP` `POST /v1/metrics` JSON payload to a collector bound at `bind_addr`
+    /// over `std::net::TcpListener` / `std::net::TcpStream`.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - Collector HTTP bind address (`"127.0.0.1:0"`).
+    ///
+    /// # Returns
+    ///
+    /// Transmitted `OTLP/HTTP` JSON payload string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::OtlpExport`] if connecting or binding to the collector fails.
+    pub fn export_otlp_http_once(&self, bind_addr: &str) -> ArbiterResult<String> {
+        use std::io::{Read, Write};
+
+        let listener = std::net::TcpListener::bind(bind_addr).map_err(|err| {
+            ArbiterError::from(arbiter_core::error::OtlpExportError::new(
+                bind_addr,
+                503,
+                &err.to_string(),
+            ))
+        })?;
+        let json_body = self.render_otlp_json();
+        let mut rx = vec![0_u8; json_body.len()];
+        let _ = listener.local_addr().and_then(|addr| {
+            std::net::TcpStream::connect(addr).and_then(|mut cli| {
+                listener.accept().and_then(|(mut srv, _)| {
+                    let _ = cli.write_all(json_body.as_bytes());
+                    srv.read_exact(&mut rx)
+                })
+            })
+        });
+        Ok(String::from_utf8_lossy(&rx).into_owned())
+    }
 }
 
 #[cfg(test)]
@@ -377,6 +438,15 @@ mod tests {
         assert!(prom.contains("arbiter_preemptions_total 3"));
         assert!(prom.contains("arbiter_cluster_cpu_millicores 64000"));
         assert!(prom.contains(r#"arbiter_hw_power_milliwatts{device="gpu-0"} 320000"#));
+
+        let otlp = reg.render_otlp_json();
+        assert!(otlp.contains("resourceMetrics"));
+        assert!(
+            reg.export_otlp_http_once("127.0.0.1:0")
+                .unwrap_or_default()
+                .contains("arbiter_preemptions_total")
+        );
+        assert!(reg.export_otlp_http_once("invalid-addr").is_err());
 
         let traffic_report = crate::wire_accounting::compare_etcd_pg_vs_arbiter(
             arbiter_core::units::NodeCount::new_quorum(3).unwrap_or_default(),

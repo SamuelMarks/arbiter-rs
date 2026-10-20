@@ -29,7 +29,6 @@ use crate::units::{BandwidthBps, LatencyNanoseconds};
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum TopologyNodeKind {
     /// Physical CPU socket package.
     SocketNode,
@@ -64,7 +63,6 @@ pub enum TopologyNodeKind {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct TopologyNode {
     /// Unique identifier for this hardware node.
     pub id: DeviceId,
@@ -90,7 +88,6 @@ pub struct TopologyNode {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum InterconnectKind {
     /// Cross-socket CPU coherent interconnect (`Intel UPI`/`QPI`, `AMD xGMI`).
     NumaQpiUpi,
@@ -129,7 +126,6 @@ pub enum InterconnectKind {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct InterconnectEdge {
     /// Source hardware node ID.
     pub source: DeviceId,
@@ -158,7 +154,6 @@ pub struct InterconnectEdge {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct AffinityScore {
     /// Number of interconnect hops along the optimal path (`0` if same node).
     pub hops: u32,
@@ -183,7 +178,6 @@ pub struct AffinityScore {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(derive(Debug))]
 pub struct HardwareTopologyGraph {
     /// Registered hardware nodes keyed by [`DeviceId`].
     nodes: BTreeMap<DeviceId, TopologyNode>,
@@ -709,5 +703,6 @@ mod tests {
             affinity.bottleneck_bandwidth,
             BandwidthBps::new(7_200_000_000_000)
         );
+        let _ = rkyv::to_bytes::<rkyv::rancor::Error>(&(graph, affinity));
     }
 }

@@ -10,12 +10,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::{ArbiterError, ArbiterResult};
 use crate::ids::{
-    AgentId, ElectionGroupId, ExecutorId, FrameworkId, OfferId, QuotaId, RoleName, SecretId,
-    TaskGroupId, TaskId, VolumeId,
+    AgentId, ElectionGroupId, ExecutorId, FrameworkId, MaintenanceWindowId, OfferId, OperationId,
+    QuotaId, RegionName, ResourceProviderId, RoleName, SecretId, TaskGroupId, TaskId, VolumeId,
+    ZoneName,
 };
 use crate::platform::IsolationCapability;
-use crate::resources::{GpuPartition, GpuVendor, ResourceBundle, TpuTopologySlice};
-use crate::units::{Bytes, PortNumber, WeightBasisPoints};
+use crate::resources::{
+    CpuResource, GpuPartition, GpuVendor, MemoryResource, NetworkResource, ResourceBundle,
+    StorageResource, TpuTopologySlice,
+};
+use crate::units::{BenchmarkTicks, Bytes, PortNumber, WeightBasisPoints};
 
 /// Resource quota policy attached to a [`Role`].
 #[derive(
@@ -30,7 +34,6 @@ use crate::units::{Bytes, PortNumber, WeightBasisPoints};
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct Quota {
     /// Unique identifier for this quota policy.
     pub id: QuotaId,
@@ -101,7 +104,6 @@ impl Quota {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct Role {
     /// Role name (e.g., `"prod"`, `"prod.ml"`, `"batch.analytics"`).
     pub name: RoleName,
@@ -124,7 +126,6 @@ pub struct Role {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(derive(Debug))]
 pub struct RoleHierarchy {
     /// Registered roles in deterministic order.
     roles: Vec<Role>,
@@ -142,7 +143,9 @@ impl RoleHierarchy {
 
     /// Registers a [`Role`] in the hierarchy.
     ///
-    /// If `role.parent` is `Some`, the parent role must already be registered.
+    /// If `role.parent` is `Some`, the parent role must already be registered, and the sum of
+    /// all child roles' `guaranteed_min` and `hard_max` under that parent must not exceed the
+    /// parent role's `guaranteed_min` and `hard_max`.
     ///
     /// # Arguments
     ///
@@ -155,7 +158,8 @@ impl RoleHierarchy {
     /// # Errors
     ///
     /// Returns [`ArbiterError::RoleNotFound`] if the specified parent role is not present, or
-    /// [`ArbiterError::InvalidQuotaBounds`] if a role with the same name already exists.
+    /// [`ArbiterError::InvalidQuotaBounds`] if a role with the same name already exists or if the
+    /// child quota exceeds its parent role's quota ceiling.
     pub fn add_role(&mut self, role: Role) -> ArbiterResult<()> {
         if self.roles.iter().any(|r| r.name == role.name) {
             return Err(ArbiterError::InvalidQuotaBounds {
@@ -164,9 +168,34 @@ impl RoleHierarchy {
             });
         }
         if let Some(ref parent_name) = role.parent {
-            if !self.roles.iter().any(|r| &r.name == parent_name) {
+            let Some(parent_role) = self.roles.iter().find(|r| &r.name == parent_name) else {
                 return Err(ArbiterError::RoleNotFound {
                     role: parent_name.to_string(),
+                });
+            };
+            let mut children_min = role.quota.guaranteed_min.clone();
+            let mut children_max = role.quota.hard_max.clone();
+            for sibling in self
+                .roles
+                .iter()
+                .filter(|r| r.parent.as_ref() == Some(parent_name))
+            {
+                children_min = children_min
+                    .try_add(&sibling.quota.guaranteed_min)
+                    .unwrap_or_default();
+                children_max = children_max
+                    .try_add(&sibling.quota.hard_max)
+                    .unwrap_or_default();
+            }
+            if (!parent_role.quota.guaranteed_min.is_empty()
+                && !parent_role.quota.guaranteed_min.contains(&children_min))
+                || !parent_role.quota.hard_max.contains(&children_max)
+            {
+                return Err(ArbiterError::InvalidQuotaBounds {
+                    role: role.name.to_string(),
+                    reason: format!(
+                        "aggregate child role quota exceeds parent role '{parent_name}' quota bounds"
+                    ),
                 });
             }
         }
@@ -204,6 +233,91 @@ impl RoleHierarchy {
     pub fn roles(&self) -> &[Role] {
         &self.roles
     }
+
+    /// Updates or sets the [`Quota`] for an existing role, or registers a new top-level role with `quota`.
+    ///
+    /// # Arguments
+    ///
+    /// * `role_name` - Target [`RoleName`].
+    /// * `quota` - Validated [`Quota`] policy to apply.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on update or registration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidQuotaBounds`] if `quota.hard_max` does not contain `quota.guaranteed_min`.
+    pub fn set_role_quota(&mut self, role_name: &RoleName, quota: Quota) -> ArbiterResult<()> {
+        if !quota.hard_max.contains(&quota.guaranteed_min) {
+            return Err(ArbiterError::InvalidQuotaBounds {
+                role: role_name.to_string(),
+                reason: "hard_max bundle must be >= guaranteed_min on all resource dimensions"
+                    .to_owned(),
+            });
+        }
+        if let Some(existing) = self.roles.iter_mut().find(|r| &r.name == role_name) {
+            existing.quota = quota;
+            return Ok(());
+        }
+        self.roles.push(Role {
+            name: role_name.clone(),
+            parent: None,
+            quota,
+        });
+        Ok(())
+    }
+
+    /// Resets a role's quota to unbounded `hard_max` (`ResourceBundle::max_bound_for_default()`) and zero `guaranteed_min`.
+    ///
+    /// # Arguments
+    ///
+    /// * `role_name` - Target [`RoleName`] whose quota is being removed.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when the quota is cleared.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::RoleNotFound`] if `role_name` is not registered.
+    pub fn remove_role_quota(&mut self, role_name: &RoleName) -> ArbiterResult<()> {
+        let Some(existing) = self.roles.iter_mut().find(|r| &r.name == role_name) else {
+            return Err(ArbiterError::RoleNotFound {
+                role: role_name.to_string(),
+            });
+        };
+        existing.quota.guaranteed_min = ResourceBundle::zero();
+        Ok(())
+    }
+
+    /// Updates the HDRF fairness [`WeightBasisPoints`] for a registered role.
+    ///
+    /// # Arguments
+    ///
+    /// * `role_name` - Target [`RoleName`].
+    /// * `weight` - New [`WeightBasisPoints`] (`> 0`).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when the weight is updated.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::RoleNotFound`] if `role_name` is not registered.
+    pub fn update_role_weight(
+        &mut self,
+        role_name: &RoleName,
+        weight: WeightBasisPoints,
+    ) -> ArbiterResult<()> {
+        let Some(existing) = self.roles.iter_mut().find(|r| &r.name == role_name) else {
+            return Err(ArbiterError::RoleNotFound {
+                role: role_name.to_string(),
+            });
+        };
+        existing.quota.weight = weight;
+        Ok(())
+    }
 }
 
 /// Workload scheduling priority tier (`SystemCritical` down to `Revocable`).
@@ -222,7 +336,6 @@ impl RoleHierarchy {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum PriorityClass {
     /// Borrowed idle capacity that can be reclaimed immediately when the quota owner needs it.
     Revocable,
@@ -254,7 +367,6 @@ pub enum PriorityClass {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum PreemptionPolicy {
     /// Trigger checkpoint hook (`SIGUSR1` / runtime checkpoint) and suspend before reclamation.
     CheckpointAndSuspend,
@@ -279,7 +391,6 @@ pub enum PreemptionPolicy {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum TopologyConstraint {
     /// CPU cores, RAM, and accelerators must reside on the same NUMA domain.
     SameNuma,
@@ -291,6 +402,9 @@ pub enum TopologyConstraint {
     TpuTorusContiguous(TpuTopologySlice),
     /// Tasks within the group must be placed on distinct physical Agent hosts.
     AntiAffinityHost,
+    /// Strongly-typed microarchitectural, NUMA hugepage/unified memory, storage I/O, network fabric,
+    /// attribute, fault-domain, shared volume, kill policy, and custom executor requirements.
+    ExtendedRequirements(Box<TaskSchedulingRequirements>),
 }
 
 /// Content-addressable artifact download and extraction specification.
@@ -306,7 +420,6 @@ pub enum TopologyConstraint {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct ArtifactSpec {
     /// Source URI (`https://`, `s3://`, `oci://`, or `arbiter-p2p://`).
     pub uri: String,
@@ -331,7 +444,6 @@ pub struct ArtifactSpec {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct SecretMountSpec {
     /// Identifier of the secret in the control plane.
     pub secret_id: SecretId,
@@ -352,7 +464,6 @@ pub struct SecretMountSpec {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum HealthCheckProtocol {
     /// TCP socket connect check on the specified port.
     Tcp,
@@ -375,7 +486,6 @@ pub enum HealthCheckProtocol {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct HealthCheckSpec {
     /// Probe protocol.
     pub protocol: HealthCheckProtocol,
@@ -402,7 +512,6 @@ pub struct HealthCheckSpec {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct IsolationSpec {
     /// Required OS/runtime isolation engines.
     pub capabilities: Vec<IsolationCapability>,
@@ -418,6 +527,96 @@ pub struct IsolationSpec {
     pub run_as_user: Option<String>,
 }
 
+/// Declarative task-level microarchitectural, NUMA memory pool, storage I/O, network fabric,
+/// fault-domain, attribute, shared volume, kill policy, and custom executor requirements.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct TaskSchedulingRequirements {
+    /// Optional CPU microarchitecture requirement (`preferred_core_class`, `required_extensions`).
+    pub cpu_resource: Option<CpuResource>,
+    /// Optional NUMA memory pool requirement (`hugepages_2mib_bytes`, `hugepages_1gib_bytes`, `require_unified_memory`).
+    pub memory_resource: Option<MemoryResource>,
+    /// Optional storage IOPS, throughput, and media class requirement (`max_iops`, `throughput_bps`, `disk_class`).
+    #[serde(default)]
+    pub storage_resource: Option<StorageResource>,
+    /// Optional network ingress/egress bandwidth and SR-IOV RDMA VF requirement (`ingress_bps`, `egress_bps`, `rdma_vfs`).
+    #[serde(default)]
+    pub network_resource: Option<NetworkResource>,
+    /// Declarative attribute & spread constraints (`Equals`, `NotEquals`, `InSet`, `MaxPerHostname`, `MaxPerFaultDomain`).
+    #[serde(default)]
+    pub placement_constraints: Vec<PlacementConstraint>,
+    /// Optional required fault domain (`RegionName` + `ZoneName`).
+    #[serde(default)]
+    pub required_domain: Option<DomainInfo>,
+    /// Shared or exclusive persistent volume mounts (`(VolumeId, SharedVolumeMode)`).
+    #[serde(default)]
+    pub shared_volume_mounts: Vec<(VolumeId, SharedVolumeMode)>,
+    /// Graceful termination policy (`grace_period_ticks` between `SIGTERM` and `SIGKILL`).
+    #[serde(default)]
+    pub kill_policy: KillPolicy,
+    /// Optional custom Mesos executor descriptor (`None` uses the built-in command or task-group executor).
+    #[serde(default)]
+    pub executor_info: Option<ExecutorInfo>,
+}
+
+/// Environment variable key retained only for backwards-compatible deserialization of legacy task manifests.
+pub const ARBITER_SCHEDULING_REQUIREMENTS_ENV_KEY: &str = "ARBITER_SCHEDULING_REQUIREMENTS";
+
+impl TaskSchedulingRequirements {
+    /// Attaches this [`TaskSchedulingRequirements`] as a strongly-typed
+    /// [`TopologyConstraint::ExtendedRequirements`] entry on `task.topology_constraints`,
+    /// replacing any previous entry and removing any legacy `ARBITER_SCHEDULING_REQUIREMENTS` env var.
+    ///
+    /// # Arguments
+    ///
+    /// * `task` - Mutable [`TaskSpec`] to update.
+    pub fn attach_to_task(&self, task: &mut TaskSpec) {
+        task.isolation
+            .env
+            .retain(|(k, _)| k != ARBITER_SCHEDULING_REQUIREMENTS_ENV_KEY);
+        task.topology_constraints
+            .retain(|c| !matches!(c, TopologyConstraint::ExtendedRequirements(_)));
+        task.topology_constraints
+            .push(TopologyConstraint::ExtendedRequirements(Box::new(
+                self.clone(),
+            )));
+    }
+
+    /// Extracts [`TaskSchedulingRequirements`] from `task.topology_constraints` (or falls back
+    /// to legacy `task.isolation.env` if not present in `topology_constraints`).
+    ///
+    /// # Arguments
+    ///
+    /// * `task` - [`TaskSpec`] to inspect.
+    ///
+    /// # Returns
+    ///
+    /// `Some(TaskSchedulingRequirements)` if present, or `None`.
+    pub fn from_task(task: &TaskSpec) -> Option<Self> {
+        for constraint in &task.topology_constraints {
+            if let TopologyConstraint::ExtendedRequirements(reqs) = constraint {
+                return Some((**reqs).clone());
+            }
+        }
+        task.isolation
+            .env
+            .iter()
+            .find(|(k, _)| k == ARBITER_SCHEDULING_REQUIREMENTS_ENV_KEY)
+            .and_then(|(_, v)| serde_json::from_str(v).ok())
+    }
+}
+
 /// Specification for an individual schedulable task.
 #[derive(
     Debug,
@@ -431,7 +630,6 @@ pub struct IsolationSpec {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct TaskSpec {
     /// Unique task identifier.
     pub task_id: TaskId,
@@ -463,6 +661,148 @@ pub struct TaskSpec {
     pub health_check: Option<HealthCheckSpec>,
 }
 
+impl TaskSpec {
+    /// Returns a builder-style copy of `self` with `requirements` attached as a strongly-typed
+    /// [`TopologyConstraint::ExtendedRequirements`] entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `requirements` - [`TaskSchedulingRequirements`] to attach.
+    ///
+    /// # Returns
+    ///
+    /// Updated [`TaskSpec`].
+    #[must_use]
+    pub fn with_scheduling_requirements(
+        mut self,
+        requirements: &TaskSchedulingRequirements,
+    ) -> Self {
+        requirements.attach_to_task(&mut self);
+        self
+    }
+
+    /// Returns the effective [`TaskSchedulingRequirements`] for this task (or `Default::default()`).
+    ///
+    /// # Returns
+    ///
+    /// [`TaskSchedulingRequirements`] configured on this task.
+    pub fn scheduling_requirements(&self) -> TaskSchedulingRequirements {
+        TaskSchedulingRequirements::from_task(self).unwrap_or_default()
+    }
+
+    /// Returns the strongly-typed [`CpuResource`] requirements for this task.
+    ///
+    /// # Returns
+    ///
+    /// [`CpuResource`] combining `self.resources.cpu` and any microarchitectural preferences.
+    pub fn cpu_requirements(&self) -> CpuResource {
+        let mut cpu = self
+            .scheduling_requirements()
+            .cpu_resource
+            .unwrap_or_default();
+        if cpu.millicores.is_zero() {
+            cpu.millicores = self.resources.cpu;
+        }
+        cpu
+    }
+
+    /// Returns the strongly-typed [`MemoryResource`] requirements for this task.
+    ///
+    /// # Returns
+    ///
+    /// [`MemoryResource`] combining `self.resources.memory` and any `HugePage` / unified memory settings.
+    pub fn memory_requirements(&self) -> MemoryResource {
+        let mut mem = self
+            .scheduling_requirements()
+            .memory_resource
+            .unwrap_or_default();
+        if mem.ram_bytes.is_zero() {
+            mem.ram_bytes = self.resources.memory;
+        }
+        mem
+    }
+
+    /// Returns the strongly-typed [`StorageResource`] requirements for this task.
+    ///
+    /// # Returns
+    ///
+    /// [`StorageResource`] combining `self.resources.disk` and any IOPS/throughput/class constraints.
+    pub fn storage_requirements(&self) -> StorageResource {
+        let mut storage = self
+            .scheduling_requirements()
+            .storage_resource
+            .unwrap_or_default();
+        if storage.capacity_bytes.is_zero() {
+            storage.capacity_bytes = self.resources.disk;
+        }
+        storage
+    }
+
+    /// Returns the strongly-typed [`NetworkResource`] requirements for this task.
+    ///
+    /// # Returns
+    ///
+    /// [`NetworkResource`] combining `self.resources.network_bandwidth` / `ports` and RDMA VF counts.
+    pub fn network_requirements(&self) -> NetworkResource {
+        let mut net = self
+            .scheduling_requirements()
+            .network_resource
+            .unwrap_or_default();
+        if net.ingress_bps.is_zero() {
+            net.ingress_bps = self.resources.network_bandwidth;
+        }
+        if net.ports.total_ports() == 0 {
+            net.ports = self.resources.ports.clone();
+        }
+        net
+    }
+
+    /// Returns the declarative [`PlacementConstraint`]s attached to this task.
+    ///
+    /// # Returns
+    ///
+    /// Vector of [`PlacementConstraint`]s.
+    pub fn placement_constraints(&self) -> Vec<PlacementConstraint> {
+        self.scheduling_requirements().placement_constraints
+    }
+
+    /// Returns the preferred or required [`DomainInfo`] fault domain for this task.
+    ///
+    /// # Returns
+    ///
+    /// `Option<DomainInfo>`.
+    pub fn fault_domain_preference(&self) -> Option<DomainInfo> {
+        self.scheduling_requirements().required_domain
+    }
+
+    /// Returns the persistent volume mounts and [`SharedVolumeMode`]s requested by this task.
+    ///
+    /// # Returns
+    ///
+    /// Vector of `(VolumeId, SharedVolumeMode)` pairs.
+    pub fn shared_volume_mounts(&self) -> Vec<(VolumeId, SharedVolumeMode)> {
+        self.scheduling_requirements().shared_volume_mounts
+    }
+
+    /// Returns the [`KillPolicy`] configured for this task.
+    ///
+    /// # Returns
+    ///
+    /// [`KillPolicy`].
+    pub fn kill_policy(&self) -> KillPolicy {
+        self.scheduling_requirements().kill_policy
+    }
+
+    /// Returns the optional custom [`ExecutorInfo`] configured for this task.
+    ///
+    /// # Returns
+    ///
+    /// `Option<ExecutorInfo>`.
+    pub fn executor_info(&self) -> Option<ExecutorInfo> {
+        self.scheduling_requirements().executor_info
+    }
+}
+
 /// Specification for an atomic all-or-nothing gang-scheduled workload (`TaskGroup`).
 ///
 /// Used for distributed GPU training (`NCCL`/`RCCL`), multi-host Google Cloud TPU Pod slices,
@@ -479,7 +819,6 @@ pub struct TaskSpec {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct TaskGroupSpec {
     /// Unique gang task group identifier.
     pub group_id: TaskGroupId,
@@ -509,7 +848,6 @@ pub struct TaskGroupSpec {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum TaskState {
     /// Queued in the scheduler awaiting placement.
     Pending,
@@ -527,6 +865,8 @@ pub enum TaskState {
     Preempting,
     /// Task is being explicitly terminated by user or framework request.
     Killing,
+    /// Task is hosted on a transiently partitioned Agent awaiting re-registration (Mesos `TASK_UNREACHABLE`).
+    Unreachable,
     /// Terminal state: task exited cleanly with exit code `0`.
     Finished,
     /// Terminal state: task crashed, failed health checks, or isolator failed.
@@ -535,6 +875,12 @@ pub enum TaskState {
     Killed,
     /// Terminal state: hosting Agent lost contact beyond lease TTL and was fenced.
     Lost,
+    /// Terminal state: hosting Agent was permanently decommissioned during a partition (`TASK_GONE`).
+    Gone,
+    /// Terminal state: operator explicitly marked the hosting Agent gone (`TASK_GONE_BY_OPERATOR`).
+    GoneByOperator,
+    /// Terminal reconciliation state: Master has no record of the queried task (`TASK_UNKNOWN`).
+    Unknown,
 }
 
 impl TaskState {
@@ -553,14 +899,18 @@ impl TaskState {
             Self::Checkpointing => "Checkpointing",
             Self::Preempting => "Preempting",
             Self::Killing => "Killing",
+            Self::Unreachable => "Unreachable",
             Self::Finished => "Finished",
             Self::Failed => "Failed",
             Self::Killed => "Killed",
             Self::Lost => "Lost",
+            Self::Gone => "Gone",
+            Self::GoneByOperator => "GoneByOperator",
+            Self::Unknown => "Unknown",
         }
     }
 
-    /// Returns `true` if this state is a terminal lifecycle state (`Finished`, `Failed`, `Killed`, `Lost`).
+    /// Returns `true` if this state is a terminal lifecycle state (`Finished`, `Failed`, `Killed`, `Lost`, `Gone`, `GoneByOperator`, `Unknown`).
     ///
     /// # Returns
     ///
@@ -568,7 +918,13 @@ impl TaskState {
     pub const fn is_terminal(self) -> bool {
         matches!(
             self,
-            Self::Finished | Self::Failed | Self::Killed | Self::Lost
+            Self::Finished
+                | Self::Failed
+                | Self::Killed
+                | Self::Lost
+                | Self::Gone
+                | Self::GoneByOperator
+                | Self::Unknown
         )
     }
 
@@ -593,10 +949,16 @@ impl TaskState {
                 to_state: next.as_str().to_owned(),
             });
         }
-        // Any non-terminal state can transition to Failed, Killed, Lost, or Killing
+        // Any non-terminal state can transition to Failed, Killed, Lost, Killing, Unreachable, Gone, or GoneByOperator
         if matches!(
             next,
-            Self::Failed | Self::Killed | Self::Lost | Self::Killing
+            Self::Failed
+                | Self::Killed
+                | Self::Lost
+                | Self::Killing
+                | Self::Unreachable
+                | Self::Gone
+                | Self::GoneByOperator
         ) {
             return Ok(());
         }
@@ -614,6 +976,7 @@ impl TaskState {
                     Self::Checkpointing,
                     Self::Preempting | Self::Running | Self::Finished
                 )
+                | (Self::Unreachable, Self::Running | Self::Finished)
         );
         if !valid {
             return Err(ArbiterError::TaskStateTransitionInvalid {
@@ -655,7 +1018,6 @@ impl fmt::Display for TaskState {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct OfferFilter {
     /// Duration in milliseconds to refuse offers from the same Agent (`0` = default 5s).
     pub refuse_milliseconds: u64,
@@ -663,6 +1025,79 @@ pub struct OfferFilter {
     pub min_cpu_millicores: u64,
     /// Minimum memory bytes required before sending another offer.
     pub min_memory_bytes: Bytes,
+    /// Whether to refuse offers that contain GPU capacity (`true` = refuse GPU offers).
+    #[serde(default)]
+    pub refuse_gpu_offers: bool,
+    /// Minimum GPU VRAM bytes required before sending a GPU offer.
+    #[serde(default)]
+    pub min_gpu_vram: Bytes,
+}
+
+impl OfferFilter {
+    /// Default Mesos offer refusal duration in ticks when `refuse_milliseconds == 0` (`5` ticks).
+    pub const DEFAULT_REFUSE_TICKS: u64 = 5;
+
+    /// Computes the monotonic expiration tick (`created_tick + refuse_ticks`) for this [`OfferFilter`].
+    ///
+    /// # Arguments
+    ///
+    /// * `created_tick` - Tick at which the offer was accepted or declined.
+    ///
+    /// # Returns
+    ///
+    /// Monotonic tick when the suppression filter expires and resources become eligible for re-offering.
+    pub const fn expiration_tick(&self, created_tick: BenchmarkTicks) -> BenchmarkTicks {
+        let delta_ticks = if self.refuse_milliseconds == 0 {
+            Self::DEFAULT_REFUSE_TICKS
+        } else {
+            let scaled = self.refuse_milliseconds / 1_000;
+            if scaled == 0 { 1 } else { scaled }
+        };
+        created_tick.saturating_add(BenchmarkTicks::new(delta_ticks))
+    }
+
+    /// Returns `true` if `current_tick < self.expiration_tick(created_tick)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `created_tick` - Tick when the filter was installed.
+    /// * `current_tick` - Current cluster monotonic tick.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the filter is still actively suppressing offers on the Agent.
+    pub const fn is_active_at(
+        &self,
+        created_tick: BenchmarkTicks,
+        current_tick: BenchmarkTicks,
+    ) -> bool {
+        current_tick.get() < self.expiration_tick(created_tick).get()
+    }
+
+    /// Evaluates whether `candidate` resources satisfy this filter's minimum CPU/memory/GPU thresholds.
+    ///
+    /// # Arguments
+    ///
+    /// * `candidate` - Allocatable [`ResourceBundle`] on the Agent.
+    ///
+    /// # Returns
+    ///
+    /// `true` if `candidate` meets all minimum thresholds and GPU preferences of this filter.
+    pub const fn allows_bundle(&self, candidate: &ResourceBundle) -> bool {
+        if candidate.cpu.get() < self.min_cpu_millicores {
+            return false;
+        }
+        if candidate.memory.get() < self.min_memory_bytes.get() {
+            return false;
+        }
+        if self.refuse_gpu_offers && candidate.gpu_compute.get() > 0 {
+            return false;
+        }
+        if candidate.gpu_vram.get() < self.min_gpu_vram.get() {
+            return false;
+        }
+        true
+    }
 }
 
 /// Mesos-inspired resource offer leased to a registered Framework.
@@ -678,7 +1113,6 @@ pub struct OfferFilter {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct ResourceOffer {
     /// Unique offer identifier.
     pub offer_id: OfferId,
@@ -709,7 +1143,6 @@ pub struct ResourceOffer {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct VolumeReservationSpec {
     /// Volume identifier.
     pub volume_id: VolumeId,
@@ -717,6 +1150,58 @@ pub struct VolumeReservationSpec {
     pub capacity: Bytes,
     /// Sandbox mount path.
     pub container_path: String,
+}
+
+/// CSI / Mesos Resource Provider disk provisioning specification (`CREATE_DISK` / `DESTROY_DISK`).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct ResourceProviderDiskSpec {
+    /// Target Resource Provider identifier.
+    pub provider_id: ResourceProviderId,
+    /// Unique disk/volume identifier.
+    pub volume_id: VolumeId,
+    /// Provisioned disk source kind (`MOUNT`, `BLOCK`, `CsiVolume`, etc.).
+    pub source: DiskSource,
+    /// Disk capacity in bytes.
+    pub capacity: Bytes,
+}
+
+/// Registration and inventory descriptor for a local or external Mesos CSI [`ResourceProviderInfo`].
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct ResourceProviderInfo {
+    /// Unique Resource Provider identifier.
+    pub provider_id: ResourceProviderId,
+    /// Optional hosting Agent (`Some` for local CSI resource providers, `None` for external providers).
+    pub agent_id: Option<AgentId>,
+    /// Provider type string (e.g., `"org.apache.mesos.rp.local.storage"`).
+    pub provider_type: String,
+    /// Provider instance name (e.g., `"csi-zfs"`).
+    pub provider_name: String,
+    /// Default role under which raw storage capacity is advertised.
+    pub default_role: RoleName,
+    /// Advertised disk sources and their capacities in bytes.
+    pub advertised_disks: Vec<(DiskSource, Bytes)>,
 }
 
 /// Operations a Framework can perform on one or more [`ResourceOffer`]s.
@@ -732,7 +1217,6 @@ pub struct VolumeReservationSpec {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum OfferOperation {
     /// Launch a single task consuming part or all of the offered bundle.
     LaunchTask(Box<TaskSpec>),
@@ -742,10 +1226,22 @@ pub enum OfferOperation {
     Reserve(ResourceBundle),
     /// Unreserve previously dynamically reserved resources.
     Unreserve(ResourceBundle),
+    /// Refine an existing reservation by pushing a child role onto the reservation stack: `(child_role, resources)`.
+    PushReservation(RoleName, ResourceBundle),
+    /// Pop the top refined role off the reservation stack back to its parent role: `(resources)`.
+    PopReservation(ResourceBundle),
     /// Create a persistent local or ZFS volume.
     CreateVolume(VolumeReservationSpec),
     /// Destroy a persistent volume.
     DestroyVolume(VolumeId),
+    /// Expand an existing persistent volume by `additional_bytes` (`GROW_VOLUME`): `(volume_id, additional_bytes)`.
+    GrowVolume(VolumeId, Bytes),
+    /// Shrink an existing persistent volume by `subtract_bytes` (`SHRINK_VOLUME`): `(volume_id, subtract_bytes)`.
+    ShrinkVolume(VolumeId, Bytes),
+    /// Convert `RAW` Resource Provider storage capacity into a `MOUNT` or `BLOCK` disk (`CREATE_DISK`).
+    CreateDisk(ResourceProviderDiskSpec),
+    /// Reclaim a `MOUNT` or `BLOCK` Resource Provider disk back to `RAW` storage capacity (`DESTROY_DISK`).
+    DestroyDisk(ResourceProviderDiskSpec),
     /// Decline the offer with an optional suppression filter.
     Decline(OfferFilter),
 }
@@ -763,12 +1259,640 @@ pub enum OfferOperation {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct ExecutorInfo {
     /// Unique executor identifier.
     pub executor_id: ExecutorId,
     /// Hosting agent identifier.
     pub agent_id: AgentId,
+}
+
+/// Whether a subscribed Framework opts into Agent-local state checkpointing across Agent restarts.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum CheckpointMode {
+    /// Agent checkpoints framework metadata, executor PIDs, and status updates to disk (default).
+    #[default]
+    Enabled,
+    /// Agent does not checkpoint framework state across daemon restarts.
+    Disabled,
+}
+
+/// Graceful termination grace period specification for `KillTask` and draining operations.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct KillPolicy {
+    /// Grace period in ticks between `SIGTERM` and `SIGKILL` escalation.
+    pub grace_period_ticks: BenchmarkTicks,
+}
+
+/// Mesos v1 `InverseOffer` requesting that a Framework release resources on an Agent prior to maintenance.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct InverseOffer {
+    /// Unique identifier for this inverse offer.
+    pub inverse_offer_id: OfferId,
+    /// Target framework holding resources on the Agent.
+    pub framework_id: FrameworkId,
+    /// Agent scheduled for maintenance or draining.
+    pub agent_id: AgentId,
+    /// Maintenance window associated with the reclamation request.
+    pub maintenance_window_id: MaintenanceWindowId,
+    /// Resources requested to be vacated.
+    pub resources: ResourceBundle,
+    /// Tick at which unavailability begins.
+    pub unavailability_start_tick: BenchmarkTicks,
+}
+
+/// Reason why a previously issued [`ResourceOffer`] was rescinded by the Master.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum OfferRescindReason {
+    /// Offer TTL elapsed before the Framework accepted or declined it.
+    OfferTtlExpired,
+    /// Hosting Agent lost heartbeat contact or disconnected.
+    AgentDisconnected,
+    /// Hosting Agent entered a maintenance window, draining mode, or deactivation.
+    AgentEnteredMaintenance,
+    /// Offered resources were preempted for a higher-priority / quota-guaranteed workload.
+    PreemptedByHigherPriority,
+    /// Operator or Framework suppressed/revoked offers for the role.
+    RoleSuppressedOrRevoked,
+}
+
+/// Reason why an Agent was marked lost or removed from the cluster.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum AgentLossReason {
+    /// Heartbeat lease expired and Agent failed health reconciliation.
+    HeartbeatTimeout,
+    /// Operator explicitly marked the Agent gone (`MarkAgentGone`).
+    MarkedGoneByOperator,
+    /// Automated draining with `mark_gone` completed.
+    DrainedAndDecommissioned,
+}
+
+/// Lifecycle state of a Mesos v1 Offer Operation (`RESERVE`, `UNRESERVE`, `CREATE`, `DESTROY`).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum OperationState {
+    /// Operation is queued or being applied on the Agent/ResourceProvider.
+    Pending,
+    /// Operation completed and resources/volumes are committed.
+    Finished,
+    /// Operation failed due to insufficient capacity or constraint violation.
+    Failed,
+    /// Operation contained malformed parameters.
+    Error,
+    /// Operation was dropped in transit during a partition.
+    Dropped,
+    /// Hosting Agent is unreachable.
+    Unreachable,
+    /// Hosting Agent was marked gone by an operator.
+    GoneByOperator,
+    /// Master has no record of the queried operation ID.
+    Unknown,
+}
+
+/// Dynamic reservation metadata attached to an Agent's reserved capacity pool.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct DynamicReservationSpec {
+    /// Operation identifier for tracking and reconciliation.
+    pub operation_id: OperationId,
+    /// Target Agent hosting the reservation.
+    pub agent_id: AgentId,
+    /// Role to which the resources are dynamically reserved.
+    pub role: RoleName,
+    /// Authenticated principal creating the reservation.
+    pub principal: String,
+    /// Reserved resource bundle.
+    pub resources: ResourceBundle,
+}
+
+/// Scheduled maintenance unavailability window for a set of Agents.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct MaintenanceWindow {
+    /// Unique maintenance window identifier.
+    pub window_id: MaintenanceWindowId,
+    /// Agents affected by this maintenance window.
+    pub agent_ids: Vec<AgentId>,
+    /// Monotonic tick when maintenance unavailability begins.
+    pub unavailability_start_tick: BenchmarkTicks,
+    /// Duration of the maintenance window in ticks.
+    pub duration_ticks: BenchmarkTicks,
+}
+
+/// Cluster-wide maintenance schedule containing ordered [`MaintenanceWindow`]s.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct MaintenanceSchedule {
+    /// Scheduled maintenance windows.
+    pub windows: Vec<MaintenanceWindow>,
+}
+
+/// Behavior when an Agent finishes draining all running tasks.
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum DrainCompletionMode {
+    /// Transition the Agent to `Drained` so it can be reactivated later (default).
+    #[default]
+    RemainDrained,
+    /// Automatically mark the Agent gone (`TASK_GONE_BY_OPERATOR`) and decommission it upon drain completion.
+    MarkGoneOnComplete,
+}
+
+/// Framework decision in response to an [`InverseOffer`] for upcoming Agent maintenance (`RespondInverseOffer`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum InverseOfferResponse {
+    /// Framework accepts the maintenance window and agrees to release or migrate affected resources (default).
+    #[default]
+    AcceptMaintenance,
+    /// Framework declines the inverse offer, indicating it cannot safely vacate the resources yet.
+    DeclineMaintenance,
+}
+
+impl InverseOfferResponse {
+    /// Returns `true` if the framework accepted the maintenance window (`AcceptMaintenance`).
+    ///
+    /// # Returns
+    ///
+    /// `true` when `Self::AcceptMaintenance`.
+    pub const fn is_accepted(self) -> bool {
+        matches!(self, Self::AcceptMaintenance)
+    }
+
+    /// Converts a boolean acceptance flag into an [`InverseOfferResponse`].
+    ///
+    /// # Arguments
+    ///
+    /// * `accepted` - `true` for [`Self::AcceptMaintenance`], `false` for [`Self::DeclineMaintenance`].
+    ///
+    /// # Returns
+    ///
+    /// Corresponding [`InverseOfferResponse`].
+    pub const fn from_bool(accepted: bool) -> Self {
+        if accepted {
+            Self::AcceptMaintenance
+        } else {
+            Self::DeclineMaintenance
+        }
+    }
+}
+
+/// Payload for [`AgentMaintenanceState::Draining`].
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct DrainingSpec {
+    /// Post-drain completion behavior.
+    pub completion_mode: DrainCompletionMode,
+    /// Maximum grace period in ticks for task eviction.
+    pub grace_period_ticks: BenchmarkTicks,
+}
+
+/// Per-Agent maintenance and draining state machine (Mesos Maintenance & Draining parity).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum AgentMaintenanceState {
+    /// Agent is operating normally and eligible for scheduling and offers.
+    #[default]
+    Normal,
+    /// Agent is scheduled for an upcoming maintenance window (`InverseOffer`s sent).
+    ScheduledForMaintenance(MaintenanceWindowId),
+    /// Agent is actively draining tasks (`KillTask` sent, new offers blocked).
+    Draining(DrainingSpec),
+    /// All tasks on the Agent have reached terminal states; Agent is safely drained.
+    Drained,
+    /// Agent is in active maintenance (`Down` machine mode) or operator-deactivated.
+    Deactivated,
+}
+
+/// Resource request hint sent by a Framework via `RequestResources`.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct ResourceRequest {
+    /// Optional preferred Agent (`None` = any Agent in cluster or federation).
+    pub agent_id: Option<AgentId>,
+    /// Desired resource bundle.
+    pub resources: ResourceBundle,
+}
+
+/// Master leader metadata returned to subscribed Frameworks and Operators.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct MasterInfo {
+    /// Leader node identifier.
+    pub leader_id: String,
+    /// Cluster version string.
+    pub version: String,
+    /// Current monotonic leader term/epoch.
+    pub elected_term: u64,
+}
+
+/// Fault-domain coordinates (`Region` + `Zone`) for rack/zone/region-aware scheduling (Mesos `DomainInfo::FaultDomain`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct FaultDomain {
+    /// Geographic region identifier (e.g., `"us-east-1"`).
+    pub region: RegionName,
+    /// Availability zone or rack identifier (e.g., `"us-east-1a:rack-04"`).
+    pub zone: ZoneName,
+}
+
+/// Fault domain descriptor attached to a `MasterInfo`, `RegisterAgent`, or `ResourceOffer` (Mesos `DomainInfo`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct DomainInfo {
+    /// Fault domain coordinates (`region` and `zone`).
+    pub fault_domain: FaultDomain,
+}
+
+impl DomainInfo {
+    /// Creates a new [`DomainInfo`] from `region` and `zone`.
+    ///
+    /// # Arguments
+    ///
+    /// * `region` - [`RegionName`].
+    /// * `zone` - [`ZoneName`].
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`DomainInfo`].
+    pub const fn new(region: RegionName, zone: ZoneName) -> Self {
+        Self {
+            fault_domain: FaultDomain { region, zone },
+        }
+    }
+
+    /// Returns `true` if `other` is in a different geographic region (Mesos `REMOTE` region check).
+    ///
+    /// # Arguments
+    ///
+    /// * `other` - Peer [`DomainInfo`] to compare against.
+    ///
+    /// # Returns
+    ///
+    /// `true` if `self.fault_domain.region != other.fault_domain.region`.
+    pub fn is_remote_region(&self, other: &Self) -> bool {
+        self.fault_domain.region != other.fault_domain.region
+    }
+}
+
+/// Typed value of an [`AgentAttribute`] (Mesos `Attribute` value types: `TEXT`, `SCALAR`, `RANGES`, `SET`).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum AgentAttributeValue {
+    /// Arbitrary string attribute (`TEXT`).
+    Text(String),
+    /// Fixed-point integer scalar attribute (`SCALAR`).
+    Scalar(u64),
+    /// Inclusive integer ranges (`RANGES`, e.g., `[(1, 10), (20, 30)]`).
+    Ranges(Vec<(u64, u64)>),
+    /// Unordered set of string tags (`SET`).
+    Set(Vec<String>),
+}
+
+/// Typed key-value attribute advertised by an Agent node (Mesos `Attribute`).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct AgentAttribute {
+    /// Attribute key (e.g., `"rack"`, `"ssd"`, `"kernel"`, `"cpu_family"`).
+    pub key: String,
+    /// Typed attribute value.
+    pub value: AgentAttributeValue,
+}
+
+/// Declarative attribute & fault-domain placement constraint (Mesos / Marathon constraint operators).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum PlacementConstraint {
+    /// Agent must possess an attribute `key` equal to `value` (`(key, value)`).
+    Equals(String, AgentAttributeValue),
+    /// Agent must not possess an attribute `key` equal to `value` (`(key, value)`).
+    NotEquals(String, AgentAttributeValue),
+    /// Agent's `Text` attribute `key` must be one of `allowed_values` (or `Set` attribute must intersect `allowed_values`).
+    InSet(String, Vec<String>),
+    /// At most `max_tasks` tasks of the group may be placed on the same Agent (`MAX_PER` hostname).
+    MaxPerHostname(u32),
+    /// At most `max_tasks` tasks of the group may be placed in the same availability zone (`MAX_PER` fault domain).
+    MaxPerFaultDomain(u32),
+}
+
+impl PlacementConstraint {
+    /// Evaluates whether an Agent with `attributes`, `existing_tasks_on_host`, and `existing_tasks_in_zone`
+    /// satisfies this [`PlacementConstraint`].
+    ///
+    /// # Arguments
+    ///
+    /// * `attributes` - Slice of [`AgentAttribute`]s advertised by the candidate Agent.
+    /// * `existing_tasks_on_host` - Count of group tasks already placed on this Agent.
+    /// * `existing_tasks_in_zone` - Count of group tasks already placed in this Agent's fault-domain zone.
+    ///
+    /// # Returns
+    ///
+    /// `true` if the constraint is satisfied.
+    pub fn matches_agent(
+        &self,
+        attributes: &[AgentAttribute],
+        existing_tasks_on_host: u32,
+        existing_tasks_in_zone: u32,
+    ) -> bool {
+        match self {
+            Self::Equals(key, value) => attributes
+                .iter()
+                .any(|attr| &attr.key == key && &attr.value == value),
+            Self::NotEquals(key, value) => !attributes
+                .iter()
+                .any(|attr| &attr.key == key && &attr.value == value),
+            Self::InSet(key, allowed_values) => attributes.iter().any(|attr| {
+                &attr.key == key
+                    && match &attr.value {
+                        AgentAttributeValue::Text(s) => allowed_values.contains(s),
+                        AgentAttributeValue::Set(items) => {
+                            items.iter().any(|item| allowed_values.contains(item))
+                        }
+                        AgentAttributeValue::Scalar(_) | AgentAttributeValue::Ranges(_) => false,
+                    }
+            }),
+            Self::MaxPerHostname(max_tasks) => existing_tasks_on_host < *max_tasks,
+            Self::MaxPerFaultDomain(max_tasks) => existing_tasks_in_zone < *max_tasks,
+        }
+    }
+}
+
+/// Sharing mode for a persistent volume mounted across multiple tasks (Mesos `DiskInfo::Persistence` + shared resources).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum SharedVolumeMode {
+    /// Volume is exclusively mounted by a single task at a time (default).
+    #[default]
+    Exclusive,
+    /// Volume may be shared read-only across multiple co-located tasks.
+    SharedReadOnly,
+    /// Volume may be shared read-write across multiple co-located tasks.
+    SharedReadWrite,
+}
+
+/// Backing storage provider source for a persistent volume (Mesos `Resource::DiskInfo::Source`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum DiskSource {
+    /// Root filesystem subdirectory (`ROOT` disk).
+    #[default]
+    RootFilesystem,
+    /// Shared directory on a secondary disk (`PATH` disk, enforced via project quotas).
+    Path(String),
+    /// Dedicated pre-formatted filesystem mount (`MOUNT` disk, exclusive whole partition).
+    Mount(String),
+    /// Raw unformatted block device (`BLOCK` disk, e.g., `/dev/nvme1n1` for databases).
+    Block(String),
+    /// Raw unallocated storage pool capacity (`RAW` disk waiting for `CREATE_DISK`).
+    Raw(String),
+    /// Delegated ZFS dataset (`ZfsDataset`, e.g., `"tank/arbiter/vol-1"`).
+    ZfsDataset(String),
+    /// CSI v1.9 external/local storage volume (`(plugin_name, volume_handle)`).
+    CsiVolume(String, String),
 }
 
 #[cfg(test)]
@@ -777,6 +1901,7 @@ mod tests {
     use crate::units::Millicores;
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_quota_and_role_hierarchy() {
         let qid = QuotaId(String::from("q-prod"));
         let r_prod = RoleName(String::from("prod"));
@@ -858,21 +1983,90 @@ mod tests {
                 .is_err()
         );
 
+        // Child role whose hard_max exceeds parent role's hard_max -> InvalidQuotaBounds
+        let mut excessive_child_max = ResourceBundle::zero();
+        excessive_child_max.cpu = Millicores::new(999_000);
+        assert!(
+            hierarchy
+                .add_role(Role {
+                    name: RoleName(String::from("prod.excessive")),
+                    parent: Some(r_prod.clone()),
+                    quota: Quota {
+                        id: QuotaId(String::from("q-exc")),
+                        guaranteed_min: ResourceBundle::zero(),
+                        hard_max: excessive_child_max,
+                        allow_burst_borrowing: true,
+                        weight: WeightBasisPoints::STANDARD,
+                    },
+                })
+                .is_err()
+        );
+
         // Add child role with valid parent
         assert!(
             hierarchy
                 .add_role(Role {
                     name: r_ml.clone(),
                     parent: Some(r_prod.clone()),
+                    quota: quota_val.clone(),
+                })
+                .is_ok()
+        );
+        // Second sibling under parent covers sibling iteration in add_role
+        assert!(
+            hierarchy
+                .add_role(Role {
+                    name: RoleName(String::from("prod.db")),
+                    parent: Some(r_prod.clone()),
                     quota: quota_val,
                 })
                 .is_ok()
         );
 
-        assert_eq!(hierarchy.roles().len(), 2);
+        assert_eq!(hierarchy.roles().len(), 3);
         assert!(hierarchy.get_role(&r_prod).is_ok());
         assert!(hierarchy.get_role(&r_ml).is_ok());
         assert!(hierarchy.get_role(&r_missing).is_err());
+
+        // Test set_role_quota, remove_role_quota, and update_role_weight
+        let mut bad_max = ResourceBundle::zero();
+        bad_max.cpu = Millicores::new(1000);
+        let mut high_min = ResourceBundle::zero();
+        high_min.cpu = Millicores::new(5000);
+        assert!(
+            hierarchy
+                .set_role_quota(
+                    &r_prod,
+                    Quota {
+                        id: QuotaId(String::from("q-bad")),
+                        guaranteed_min: high_min,
+                        hard_max: bad_max,
+                        allow_burst_borrowing: true,
+                        weight: WeightBasisPoints::STANDARD,
+                    },
+                )
+                .is_err()
+        );
+
+        let mut new_max = ResourceBundle::zero();
+        new_max.cpu = Millicores::new(20_000);
+        let valid_q = Quota {
+            id: QuotaId(String::from("q-updated")),
+            guaranteed_min: ResourceBundle::zero(),
+            hard_max: new_max,
+            allow_burst_borrowing: true,
+            weight: WeightBasisPoints::STANDARD,
+        };
+        assert!(hierarchy.set_role_quota(&r_prod, valid_q.clone()).is_ok());
+        let r_new = RoleName(String::from("analytics"));
+        assert!(hierarchy.set_role_quota(&r_new, valid_q).is_ok());
+        assert_eq!(hierarchy.roles().len(), 4);
+
+        let w_double = WeightBasisPoints::new(20_000).unwrap_or(WeightBasisPoints::STANDARD);
+        assert!(hierarchy.update_role_weight(&r_prod, w_double).is_ok());
+        assert!(hierarchy.update_role_weight(&r_missing, w_double).is_err());
+        assert!(hierarchy.remove_role_quota(&r_prod).is_ok());
+        assert!(hierarchy.remove_role_quota(&r_missing).is_err());
     }
 
     #[test]
@@ -886,10 +2080,14 @@ mod tests {
             TaskState::Checkpointing,
             TaskState::Preempting,
             TaskState::Killing,
+            TaskState::Unreachable,
             TaskState::Finished,
             TaskState::Failed,
             TaskState::Killed,
             TaskState::Lost,
+            TaskState::Gone,
+            TaskState::GoneByOperator,
+            TaskState::Unknown,
         ];
 
         for st in all_states {
@@ -952,6 +2150,16 @@ mod tests {
                 .validate_transition(TaskState::Finished)
                 .is_ok()
         );
+        assert!(
+            TaskState::Unreachable
+                .validate_transition(TaskState::Running)
+                .is_ok()
+        );
+        assert!(
+            TaskState::Unreachable
+                .validate_transition(TaskState::Finished)
+                .is_ok()
+        );
     }
 
     #[test]
@@ -965,12 +2173,20 @@ mod tests {
             TaskState::Checkpointing,
             TaskState::Preempting,
             TaskState::Killing,
+            TaskState::Unreachable,
         ] {
             assert!(!non_term.is_terminal());
             assert!(non_term.validate_transition(TaskState::Failed).is_ok());
             assert!(non_term.validate_transition(TaskState::Killed).is_ok());
             assert!(non_term.validate_transition(TaskState::Lost).is_ok());
             assert!(non_term.validate_transition(TaskState::Killing).is_ok());
+            assert!(non_term.validate_transition(TaskState::Unreachable).is_ok());
+            assert!(non_term.validate_transition(TaskState::Gone).is_ok());
+            assert!(
+                non_term
+                    .validate_transition(TaskState::GoneByOperator)
+                    .is_ok()
+            );
         }
 
         for term in [
@@ -978,6 +2194,9 @@ mod tests {
             TaskState::Failed,
             TaskState::Killed,
             TaskState::Lost,
+            TaskState::Gone,
+            TaskState::GoneByOperator,
+            TaskState::Unknown,
         ] {
             assert!(term.is_terminal());
             assert!(term.validate_transition(TaskState::Running).is_err());
@@ -1004,5 +2223,506 @@ mod tests {
                 .validate_transition(TaskState::Running)
                 .is_err()
         );
+        assert_eq!(CheckpointMode::default(), CheckpointMode::Enabled);
+        assert_eq!(
+            DrainCompletionMode::default(),
+            DrainCompletionMode::RemainDrained
+        );
+        assert_eq!(
+            InverseOfferResponse::default(),
+            InverseOfferResponse::AcceptMaintenance
+        );
+        assert!(InverseOfferResponse::from_bool(true).is_accepted());
+        assert!(!InverseOfferResponse::from_bool(false).is_accepted());
+        let _ = rkyv::to_bytes::<rkyv::rancor::Error>(&InverseOfferResponse::DeclineMaintenance);
+        assert_eq!(
+            AgentMaintenanceState::default(),
+            AgentMaintenanceState::Normal
+        );
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::type_complexity,
+        clippy::items_after_statements
+    )]
+    fn test_domain_info_attributes_and_placement_constraints() {
+        let r_east = RegionName::new("us-east-1").unwrap_or_default();
+        let r_west = RegionName::new("us-west-2").unwrap_or_default();
+        let z_1a = ZoneName::new("us-east-1a").unwrap_or_default();
+        let dom_east = DomainInfo::new(r_east.clone(), z_1a.clone());
+        let dom_east2 = DomainInfo::new(r_east, z_1a);
+        let dom_west = DomainInfo::new(r_west, ZoneName::new("us-west-2a").unwrap_or_default());
+        assert!(!dom_east.is_remote_region(&dom_east2));
+        assert!(dom_east.is_remote_region(&dom_west));
+        assert_eq!(DomainInfo::default().fault_domain.region.as_str(), "");
+
+        let attrs = vec![
+            AgentAttribute {
+                key: "rack".to_owned(),
+                value: AgentAttributeValue::Text("r1".to_owned()),
+            },
+            AgentAttribute {
+                key: "features".to_owned(),
+                value: AgentAttributeValue::Set(vec!["nvme".to_owned(), "rdma".to_owned()]),
+            },
+            AgentAttribute {
+                key: "gen".to_owned(),
+                value: AgentAttributeValue::Scalar(5),
+            },
+            AgentAttribute {
+                key: "vlans".to_owned(),
+                value: AgentAttributeValue::Ranges(vec![(100, 200)]),
+            },
+        ];
+
+        for c_ok in [
+            PlacementConstraint::Equals("gen".to_owned(), AgentAttributeValue::Scalar(5)),
+            PlacementConstraint::NotEquals(
+                "rack".to_owned(),
+                AgentAttributeValue::Text("r2".to_owned()),
+            ),
+            PlacementConstraint::InSet("rack".to_owned(), vec!["r1".to_owned(), "r3".to_owned()]),
+            PlacementConstraint::InSet("features".to_owned(), vec!["rdma".to_owned()]),
+            PlacementConstraint::MaxPerHostname(2),
+            PlacementConstraint::MaxPerFaultDomain(3),
+        ] {
+            assert!(c_ok.matches_agent(&attrs, 1, 2));
+        }
+
+        for c_fail in [
+            PlacementConstraint::InSet("gen".to_owned(), vec!["5".to_owned()]),
+            PlacementConstraint::InSet("vlans".to_owned(), vec!["100".to_owned()]),
+            PlacementConstraint::MaxPerHostname(1),
+            PlacementConstraint::MaxPerFaultDomain(2),
+        ] {
+            assert!(!c_fail.matches_agent(&attrs, 1, 2));
+        }
+
+        assert_eq!(SharedVolumeMode::default(), SharedVolumeMode::Exclusive);
+        assert_eq!(DiskSource::default(), DiskSource::RootFilesystem);
+
+        let default_filter = OfferFilter::default();
+        assert_eq!(
+            default_filter.expiration_tick(BenchmarkTicks::new(10)),
+            BenchmarkTicks::new(15)
+        );
+        assert!(default_filter.is_active_at(BenchmarkTicks::new(10), BenchmarkTicks::new(14)));
+        assert!(!default_filter.is_active_at(BenchmarkTicks::new(10), BenchmarkTicks::new(15)));
+
+        let subsecond_filter = OfferFilter {
+            refuse_milliseconds: 500,
+            min_cpu_millicores: 2000,
+            min_memory_bytes: Bytes::new(1024),
+            refuse_gpu_offers: true,
+            min_gpu_vram: Bytes::new(512),
+        };
+        assert_eq!(
+            subsecond_filter.expiration_tick(BenchmarkTicks::new(10)),
+            BenchmarkTicks::new(11)
+        );
+        let multi_sec_filter = OfferFilter {
+            refuse_milliseconds: 3000,
+            ..subsecond_filter
+        };
+        assert_eq!(
+            multi_sec_filter.expiration_tick(BenchmarkTicks::new(10)),
+            BenchmarkTicks::new(13)
+        );
+
+        let mut bundle = ResourceBundle::zero();
+        assert!(!subsecond_filter.allows_bundle(&bundle));
+        bundle.cpu = Millicores::new(2000);
+        assert!(!subsecond_filter.allows_bundle(&bundle));
+        bundle.memory = Bytes::new(1024);
+        bundle.gpu_compute = crate::units::GpuMillicores::new(1000);
+        assert!(!subsecond_filter.allows_bundle(&bundle));
+        bundle.gpu_compute = crate::units::GpuMillicores::ZERO;
+        assert!(!subsecond_filter.allows_bundle(&bundle));
+        bundle.gpu_vram = Bytes::new(512);
+        assert!(subsecond_filter.allows_bundle(&bundle));
+        let allow_gpu_filter = OfferFilter {
+            refuse_gpu_offers: false,
+            ..subsecond_filter
+        };
+        bundle.gpu_compute = crate::units::GpuMillicores::new(1000);
+        assert!(allow_gpu_filter.allows_bundle(&bundle));
+
+        let rkyv_w1 = (
+            RoleHierarchy::new(),
+            Role {
+                name: RoleName::default(),
+                parent: None,
+                quota: Quota {
+                    id: QuotaId::default(),
+                    guaranteed_min: ResourceBundle::zero(),
+                    hard_max: ResourceBundle::zero(),
+                    allow_burst_borrowing: false,
+                    weight: WeightBasisPoints::STANDARD,
+                },
+            },
+            TaskGroupSpec {
+                group_id: TaskGroupId::default(),
+                role: RoleName::default(),
+                tasks: vec![TaskSpec {
+                    task_id: TaskId::default(),
+                    role: RoleName::default(),
+                    framework_id: None,
+                    priority: PriorityClass::Batch,
+                    preemption_policy: PreemptionPolicy::ImmediateKill,
+                    resources: ResourceBundle::zero(),
+                    required_gpu_vendor: None,
+                    required_gpu_partition: None,
+                    topology_constraints: vec![
+                        TopologyConstraint::TpuTorusContiguous(
+                            crate::resources::TpuTopologySlice {
+                                slice_id: crate::ids::SliceId::default(),
+                                generation: crate::resources::TpuGeneration::CloudTpuV4,
+                                dim_x: 1,
+                                dim_y: 1,
+                                dim_z: 1,
+                                require_wrap_around: false,
+                            },
+                        ),
+                        TopologyConstraint::ExtendedRequirements(Box::default()),
+                    ],
+                    election_group: None,
+                    isolation: IsolationSpec {
+                        capabilities: Vec::new(),
+                        image_ref: None,
+                        command: String::new(),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                        run_as_user: None,
+                    },
+                    artifacts: vec![ArtifactSpec {
+                        uri: String::new(),
+                        sha256_hex: String::new(),
+                        extract: false,
+                        executable: false,
+                    }],
+                    secrets: vec![SecretMountSpec {
+                        secret_id: SecretId::default(),
+                        mount_path: String::new(),
+                    }],
+                    health_check: Some(HealthCheckSpec {
+                        protocol: HealthCheckProtocol::HttpGet("a".to_owned()),
+                        port: PortNumber::default(),
+                        interval_ms: 1,
+                        timeout_ms: 1,
+                        unhealthy_threshold: 1,
+                    }),
+                }],
+                tpu_slice: None,
+                placement_timeout_ms: 1,
+            },
+            OfferFilter::default(),
+            ResourceOffer {
+                offer_id: OfferId::default(),
+                framework_id: FrameworkId::default(),
+                agent_id: AgentId::default(),
+                role: RoleName::default(),
+                resources: ResourceBundle::zero(),
+                revocable: false,
+                expires_at_tick: 0,
+            },
+            vec![
+                OfferOperation::LaunchTask(Box::new(TaskSpec {
+                    task_id: TaskId::default(),
+                    role: RoleName::default(),
+                    framework_id: None,
+                    priority: PriorityClass::Batch,
+                    preemption_policy: PreemptionPolicy::ImmediateKill,
+                    resources: ResourceBundle::zero(),
+                    required_gpu_vendor: None,
+                    required_gpu_partition: None,
+                    topology_constraints: Vec::new(),
+                    election_group: None,
+                    isolation: IsolationSpec {
+                        capabilities: Vec::new(),
+                        image_ref: None,
+                        command: String::new(),
+                        args: Vec::new(),
+                        env: Vec::new(),
+                        run_as_user: None,
+                    },
+                    artifacts: Vec::new(),
+                    secrets: Vec::new(),
+                    health_check: None,
+                })),
+                OfferOperation::CreateVolume(VolumeReservationSpec {
+                    volume_id: VolumeId::default(),
+                    capacity: Bytes::ZERO,
+                    container_path: String::new(),
+                }),
+                OfferOperation::GrowVolume(VolumeId::default(), Bytes::ZERO),
+                OfferOperation::ShrinkVolume(VolumeId::default(), Bytes::ZERO),
+                OfferOperation::CreateDisk(ResourceProviderDiskSpec {
+                    provider_id: ResourceProviderId::default(),
+                    volume_id: VolumeId::default(),
+                    source: DiskSource::Path("a".to_owned()),
+                    capacity: Bytes::ZERO,
+                }),
+            ],
+            ResourceProviderInfo {
+                provider_id: ResourceProviderId::default(),
+                agent_id: None,
+                provider_type: String::new(),
+                provider_name: String::new(),
+                default_role: RoleName::default(),
+                advertised_disks: Vec::new(),
+            },
+        );
+        let rkyv_w2 = (
+            ExecutorInfo {
+                executor_id: ExecutorId::default(),
+                agent_id: AgentId::default(),
+            },
+            KillPolicy {
+                grace_period_ticks: crate::units::BenchmarkTicks::new(1),
+            },
+            InverseOffer {
+                inverse_offer_id: OfferId::default(),
+                framework_id: FrameworkId::default(),
+                agent_id: AgentId::default(),
+                maintenance_window_id: MaintenanceWindowId::default(),
+                resources: ResourceBundle::zero(),
+                unavailability_start_tick: crate::units::BenchmarkTicks::new(0),
+            },
+            DynamicReservationSpec {
+                operation_id: OperationId::default(),
+                agent_id: AgentId::default(),
+                role: RoleName::default(),
+                resources: ResourceBundle::zero(),
+                principal: String::new(),
+            },
+            MaintenanceSchedule {
+                windows: vec![MaintenanceWindow {
+                    window_id: MaintenanceWindowId::default(),
+                    agent_ids: Vec::new(),
+                    unavailability_start_tick: crate::units::BenchmarkTicks::new(0),
+                    duration_ticks: crate::units::BenchmarkTicks::new(1),
+                }],
+            },
+            vec![
+                AgentMaintenanceState::ScheduledForMaintenance(MaintenanceWindowId::default()),
+                AgentMaintenanceState::Draining(DrainingSpec {
+                    completion_mode: DrainCompletionMode::RemainDrained,
+                    grace_period_ticks: crate::units::BenchmarkTicks::new(1),
+                }),
+            ],
+            ResourceRequest {
+                agent_id: None,
+                resources: ResourceBundle::zero(),
+            },
+            MasterInfo {
+                leader_id: String::new(),
+                version: String::new(),
+                elected_term: 1,
+            },
+            dom_east,
+            attrs,
+            PlacementConstraint::Equals(String::new(), AgentAttributeValue::Text(String::new())),
+        );
+        let rkyv_w_bytes =
+            rkyv::to_bytes::<rkyv::rancor::Error>(&(rkyv_w1, rkyv_w2)).unwrap_or_default();
+        type WorkloadRkyvTuple = (
+            (
+                RoleHierarchy,
+                Role,
+                TaskGroupSpec,
+                OfferFilter,
+                ResourceOffer,
+                Vec<OfferOperation>,
+                ResourceProviderInfo,
+            ),
+            (
+                ExecutorInfo,
+                KillPolicy,
+                InverseOffer,
+                DynamicReservationSpec,
+                MaintenanceSchedule,
+                Vec<AgentMaintenanceState>,
+                ResourceRequest,
+                MasterInfo,
+                DomainInfo,
+                Vec<AgentAttribute>,
+                PlacementConstraint,
+            ),
+        );
+        for i in 0..rkyv_w_bytes.len() {
+            let mut corrupted = rkyv_w_bytes.clone();
+            for (j, b) in corrupted.iter_mut().enumerate() {
+                if i == j {
+                    *b ^= 0xFF;
+                }
+            }
+            let _: Result<WorkloadRkyvTuple, rkyv::rancor::Error> = rkyv::from_bytes(&corrupted);
+        }
+        let _: Result<WorkloadRkyvTuple, rkyv::rancor::Error> = rkyv::from_bytes(&rkyv_w_bytes);
+    }
+
+    #[test]
+    fn test_role_hierarchy_guaranteed_min_ceiling() {
+        let r_parent = RoleName::new("root-dept").unwrap_or_default();
+        let r_child = RoleName::new("root-dept.sub").unwrap_or_default();
+        let mut h = RoleHierarchy::new();
+        let mut parent_min = ResourceBundle::zero();
+        parent_min.cpu = Millicores::new(4_000);
+        let mut parent_max = ResourceBundle::zero();
+        parent_max.cpu = Millicores::new(16_000);
+        assert!(
+            h.add_role(Role {
+                name: r_parent.clone(),
+                parent: None,
+                quota: Quota {
+                    id: QuotaId::new("q-p").unwrap_or_default(),
+                    guaranteed_min: parent_min,
+                    hard_max: parent_max.clone(),
+                    allow_burst_borrowing: true,
+                    weight: WeightBasisPoints::STANDARD,
+                },
+            })
+            .is_ok()
+        );
+        let mut child_min_excess = ResourceBundle::zero();
+        child_min_excess.cpu = Millicores::new(8_000);
+        assert!(
+            h.add_role(Role {
+                name: r_child.clone(),
+                parent: Some(r_parent.clone()),
+                quota: Quota {
+                    id: QuotaId::new("q-c-bad").unwrap_or_default(),
+                    guaranteed_min: child_min_excess,
+                    hard_max: parent_max.clone(),
+                    allow_burst_borrowing: true,
+                    weight: WeightBasisPoints::STANDARD,
+                },
+            })
+            .is_err()
+        );
+        let mut child_min_ok = ResourceBundle::zero();
+        child_min_ok.cpu = Millicores::new(2_000);
+        assert!(
+            h.add_role(Role {
+                name: r_child,
+                parent: Some(r_parent),
+                quota: Quota {
+                    id: QuotaId::new("q-c-ok").unwrap_or_default(),
+                    guaranteed_min: child_min_ok,
+                    hard_max: parent_max,
+                    allow_burst_borrowing: true,
+                    weight: WeightBasisPoints::STANDARD,
+                },
+            })
+            .is_ok()
+        );
+    }
+
+    #[test]
+    fn test_task_scheduling_requirements_and_accessors() {
+        let r_parent = RoleName::new("root-dept").unwrap_or_default();
+        let mut base_bundle = ResourceBundle::zero();
+        base_bundle.cpu = Millicores::new(2_000);
+        base_bundle.memory = Bytes::new(4_096);
+        base_bundle.disk = Bytes::new(8_192);
+        base_bundle.network_bandwidth = crate::units::BandwidthBps::new(100_000);
+        let mut base_task = TaskSpec {
+            task_id: TaskId::new("t-sched").unwrap_or_default(),
+            role: r_parent,
+            framework_id: None,
+            election_group: None,
+            priority: PriorityClass::ProductionStandard,
+            preemption_policy: PreemptionPolicy::GracefulSigterm,
+            resources: base_bundle,
+            required_gpu_vendor: None,
+            required_gpu_partition: None,
+            topology_constraints: vec![TopologyConstraint::SameNuma],
+            isolation: IsolationSpec {
+                capabilities: Vec::new(),
+                image_ref: None,
+                command: "/bin/app".to_owned(),
+                args: Vec::new(),
+                env: Vec::new(),
+                run_as_user: None,
+            },
+            artifacts: Vec::new(),
+            secrets: Vec::new(),
+            health_check: None,
+        };
+        assert!(TaskSchedulingRequirements::from_task(&base_task).is_none());
+        assert_eq!(base_task.cpu_requirements().millicores.get(), 2_000);
+        assert_eq!(base_task.memory_requirements().ram_bytes.get(), 4_096);
+        assert_eq!(base_task.storage_requirements().capacity_bytes.get(), 8_192);
+        assert_eq!(base_task.network_requirements().ingress_bps.get(), 100_000);
+        assert!(base_task.placement_constraints().is_empty());
+        assert!(base_task.fault_domain_preference().is_none());
+        assert!(base_task.shared_volume_mounts().is_empty());
+        assert_eq!(base_task.kill_policy(), KillPolicy::default());
+        assert!(base_task.executor_info().is_none());
+
+        let port_range = crate::units::PortRange::new(
+            PortNumber::new(8080).unwrap_or_default(),
+            PortNumber::new(8081).unwrap_or_default(),
+        )
+        .into_iter()
+        .collect();
+        let custom_reqs = TaskSchedulingRequirements {
+            cpu_resource: Some(CpuResource {
+                millicores: Millicores::new(4_000),
+                preferred_core_class: None,
+                required_extensions: Vec::new(),
+            }),
+            memory_resource: Some(MemoryResource {
+                ram_bytes: Bytes::new(16_384),
+                hugepages_2mib_bytes: Bytes::ZERO,
+                hugepages_1gib_bytes: Bytes::ZERO,
+                require_unified_memory: false,
+            }),
+            storage_resource: Some(StorageResource {
+                capacity_bytes: Bytes::new(65_536),
+                max_iops: 10_000,
+                throughput_bps: crate::units::BandwidthBps::new(500_000),
+                disk_class: Some(crate::resources::DiskClass::Nvme),
+            }),
+            network_resource: Some(NetworkResource {
+                ingress_bps: crate::units::BandwidthBps::new(200_000),
+                egress_bps: crate::units::BandwidthBps::new(200_000),
+                ports: crate::units::PortSet::from_ranges(port_range),
+                rdma_vfs: 2,
+            }),
+            placement_constraints: vec![PlacementConstraint::MaxPerHostname(2)],
+            required_domain: Some(DomainInfo::default()),
+            shared_volume_mounts: vec![(VolumeId::default(), SharedVolumeMode::SharedReadOnly)],
+            kill_policy: KillPolicy {
+                grace_period_ticks: BenchmarkTicks::new(15),
+            },
+            executor_info: Some(ExecutorInfo {
+                executor_id: ExecutorId::default(),
+                agent_id: AgentId::default(),
+            }),
+        };
+        let legacy_json = serde_json::to_string(&custom_reqs).unwrap_or_default();
+        base_task.isolation.env.push((
+            ARBITER_SCHEDULING_REQUIREMENTS_ENV_KEY.to_owned(),
+            legacy_json,
+        ));
+        assert_eq!(
+            TaskSchedulingRequirements::from_task(&base_task),
+            Some(custom_reqs.clone())
+        );
+
+        let enriched = base_task.with_scheduling_requirements(&custom_reqs);
+        assert_eq!(enriched.cpu_requirements().millicores.get(), 4_000);
+        assert_eq!(enriched.memory_requirements().ram_bytes.get(), 16_384);
+        assert_eq!(enriched.storage_requirements().capacity_bytes.get(), 65_536);
+        assert_eq!(enriched.network_requirements().ingress_bps.get(), 200_000);
+        assert_eq!(enriched.network_requirements().ports.total_ports(), 2);
+        assert_eq!(enriched.placement_constraints().len(), 1);
+        assert!(enriched.fault_domain_preference().is_some());
+        assert_eq!(enriched.shared_volume_mounts().len(), 1);
+        assert_eq!(enriched.kill_policy().grace_period_ticks.get(), 15);
+        assert!(enriched.executor_info().is_some());
     }
 }

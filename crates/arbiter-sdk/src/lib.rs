@@ -16,7 +16,13 @@ use arbiter_core::workload::{
     TaskGroupSpec, TaskSpec, TopologyConstraint,
 };
 use arbiter_master::MasterNode;
-use arbiter_proto::{AcceptOffers, SubmitDirectJob, SubscribeFramework, TaskStatusUpdate};
+use arbiter_net::http::{HttpGateway, HttpRequest};
+use arbiter_net::quic::{FramedStreamTransport, QuicStreamKind};
+use arbiter_net::security::SpiffeSvid;
+use arbiter_proto::{
+    AcceptOffers, SchedulerCall, SubmitDirectJob, SubscribeFramework, TaskStatusUpdate,
+    WireEnvelope, WireMessage, encode_recordio_frame,
+};
 use arbiter_store::traits::StateStore;
 
 /// Trait implemented by custom 2-level Mesos-style Frameworks consuming [`ResourceOffer`]s.
@@ -186,6 +192,46 @@ impl<F: FrameworkScheduler> FrameworkRunner<F> {
     pub fn deliver_status_update(&mut self, update: &TaskStatusUpdate) -> ArbiterResult<()> {
         self.scheduler.on_task_status_update(update)
     }
+
+    /// Transmits a Mesos v1 [`SchedulerCall`] to `/api/v1/scheduler` over a live TCP HTTP/RecordIO
+    /// connection via `gateway` and returns the `RecordIO`-framed response string.
+    ///
+    /// # Arguments
+    ///
+    /// * `gateway` - [`HttpGateway`] instance.
+    /// * `bind_addr` - Local TCP bind address (`"127.0.0.1:0"`).
+    /// * `client_svid` - Authenticated [`SpiffeSvid`] token.
+    /// * `call` - [`SchedulerCall`] payload.
+    /// * `seq` - Monotonic sequence number.
+    /// * `current_tick` - Monotonic tick.
+    ///
+    /// # Returns
+    ///
+    /// `RecordIO`-encoded HTTP response frame (`"<len>\n<json>"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketBindError`] or [`ArbiterError::AuthenticationFailed`] on failure.
+    pub fn exchange_scheduler_call_over_http(
+        &mut self,
+        gateway: &HttpGateway,
+        bind_addr: &str,
+        client_svid: SpiffeSvid,
+        call: SchedulerCall,
+        seq: u64,
+        current_tick: u64,
+    ) -> ArbiterResult<String> {
+        let env = WireEnvelope::new(seq, WireMessage::SchedulerCall(Box::new(call)));
+        let req = HttpRequest {
+            path: "/api/v1/scheduler".to_owned(),
+            client_svid: Some(client_svid),
+            body_json: env.to_json_string(),
+        };
+        let (_, parsed_env, _) =
+            gateway.execute_loopback_tcp_exchange(bind_addr, &req, current_tick)?;
+        self.is_subscribed = true;
+        Ok(encode_recordio_frame(&parsed_env))
+    }
 }
 
 /// High-level client SDK for submitting direct tasks, gang jobs, and GPU/TPU topology workloads.
@@ -207,6 +253,38 @@ impl ArbiterClient {
     /// Initialized [`ArbiterClient`].
     pub const fn new(default_role: RoleName) -> Self {
         Self { default_role }
+    }
+
+    /// Submits a direct [`TaskSpec`] over a live/framed QUIC [`QuicStreamKind::Control`] transport.
+    ///
+    /// # Arguments
+    ///
+    /// * `transport` - [`FramedStreamTransport`] connected to the remote Master.
+    /// * `task` - [`TaskSpec`] to transmit.
+    /// * `seq` - Monotonic wire envelope sequence number.
+    /// * `current_tick` - Monotonic tick.
+    ///
+    /// # Returns
+    ///
+    /// Submitted [`TaskId`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::QuicConnectionError`] if transmission fails.
+    pub fn submit_task_over_quic<T: FramedStreamTransport>(
+        &self,
+        transport: &mut T,
+        task: TaskSpec,
+        seq: u64,
+        current_tick: u64,
+    ) -> ArbiterResult<TaskId> {
+        let tid = task.task_id.clone();
+        let env = WireEnvelope::new(
+            seq,
+            WireMessage::SubmitDirectJob(SubmitDirectJob::SingleTask(Box::new(task))),
+        );
+        transport.transmit_envelope(QuicStreamKind::Control, &env, current_tick)?;
+        Ok(tid)
     }
 
     /// Submits a single direct [`TaskSpec`] to `master`.
@@ -357,8 +435,159 @@ impl ArbiterClient {
                 refuse_milliseconds,
                 min_cpu_millicores: 0,
                 min_memory_bytes: arbiter_core::units::Bytes::ZERO,
+                min_gpu_vram: arbiter_core::units::Bytes::ZERO,
+                refuse_gpu_offers: false,
             })],
         }
+    }
+}
+
+/// Networked client SDK (`RemoteArbiterClient`) connecting to a remote `arbiter-master` over
+/// QUIC (`arbiter-net::quic`) or HTTP/SSE (`arbiter-net::http`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RemoteArbiterClient {
+    /// Remote Master HTTP/REST endpoint (`"127.0.0.1:5051"`).
+    pub master_http_endpoint: String,
+    /// Remote Master QUIC endpoint (`"127.0.0.1:5050"`).
+    pub master_quic_endpoint: String,
+    /// Authenticated SPIFFE SVID for mTLS/HTTP requests.
+    pub client_svid: SpiffeSvid,
+    /// Default scheduling [`RoleName`].
+    pub default_role: RoleName,
+}
+
+impl RemoteArbiterClient {
+    /// Creates a new [`RemoteArbiterClient`].
+    ///
+    /// # Arguments
+    ///
+    /// * `master_http_endpoint` - Master HTTP/REST address.
+    /// * `master_quic_endpoint` - Master QUIC address.
+    /// * `client_svid` - Client [`SpiffeSvid`].
+    /// * `default_role` - Default [`RoleName`].
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`RemoteArbiterClient`].
+    pub const fn new(
+        master_http_endpoint: String,
+        master_quic_endpoint: String,
+        client_svid: SpiffeSvid,
+        default_role: RoleName,
+    ) -> Self {
+        Self {
+            master_http_endpoint,
+            master_quic_endpoint,
+            client_svid,
+            default_role,
+        }
+    }
+
+    /// Submits a [`SubmitDirectJob`] over HTTP `POST /api/v1/jobs` via `gateway`.
+    ///
+    /// # Arguments
+    ///
+    /// * `gateway` - [`HttpGateway`] instance.
+    /// * `job` - [`SubmitDirectJob`] payload (`SingleTask` or `GangJob`).
+    /// * `seq` - Monotonic sequence number.
+    /// * `current_tick` - Monotonic tick.
+    ///
+    /// # Returns
+    ///
+    /// Returned [`WireEnvelope`] acknowledgement.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if socket binding or authentication fails.
+    pub fn submit_job_over_http(
+        &self,
+        gateway: &HttpGateway,
+        job: SubmitDirectJob,
+        seq: u64,
+        current_tick: u64,
+    ) -> ArbiterResult<WireEnvelope> {
+        let env = WireEnvelope::new(seq, WireMessage::SubmitDirectJob(job));
+        let req = HttpRequest {
+            path: "/api/v1/jobs".to_owned(),
+            client_svid: Some(self.client_svid.clone()),
+            body_json: env.to_json_string(),
+        };
+        let (_, resp_env, _) = gateway.execute_loopback_tcp_exchange(
+            &self.master_http_endpoint,
+            &req,
+            current_tick,
+        )?;
+        Ok(resp_env)
+    }
+}
+
+/// Networked 2-level Framework driver (`RemoteFrameworkDriver`) connecting a [`FrameworkScheduler`]
+/// to a remote `arbiter-master` over QUIC or HTTP/RecordIO.
+pub struct RemoteFrameworkDriver<F: FrameworkScheduler> {
+    /// Wrapped [`FrameworkRunner`].
+    pub runner: FrameworkRunner<F>,
+    /// Remote [`RemoteArbiterClient`] transport configuration.
+    pub client: RemoteArbiterClient,
+}
+
+impl<F: FrameworkScheduler> RemoteFrameworkDriver<F> {
+    /// Creates a new [`RemoteFrameworkDriver`].
+    ///
+    /// # Arguments
+    ///
+    /// * `scheduler` - [`FrameworkScheduler`] implementation.
+    /// * `client` - [`RemoteArbiterClient`] transport config.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`RemoteFrameworkDriver`].
+    pub const fn new(scheduler: F, client: RemoteArbiterClient) -> Self {
+        Self {
+            runner: FrameworkRunner::new(scheduler),
+            client,
+        }
+    }
+
+    /// Subscribes the Framework over HTTP `POST /api/v1/scheduler` (`RecordIO` SSE) via `gateway`.
+    ///
+    /// # Arguments
+    ///
+    /// * `gateway` - [`HttpGateway`] instance.
+    /// * `seq` - Sequence number.
+    /// * `current_tick` - Monotonic tick.
+    ///
+    /// # Returns
+    ///
+    /// `RecordIO`-encoded `SUBSCRIBED` response frame.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ArbiterError`] if the HTTP exchange fails.
+    pub fn subscribe_over_http(
+        &mut self,
+        gateway: &HttpGateway,
+        seq: u64,
+        current_tick: u64,
+    ) -> ArbiterResult<String> {
+        let role = self.runner.scheduler.role();
+        let call = SchedulerCall::Subscribe(
+            SubscribeFramework {
+                framework_id: self.runner.scheduler.framework_id(),
+                role: role.clone(),
+                failover_timeout_ms: self.runner.scheduler.failover_timeout_ms(),
+            },
+            arbiter_core::workload::CheckpointMode::Enabled,
+            vec![role],
+            Vec::new(),
+        );
+        self.runner.exchange_scheduler_call_over_http(
+            gateway,
+            &self.client.master_http_endpoint,
+            self.client.client_svid.clone(),
+            call,
+            seq,
+            current_tick,
+        )
     }
 }
 
@@ -574,6 +803,127 @@ mod tests {
                 .is_ok()
         );
         assert_eq!(runner.scheduler.observed_updates, 1);
+
+        // Live HTTP/RecordIO SchedulerCall exchange via FrameworkRunner
+        let auth = arbiter_net::security::SvidAuthority::new("arbiter.internal", [9_u8; 32], 100);
+        let svid = auth
+            .issue_svid("spiffe://arbiter.internal/role/ml/task/fw", 10)
+            .unwrap_or_default();
+        let gw = HttpGateway::new(auth);
+        let rio_resp = runner.exchange_scheduler_call_over_http(
+            &gw,
+            "127.0.0.1:0",
+            svid.clone(),
+            SchedulerCall::Revive(FrameworkId::new("spark-fw").unwrap_or_default(), Vec::new()),
+            1,
+            20,
+        );
+        assert!(rio_resp.is_ok());
+        assert!(
+            runner
+                .exchange_scheduler_call_over_http(
+                    &gw,
+                    "invalid-addr",
+                    svid,
+                    SchedulerCall::Revive(
+                        FrameworkId::new("spark-fw").unwrap_or_default(),
+                        Vec::new(),
+                    ),
+                    2,
+                    20,
+                )
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_sdk_client_quic_submission() {
+        let (_, role) = setup_master();
+        let client = ArbiterClient::new(role);
+        let mut quic_conn =
+            arbiter_net::quic::QuicMultiplexedConnection::new("127.0.0.1:5050", 2, 100, 1);
+        let sample_t = TaskSpec {
+            task_id: TaskId::new("quic-job-1").unwrap_or_default(),
+            role: client.default_role.clone(),
+            framework_id: None,
+            election_group: None,
+            priority: PriorityClass::Batch,
+            preemption_policy: PreemptionPolicy::ImmediateKill,
+            resources: ResourceBundle::zero(),
+            required_gpu_vendor: None,
+            required_gpu_partition: None,
+            topology_constraints: Vec::new(),
+            isolation: IsolationSpec {
+                capabilities: Vec::new(),
+                image_ref: None,
+                command: "/bin/true".to_owned(),
+                args: Vec::new(),
+                env: Vec::new(),
+                run_as_user: None,
+            },
+            artifacts: Vec::new(),
+            secrets: Vec::new(),
+            health_check: None,
+        };
+        assert!(
+            client
+                .submit_task_over_quic(&mut quic_conn, sample_t.clone(), 1, 2)
+                .is_ok()
+        );
+        let mut zero_quic =
+            arbiter_net::quic::QuicMultiplexedConnection::new("127.0.0.1:5050", 0, 100, 1);
+        assert!(
+            client
+                .submit_task_over_quic(&mut zero_quic, sample_t.clone(), 2, 2)
+                .is_err()
+        );
+
+        let auth = arbiter_net::security::SvidAuthority::new("arbiter.internal", [7_u8; 32], 100);
+        let svid = auth
+            .issue_svid("spiffe://arbiter.internal/role/ml/task/rem", 10)
+            .unwrap_or_default();
+        let gw = HttpGateway::new(auth);
+        let rem_client = RemoteArbiterClient::new(
+            "127.0.0.1:0".to_owned(),
+            "127.0.0.1:5050".to_owned(),
+            svid,
+            client.default_role.clone(),
+        );
+        assert!(
+            rem_client
+                .submit_job_over_http(&gw, SubmitDirectJob::SingleTask(Box::new(sample_t)), 3, 20)
+                .is_ok()
+        );
+        let mut rem_fw = RemoteFrameworkDriver::new(
+            GreedyTestFramework {
+                fw_id: FrameworkId::new("rem-fw").unwrap_or_default(),
+                role: client.default_role.clone(),
+                launch_on_offer: false,
+                fail_on_offer: false,
+                observed_updates: 0,
+            },
+            rem_client,
+        );
+        assert!(rem_fw.subscribe_over_http(&gw, 4, 20).is_ok());
+        rem_fw.client.master_http_endpoint = "invalid-addr".to_owned();
+        assert!(rem_fw.subscribe_over_http(&gw, 5, 20).is_err());
+        assert!(
+            rem_fw
+                .client
+                .submit_job_over_http(
+                    &gw,
+                    SubmitDirectJob::GangJob(TaskGroupSpec {
+                        group_id: TaskGroupId::new("g1").unwrap_or_default(),
+                        role: client.default_role,
+                        tasks: Vec::new(),
+                        tpu_slice: None,
+                        placement_timeout_ms: 100,
+                    }),
+                    6,
+                    20
+                )
+                .is_err()
+        );
     }
 
     #[test]

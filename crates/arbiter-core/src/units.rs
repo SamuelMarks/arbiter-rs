@@ -38,7 +38,6 @@ macro_rules! define_u64_unit {
             RkyvSerialize,
             RkyvDeserialize,
         )]
-        #[rkyv(compare(PartialEq), derive(Debug))]
         pub struct $name(u64);
 
         impl $name {
@@ -354,6 +353,374 @@ define_u64_unit!(
     "LogSequenceNumber"
 );
 
+define_u64_unit!(
+    /// Monotonically increasing Raft consensus election term (`0..=u64::MAX`).
+    RaftTerm,
+    "term",
+    "RaftTerm"
+);
+
+define_u64_unit!(
+    /// Monotonically increasing Raft write-ahead log entry index (`0..=u64::MAX`).
+    RaftLogIndex,
+    "idx",
+    "RaftLogIndex"
+);
+
+define_u64_unit!(
+    /// Monotonically increasing key-value storage modification revision (`0..=u64::MAX`).
+    StorageRevision,
+    "rev",
+    "StorageRevision"
+);
+
+define_u64_unit!(
+    /// Framework failover grace timeout in milliseconds (`ms`) before unregistered tasks are terminated.
+    FailoverTimeoutMillis,
+    "ms",
+    "FailoverTimeoutMillis"
+);
+
+define_u64_unit!(
+    /// Periodic Master or Agent heartbeat interval in discrete ticks.
+    HeartbeatIntervalTicks,
+    "ticks",
+    "HeartbeatIntervalTicks"
+);
+
+define_u64_unit!(
+    /// Resource offer time-to-live (`TTL`) duration in discrete ticks before automatic rescinding.
+    OfferTtlTicks,
+    "ticks",
+    "OfferTtlTicks"
+);
+
+define_u64_unit!(
+    /// Byte offset for paginated Mesos `READ_FILE` sandbox file reads.
+    FileReadOffset,
+    "B",
+    "FileReadOffset"
+);
+
+define_u64_unit!(
+    /// Maximum byte length for paginated Mesos `READ_FILE` sandbox file reads.
+    FileReadLength,
+    "B",
+    "FileReadLength"
+);
+
+/// Strongly-typed control-plane and agent logging verbosity level (`SET_LOGGING_LEVEL` / `GET_LOGGING_LEVEL`).
+#[must_use]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum LoggingLevel {
+    /// Only fatal and error events (`0`).
+    Error,
+    /// Warning and error events (`1`, default).
+    #[default]
+    Warn,
+    /// Informational, warning, and error events (`2`).
+    Info,
+    /// Verbose debug events (`3`).
+    Debug,
+    /// Wire-frame and tick-level trace events (`4`).
+    Trace,
+}
+
+impl LoggingLevel {
+    /// Converts a raw numeric level (`0..=4`) into a validated [`LoggingLevel`].
+    ///
+    /// # Arguments
+    ///
+    /// * `raw` - Numeric verbosity level (`0..=4`).
+    ///
+    /// # Returns
+    ///
+    /// Validated [`LoggingLevel`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidResourceQuantity`] if `raw > 4`.
+    pub fn from_u8(raw: u8) -> ArbiterResult<Self> {
+        match raw {
+            0 => Ok(Self::Error),
+            1 => Ok(Self::Warn),
+            2 => Ok(Self::Info),
+            3 => Ok(Self::Debug),
+            4 => Ok(Self::Trace),
+            _ => Err(ArbiterError::InvalidResourceQuantity {
+                resource: "LoggingLevel".to_owned(),
+                quantity: u64::from(raw),
+                reason: "logging level must be between 0 (Error) and 4 (Trace)".to_owned(),
+            }),
+        }
+    }
+
+    /// Returns the canonical numeric verbosity code (`0..=4`).
+    ///
+    /// # Returns
+    ///
+    /// Numeric level `u8`.
+    pub const fn as_u8(self) -> u8 {
+        match self {
+            Self::Error => 0,
+            Self::Warn => 1,
+            Self::Info => 2,
+            Self::Debug => 3,
+            Self::Trace => 4,
+        }
+    }
+
+    /// Returns the canonical uppercase name of this logging level.
+    ///
+    /// # Returns
+    ///
+    /// Static uppercase label string.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Error => "ERROR",
+            Self::Warn => "WARN",
+            Self::Info => "INFO",
+            Self::Debug => "DEBUG",
+            Self::Trace => "TRACE",
+        }
+    }
+}
+
+impl fmt::Display for LoggingLevel {
+    /// Formats the logging level as its canonical uppercase name.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Validated HTTP response status code (`100..=599`).
+#[must_use]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct HttpStatusCode(u16);
+
+impl Default for HttpStatusCode {
+    /// Returns HTTP `200 OK` as the default status code.
+    ///
+    /// # Returns
+    ///
+    /// `HttpStatusCode(200)`.
+    fn default() -> Self {
+        Self::OK
+    }
+}
+
+impl HttpStatusCode {
+    /// HTTP `101 Switching Protocols` (WebSocket upgrade).
+    pub const SWITCHING_PROTOCOLS: Self = Self(101);
+    /// HTTP `200 OK`.
+    pub const OK: Self = Self(200);
+    /// HTTP `202 Accepted` (Mesos v1 one-way call acknowledgment).
+    pub const ACCEPTED: Self = Self(202);
+    /// HTTP `204 No Content`.
+    pub const NO_CONTENT: Self = Self(204);
+    /// HTTP `400 Bad Request`.
+    pub const BAD_REQUEST: Self = Self(400);
+    /// HTTP `401 Unauthorized`.
+    pub const UNAUTHORIZED: Self = Self(401);
+    /// HTTP `403 Forbidden`.
+    pub const FORBIDDEN: Self = Self(403);
+    /// HTTP `404 Not Found`.
+    pub const NOT_FOUND: Self = Self(404);
+    /// HTTP `409 Conflict`.
+    pub const CONFLICT: Self = Self(409);
+    /// HTTP `503 Service Unavailable`.
+    pub const SERVICE_UNAVAILABLE: Self = Self(503);
+
+    /// Validates and constructs an [`HttpStatusCode`] in `100..=599`.
+    ///
+    /// # Arguments
+    ///
+    /// * `code` - Raw HTTP status code (`100..=599`).
+    ///
+    /// # Returns
+    ///
+    /// Validated [`HttpStatusCode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidRangeBounds`] if `code < 100` or `code > 599`.
+    pub fn new(code: u16) -> ArbiterResult<Self> {
+        if !(100..=599).contains(&code) {
+            return Err(ArbiterError::InvalidRangeBounds {
+                context: "HttpStatusCode".to_owned(),
+                start: u64::from(code),
+                end: 599,
+            });
+        }
+        Ok(Self(code))
+    }
+
+    /// Returns the underlying `u16` HTTP status code.
+    ///
+    /// # Returns
+    ///
+    /// Raw `u16` status code.
+    pub const fn get(self) -> u16 {
+        self.0
+    }
+
+    /// Returns `true` if the status code is in the `2xx` success range (`200..=299`).
+    ///
+    /// # Returns
+    ///
+    /// `true` if `200 <= code <= 299`.
+    pub const fn is_success(self) -> bool {
+        self.0 >= 200 && self.0 <= 299
+    }
+}
+
+impl fmt::Display for HttpStatusCode {
+    /// Formats the HTTP status code.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+/// Validated POSIX / OS signal number (`1..=64`).
+#[must_use]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct SignalNumber(i32);
+
+impl Default for SignalNumber {
+    /// Returns `SIGTERM` (`15`) as the default signal number.
+    ///
+    /// # Returns
+    ///
+    /// `SignalNumber(15)`.
+    fn default() -> Self {
+        Self::SIGTERM
+    }
+}
+
+impl SignalNumber {
+    /// `SIGHUP` (`1`) — configuration / trust bundle reload.
+    pub const SIGHUP: Self = Self(1);
+    /// `SIGINT` (`2`) — interactive interrupt.
+    pub const SIGINT: Self = Self(2);
+    /// `SIGKILL` (`9`) — immediate non-maskable termination.
+    pub const SIGKILL: Self = Self(9);
+    /// `SIGUSR1` (`10`) — Arbiter pre-preemption checkpoint warning signal.
+    pub const SIGUSR1: Self = Self(10);
+    /// `SIGTERM` (`15`) — graceful termination request.
+    pub const SIGTERM: Self = Self(15);
+    /// `SIGCONT` (`18`) — resume stopped process.
+    pub const SIGCONT: Self = Self(18);
+    /// `SIGSTOP` (`19`) — freeze process execution.
+    pub const SIGSTOP: Self = Self(19);
+
+    /// Validates and constructs a [`SignalNumber`] in `1..=64`.
+    ///
+    /// # Arguments
+    ///
+    /// * `sig` - Raw POSIX signal number (`1..=64`).
+    ///
+    /// # Returns
+    ///
+    /// Validated [`SignalNumber`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidResourceQuantity`] if `sig < 1` or `sig > 64`.
+    pub fn new(sig: i32) -> ArbiterResult<Self> {
+        if !(1..=64).contains(&sig) {
+            return Err(ArbiterError::InvalidResourceQuantity {
+                resource: "SignalNumber".to_owned(),
+                quantity: u64::try_from(sig).unwrap_or(0),
+                reason: "POSIX signal number must be in 1..=64".to_owned(),
+            });
+        }
+        Ok(Self(sig))
+    }
+
+    /// Returns the underlying `i32` signal number.
+    ///
+    /// # Returns
+    ///
+    /// Raw `i32` signal number.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+impl fmt::Display for SignalNumber {
+    /// Formats the signal number with `SIG:` prefix.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "SIG:{}", self.0)
+    }
+}
+
 /// Monotonically increasing replication timeline identifier (`>= 1`, incremented on each standby promotion).
 #[must_use]
 #[derive(
@@ -371,7 +738,6 @@ define_u64_unit!(
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct TimelineId(u64);
 
 impl Default for TimelineId {
@@ -470,7 +836,6 @@ impl fmt::Display for TimelineId {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct ClusterCount(u32);
 
 impl Default for ClusterCount {
@@ -550,7 +915,6 @@ impl fmt::Display for ClusterCount {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct NodeCount(u32);
 
 impl Default for NodeCount {
@@ -671,7 +1035,6 @@ impl fmt::Display for NodeCount {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct WorkloadTaskCount(u32);
 
 impl Default for WorkloadTaskCount {
@@ -752,7 +1115,6 @@ impl fmt::Display for WorkloadTaskCount {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct DeterministicPrngSeed(u64);
 
 impl DeterministicPrngSeed {
@@ -868,7 +1230,6 @@ impl SharePartsPerBillion {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct TemperatureMilliCelsius(i64);
 
 /// Alias for [`TemperatureMilliCelsius`] for concise domain signatures.
@@ -974,7 +1335,6 @@ impl fmt::Display for TemperatureMilliCelsius {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct WeightBasisPoints(pub(crate) u64);
 
 impl WeightBasisPoints {
@@ -1046,7 +1406,6 @@ impl fmt::Display for WeightBasisPoints {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct PortNumber(pub(crate) u16);
 
 impl Default for PortNumber {
@@ -1127,7 +1486,6 @@ impl fmt::Display for PortNumber {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct PortRange {
     /// Inclusive lower bound port.
     pub(crate) start: PortNumber,
@@ -1245,7 +1603,6 @@ impl fmt::Display for PortRange {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub struct PortSet {
     /// Sorted, coalesced, disjoint port ranges.
     ranges: Vec<PortRange>,
@@ -1474,6 +1831,63 @@ mod tests {
     test_unit_type!(test_latency_micros, LatencyMicros, "us");
     test_unit_type!(test_client_downtime_millis, ClientDowntimeMillis, "ms");
     test_unit_type!(test_log_sequence_number, LogSequenceNumber, "lsn");
+    test_unit_type!(test_raft_term, RaftTerm, "term");
+    test_unit_type!(test_raft_log_index, RaftLogIndex, "idx");
+    test_unit_type!(test_storage_revision, StorageRevision, "rev");
+    test_unit_type!(test_failover_timeout_millis, FailoverTimeoutMillis, "ms");
+    test_unit_type!(
+        test_heartbeat_interval_ticks,
+        HeartbeatIntervalTicks,
+        "ticks"
+    );
+    test_unit_type!(test_offer_ttl_ticks, OfferTtlTicks, "ticks");
+    test_unit_type!(test_file_read_offset, FileReadOffset, "B");
+    test_unit_type!(test_file_read_length, FileReadLength, "B");
+
+    #[test]
+    fn test_logging_level_conversions() {
+        assert_eq!(LoggingLevel::default(), LoggingLevel::Warn);
+        let levels = [
+            (0_u8, LoggingLevel::Error, "ERROR"),
+            (1_u8, LoggingLevel::Warn, "WARN"),
+            (2_u8, LoggingLevel::Info, "INFO"),
+            (3_u8, LoggingLevel::Debug, "DEBUG"),
+            (4_u8, LoggingLevel::Trace, "TRACE"),
+        ];
+        for (code, expected, label) in levels {
+            assert_eq!(LoggingLevel::from_u8(code), Ok(expected));
+            assert_eq!(expected.as_u8(), code);
+            assert_eq!(expected.as_str(), label);
+            assert_eq!(expected.to_string(), label);
+        }
+        assert!(LoggingLevel::from_u8(5).is_err());
+        let _ = rkyv::to_bytes::<rkyv::rancor::Error>(&LoggingLevel::Trace);
+    }
+
+    #[test]
+    fn test_http_status_code_and_signal_number() {
+        assert_eq!(HttpStatusCode::default(), HttpStatusCode::OK);
+        assert!(HttpStatusCode::OK.is_success());
+        assert!(HttpStatusCode::ACCEPTED.is_success());
+        assert!(!HttpStatusCode::SWITCHING_PROTOCOLS.is_success());
+        assert!(!HttpStatusCode::BAD_REQUEST.is_success());
+        assert!(HttpStatusCode::new(99).is_err());
+        assert!(HttpStatusCode::new(600).is_err());
+        let code = HttpStatusCode::new(204).unwrap_or_default();
+        assert_eq!(code.get(), 204);
+        assert_eq!(code.to_string(), "204");
+
+        assert_eq!(SignalNumber::default(), SignalNumber::SIGTERM);
+        assert!(SignalNumber::new(0).is_err());
+        assert!(SignalNumber::new(-1).is_err());
+        assert!(SignalNumber::new(65).is_err());
+        let sig = SignalNumber::new(9).unwrap_or_default();
+        assert_eq!(sig, SignalNumber::SIGKILL);
+        assert_eq!(sig.get(), 9);
+        assert_eq!(sig.to_string(), "SIG:9");
+
+        let _ = rkyv::to_bytes::<rkyv::rancor::Error>(&(code, sig));
+    }
 
     #[test]
     fn test_timeline_id_and_cluster_count() {
@@ -1652,6 +2066,24 @@ mod tests {
             end: PortNumber(210),
         }]);
         assert!(set.try_sub(&invalid_sub).is_err());
+
+        let all_units = (
+            Millicores::ZERO,
+            TimelineId::default(),
+            ClusterCount::default(),
+            NodeCount::default(),
+            WorkloadTaskCount::default(),
+            DeterministicPrngSeed::default(),
+            TemperatureMilliCelsius::default(),
+            WeightBasisPoints::STANDARD,
+            PortNumber::default(),
+            PortRange {
+                start: PortNumber(80),
+                end: PortNumber(90),
+            },
+            set,
+        );
+        let _ = rkyv::to_bytes::<rkyv::rancor::Error>(&all_units);
     }
 
     proptest! {

@@ -14,12 +14,9 @@ categories.workspace = true
 [dependencies]
 arbiter-core = { workspace = true }
 arbiter-proto = { workspace = true }
-arbiter-iso = { workspace = true }
 arbiter-telemetry = { workspace = true }
 serde = { workspace = true }
-
-[dev-dependencies]
-proptest = { workspace = true }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

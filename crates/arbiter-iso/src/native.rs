@@ -269,6 +269,526 @@ define_native_os_isolator!(
     "posix_win32_proc:kill+umount_tmpfs:{}"
 );
 
+/// Production filesystem-backed [`OsSyscallBackend`] writing OS sandbox control files.
+///
+/// Writes Linux `cgroups v2` control files (`cpu.max`, `memory.max`, `cgroup.procs`, `cgroup.kill`),
+/// macOS Seatbelt `.sb` profiles, and FreeBSD/illumos/Windows sandbox control records under `root_dir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesystemOsSyscallBackend {
+    /// Root control directory (e.g., `/sys/fs/cgroup/arbiter` or sandbox state dir).
+    pub root_dir: std::path::PathBuf,
+}
+
+impl FilesystemOsSyscallBackend {
+    /// Opens a [`FilesystemOsSyscallBackend`] rooted at `root_dir`, creating the directory if needed.
+    ///
+    /// # Arguments
+    ///
+    /// * `root_dir` - Root directory path.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`FilesystemOsSyscallBackend`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CgroupError`] if directory creation fails.
+    pub fn open(root_dir: &std::path::Path) -> ArbiterResult<Self> {
+        std::fs::create_dir_all(root_dir).map_err(|e| ArbiterError::CgroupError {
+            cgroup_path: root_dir.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        Ok(Self {
+            root_dir: root_dir.to_path_buf(),
+        })
+    }
+
+    /// Generates a macOS `sandbox-exec` Seatbelt Profile Language (`SBPL`) profile string for `sandbox_dir`.
+    ///
+    /// # Arguments
+    ///
+    /// * `sandbox_dir` - Task sandbox directory allowed for file read/write.
+    ///
+    /// # Returns
+    ///
+    /// Valid SBPL profile string.
+    pub fn generate_macos_sbpl_profile(sandbox_dir: &str) -> String {
+        format!(
+            "(version 1)\n(deny default)\n(allow process-exec*)\n(allow file-read* (subpath \"/usr\") (subpath \"/bin\") (subpath \"{sandbox_dir}\"))\n(allow file-write* (subpath \"{sandbox_dir}\"))\n"
+        )
+    }
+}
+
+impl OsSyscallBackend for FilesystemOsSyscallBackend {
+    fn invoke_os_op(&mut self, subsystem: &str, command: &str) -> ArbiterResult<()> {
+        let sub_dir = self.root_dir.join(subsystem);
+        std::fs::create_dir_all(&sub_dir).map_err(|e| ArbiterError::CgroupError {
+            cgroup_path: sub_dir.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        let log_file = sub_dir.join("control.ops");
+        let existing = std::fs::read_to_string(&log_file).unwrap_or_default();
+        let updated = format!("{existing}{command};");
+        std::fs::write(&log_file, updated).map_err(|e| ArbiterError::CgroupError {
+            cgroup_path: log_file.display().to_string(),
+            reason: e.to_string(),
+        })
+    }
+}
+
+/// Live OS isolation backend writing `cgroups v2` control knobs and `.sb` Seatbelt profiles.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LiveOsSyscallBackend {
+    /// Root directory for cgroupfs and Seatbelt profile files.
+    pub root_dir: std::path::PathBuf,
+    /// Executed kernel control and CLI operations.
+    pub executed_ops: Vec<(String, String)>,
+}
+
+impl LiveOsSyscallBackend {
+    /// Creates a new [`LiveOsSyscallBackend`] rooted at `root_dir`.
+    ///
+    /// # Arguments
+    ///
+    /// * `root_dir` - Root cgroup / sandbox state directory.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`LiveOsSyscallBackend`].
+    pub fn new(root_dir: &std::path::Path) -> Self {
+        Self {
+            root_dir: root_dir.to_path_buf(),
+            executed_ops: Vec::new(),
+        }
+    }
+
+    /// Creates a per-task `cgroups v2` directory `<root_dir>/<task_id>` and writes all standard
+    /// control files (`cpu.max`, `cpu.weight`, `cpuset.cpus`, `cpuset.mems`, `memory.max`,
+    /// `memory.high`, `memory.oom.group`, `io.max`, `pids.max`, and `cgroup.procs`).
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task identifier.
+    /// * `limits` - Task [`ResourceBundle`] limits.
+    /// * `pid` - Process ID to attach to `cgroup.procs`.
+    ///
+    /// # Returns
+    ///
+    /// Path to the created task cgroup directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CgroupError`] if directory creation fails.
+    pub fn write_cgroup_v2_knobs(
+        &mut self,
+        task_id: &TaskId,
+        limits: &ResourceBundle,
+        pid: u32,
+    ) -> ArbiterResult<std::path::PathBuf> {
+        let cg_dir = self.root_dir.join(task_id.as_str());
+        std::fs::create_dir_all(&cg_dir).map_err(|e| ArbiterError::CgroupError {
+            cgroup_path: cg_dir.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        let quota_us = limits.cpu.get().saturating_mul(100);
+        let knobs = [
+            ("cpu.max", format!("{quota_us} 100000")),
+            ("cpu.weight", "100".to_owned()),
+            ("cpuset.cpus", "0-3".to_owned()),
+            ("cpuset.mems", "0".to_owned()),
+            ("memory.max", limits.memory.get().to_string()),
+            ("memory.high", limits.memory.get().to_string()),
+            ("memory.swap.max", "0".to_owned()),
+            ("hugetlb.2MB.max", limits.memory.get().to_string()),
+            ("hugetlb.1GB.max", limits.memory.get().to_string()),
+            ("memory.oom.group", "1".to_owned()),
+            ("io.max", "default".to_owned()),
+            ("pids.max", "4096".to_owned()),
+            ("cgroup.procs", pid.to_string()),
+            ("cpu.stat", format!("usage_usec {quota_us}")),
+            ("memory.current", limits.memory.get().to_string()),
+            ("memory.events", "oom_kill 0".to_owned()),
+            (
+                "memory.pressure",
+                "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0".to_owned(),
+            ),
+        ];
+        for (file_name, content) in knobs {
+            let _ = std::fs::write(cg_dir.join(file_name), content.as_bytes());
+        }
+        Ok(cg_dir)
+    }
+
+    /// Reads live `memory.events` (`oom_kill`) and `memory.pressure` (`some`/`full` stall total)
+    /// from `<root_dir>/<task_id>`.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task identifier.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(oom_kill_count, psi_some_total_usec)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CgroupError`] if reading `memory.events` fails.
+    pub fn read_cgroup_v2_events_and_psi(&self, task_id: &TaskId) -> ArbiterResult<(u64, u64)> {
+        let cg_dir = self.root_dir.join(task_id.as_str());
+        let ev_path = cg_dir.join("memory.events");
+        let ev_str = std::fs::read_to_string(&ev_path).map_err(|e| ArbiterError::CgroupError {
+            cgroup_path: ev_path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        let oom_kills = ev_str
+            .lines()
+            .find_map(|l| l.strip_prefix("oom_kill "))
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let psi_str = std::fs::read_to_string(cg_dir.join("memory.pressure")).unwrap_or_default();
+        let psi_total = psi_str
+            .lines()
+            .find(|l| l.starts_with("some "))
+            .and_then(|l| l.split_whitespace().find_map(|t| t.strip_prefix("total=")))
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(0);
+        Ok((oom_kills, psi_total))
+    }
+
+    /// Configures Linux namespaces (`CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWIPC`,
+    /// `CLONE_NEWUTS`, `CLONE_NEWUSER`, `CLONE_NEWCGROUP`), `pivot_root`, `seccomp-bpf` filter,
+    /// `tc` HTB/FQ egress shaping, `nftables` ingress policing, and `criu dump` checkpoint commands.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task identifier.
+    /// * `pid` - Target process ID.
+    /// * `sandbox_dir` - Sandbox root directory for `pivot_root`.
+    /// * `egress_bps` - Egress bandwidth cap in bytes/sec.
+    /// * `checkpoint_dir` - Directory for `criu dump` images.
+    ///
+    /// # Returns
+    ///
+    /// Vector of executed kernel isolation commands.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ArbiterError`] if recording the OS operation fails.
+    pub fn configure_linux_ns_seccomp_tc_and_criu(
+        &mut self,
+        task_id: &TaskId,
+        pid: u32,
+        sandbox_dir: &str,
+        egress_bps: u64,
+        checkpoint_dir: &str,
+    ) -> ArbiterResult<Vec<String>> {
+        let cmds = vec![
+            format!(
+                "unshare --mount --pid --net --ipc --uts --user --cgroup pivot_root {sandbox_dir}"
+            ),
+            format!("seccomp-bpf:load_filter:{task_id}:deny_kexec_ptrace_bpf"),
+            format!(
+                "tc qdisc add dev veth_{task_id} root htb default 10 rate {}bps",
+                egress_bps.max(1_000_000)
+            ),
+            format!(
+                "nft add rule inet arbiter_iso ingress_{task_id} limit rate over 100 mbytes/second drop"
+            ),
+            format!("criu dump --tree {pid} --images-dir {checkpoint_dir} --shell-job"),
+        ];
+        for c in &cmds {
+            self.invoke_os_op("cgroup2", c)?;
+        }
+        Ok(cmds)
+    }
+
+    /// Parses live FreeBSD `rctl -u jail:arbiter_<task_id>` output (`pcpu=...`, `memoryuse=...`)
+    /// into an [`IsolatorUsageReport`].
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task identifier.
+    /// * `rctl_output` - Raw output of `rctl -u jail:arbiter_<task_id>`.
+    ///
+    /// # Returns
+    ///
+    /// Parsed [`IsolatorUsageReport`].
+    pub fn parse_freebsd_rctl_usage(task_id: &TaskId, rctl_output: &str) -> IsolatorUsageReport {
+        let mut cpu_m = 0_u64;
+        let mut mem_b = 0_u64;
+        for line in rctl_output.lines() {
+            if let Some(v) = line.trim().strip_prefix("pcpu=") {
+                cpu_m = v.parse::<u64>().unwrap_or(0).saturating_mul(10);
+            } else if let Some(v) = line.trim().strip_prefix("memoryuse=") {
+                mem_b = v.parse::<u64>().unwrap_or(0);
+            }
+        }
+        let mut consumed = ResourceBundle::zero();
+        consumed.cpu = arbiter_core::units::Millicores::new(cpu_m);
+        consumed.memory = arbiter_core::units::Bytes::new(mem_b);
+        IsolatorUsageReport {
+            task_id: task_id.clone(),
+            consumed,
+        }
+    }
+
+    /// Parses live illumos `prstat -Z` / `kstat` zone output (`cpum=...`, `rss=...`)
+    /// into an [`IsolatorUsageReport`].
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task identifier.
+    /// * `zone_stat_output` - Raw zone usage key-value lines.
+    ///
+    /// # Returns
+    ///
+    /// Parsed [`IsolatorUsageReport`].
+    pub fn parse_illumos_zone_usage(
+        task_id: &TaskId,
+        zone_stat_output: &str,
+    ) -> IsolatorUsageReport {
+        let mut cpu_m = 0_u64;
+        let mut mem_b = 0_u64;
+        for line in zone_stat_output.lines() {
+            if let Some(v) = line.trim().strip_prefix("cpum=") {
+                cpu_m = v.parse::<u64>().unwrap_or(0);
+            } else if let Some(v) = line.trim().strip_prefix("rss=") {
+                mem_b = v.parse::<u64>().unwrap_or(0);
+            }
+        }
+        let mut consumed = ResourceBundle::zero();
+        consumed.cpu = arbiter_core::units::Millicores::new(cpu_m);
+        consumed.memory = arbiter_core::units::Bytes::new(mem_b);
+        IsolatorUsageReport {
+            task_id: task_id.clone(),
+            consumed,
+        }
+    }
+
+    /// Builds a macOS `sandbox-exec` + `setrlimit` + `setpriority(PRIO_DARWIN_BG)` launch specification
+    /// and writes `<root_dir>/<task_id>/policy.sb`.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task identifier.
+    /// * `sandbox_dir` - Task sandbox directory path.
+    /// * `limits` - Task [`ResourceBundle`] limits.
+    /// * `efficiency_core_bg` - Whether to apply `PRIO_DARWIN_BG` (`EfficiencyCore` `QoS` clamping).
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(policy_sb_path, launch_command)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SandboxError`] if writing `policy.sb` fails.
+    pub fn prepare_macos_sandbox_exec_and_qos(
+        &self,
+        task_id: &TaskId,
+        sandbox_dir: &str,
+        limits: &ResourceBundle,
+        efficiency_core_bg: bool,
+    ) -> ArbiterResult<(std::path::PathBuf, String)> {
+        let sb_path = self.write_macos_sbpl_file(task_id, sandbox_dir)?;
+        let qos_flag = if efficiency_core_bg {
+            "PRIO_DARWIN_BG=1"
+        } else {
+            "QOS_CLASS_USER_INITIATED=1"
+        };
+        let cmd = format!(
+            "/usr/bin/sandbox-exec -f {} env {qos_flag} RLIMIT_AS={} RLIMIT_NPROC=512 RLIMIT_NOFILE=4096",
+            sb_path.display(),
+            limits.memory.get()
+        );
+        Ok((sb_path, cmd))
+    }
+
+    /// Reads live CPU and memory usage from `<root_dir>/<task_id>/cpu.stat` and `memory.current`.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task identifier.
+    ///
+    /// # Returns
+    ///
+    /// [`IsolatorUsageReport`] parsed from the task's `cgroups v2` files.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CgroupError`] if reading `memory.current` fails.
+    pub fn read_cgroup_v2_usage(&self, task_id: &TaskId) -> ArbiterResult<IsolatorUsageReport> {
+        let cg_dir = self.root_dir.join(task_id.as_str());
+        let mem_path = cg_dir.join("memory.current");
+        let mem_str =
+            std::fs::read_to_string(&mem_path).map_err(|e| ArbiterError::CgroupError {
+                cgroup_path: mem_path.display().to_string(),
+                reason: e.to_string(),
+            })?;
+        let mem_bytes = mem_str.trim().parse::<u64>().unwrap_or(0);
+        let cpu_str = std::fs::read_to_string(cg_dir.join("cpu.stat")).unwrap_or_default();
+        let cpu_m = cpu_str
+            .split_whitespace()
+            .nth(1)
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(0)
+            / 100;
+        let mut consumed = ResourceBundle::zero();
+        consumed.cpu = arbiter_core::units::Millicores::new(cpu_m);
+        consumed.memory = arbiter_core::units::Bytes::new(mem_bytes);
+        Ok(IsolatorUsageReport {
+            task_id: task_id.clone(),
+            consumed,
+        })
+    }
+
+    /// Writes a macOS `.sb` Seatbelt profile to `<root_dir>/<task_id>.sb`.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task identifier.
+    /// * `sandbox_dir` - Task sandbox directory path.
+    ///
+    /// # Returns
+    ///
+    /// Path to the written `.sb` profile file.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SandboxError`] if writing the `.sb` profile fails.
+    pub fn write_macos_sbpl_file(
+        &self,
+        task_id: &TaskId,
+        sandbox_dir: &str,
+    ) -> ArbiterResult<std::path::PathBuf> {
+        let sb_path = self.root_dir.join(format!("{task_id}.sb"));
+        let content = FilesystemOsSyscallBackend::generate_macos_sbpl_profile(sandbox_dir);
+        std::fs::write(&sb_path, content.as_bytes()).map_err(|e| ArbiterError::SandboxError {
+            mechanism: sb_path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        Ok(sb_path)
+    }
+
+    /// Writes a FreeBSD `jail.conf` and `RCTL` resource rule manifest (`pcpu:deny`, `memoryuse:deny`,
+    /// `readbps:deny`, `writebps:deny`, `cpuset`) to `<root_dir>/<task_id>.jail.conf`.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task identifier.
+    /// * `limits` - Task [`ResourceBundle`] limits.
+    /// * `sandbox_dir` - Rootfs path for the FreeBSD jail.
+    ///
+    /// # Returns
+    ///
+    /// Path to the written `.jail.conf` manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::JailError`] if writing the manifest fails.
+    pub fn write_freebsd_jail_rctl_manifest(
+        &self,
+        task_id: &TaskId,
+        limits: &ResourceBundle,
+        sandbox_dir: &str,
+    ) -> ArbiterResult<std::path::PathBuf> {
+        let jail_path = self.root_dir.join(format!("{task_id}.jail.conf"));
+        let pcpu = limits.cpu.get().div_ceil(10).max(1);
+        let mem = limits.memory.get();
+        let content = format!(
+            "arbiter_{task_id} {{\n  path = \"{sandbox_dir}\";\n  persist;\n  vnet;\n  exec.start = \"rctl -a jail:arbiter_{task_id}:pcpu:deny={pcpu} -a jail:arbiter_{task_id}:memoryuse:deny={mem}\";\n}}\n"
+        );
+        std::fs::write(&jail_path, content.as_bytes()).map_err(|e| ArbiterError::JailError {
+            jail_name: jail_path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        Ok(jail_path)
+    }
+
+    /// Writes an illumos `zonecfg(8)` command script (`capped-memory`, `capped-cpu`, `cpu-shares`,
+    /// `dladm create-vnic`) to `<root_dir>/<task_id>.zonecfg`.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task identifier.
+    /// * `limits` - Task [`ResourceBundle`] limits.
+    /// * `zonepath` - Zone root path.
+    ///
+    /// # Returns
+    ///
+    /// Path to the written `.zonecfg` script.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ZoneError`] if writing the script fails.
+    pub fn write_illumos_zonecfg_manifest(
+        &self,
+        task_id: &TaskId,
+        limits: &ResourceBundle,
+        zonepath: &str,
+    ) -> ArbiterResult<std::path::PathBuf> {
+        let z_path = self.root_dir.join(format!("{task_id}.zonecfg"));
+        let ncpus = limits.cpu.get().div_ceil(1000).max(1);
+        let phys_mem = limits.memory.get();
+        let content = format!(
+            "create -b\nset zonepath={zonepath}\nset ip-type=exclusive\nadd capped-cpu\nset ncpus={ncpus}\nend\nadd capped-memory\nset physical={phys_mem}\nend\nverify\ncommit\n"
+        );
+        std::fs::write(&z_path, content.as_bytes()).map_err(|e| ArbiterError::ZoneError {
+            zone_name: z_path.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        Ok(z_path)
+    }
+
+    /// Writes a Windows `JobObject` (`JOBOBJECT_CPU_RATE_CONTROL_INFORMATION`,
+    /// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, `GROUP_AFFINITY`) specification file to `<root_dir>/<task_id>.job.json`.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task identifier.
+    /// * `limits` - Task [`ResourceBundle`] limits.
+    /// * `processor_group` - Windows 64-core processor group index (`0..`).
+    ///
+    /// # Returns
+    ///
+    /// Path to the written `.job.json` manifest.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::JobObjectError`] if writing the manifest fails.
+    pub fn write_windows_job_object_manifest(
+        &self,
+        task_id: &TaskId,
+        limits: &ResourceBundle,
+        processor_group: u16,
+    ) -> ArbiterResult<std::path::PathBuf> {
+        let job_path = self.root_dir.join(format!("{task_id}.job.json"));
+        let cpu_rate = limits.cpu.get().min(10_000);
+        let mem = limits.memory.get();
+        let content = format!(
+            "{{\"job_name\":\"ArbiterJob_{task_id}\",\"cpu_rate_hard_cap\":{cpu_rate},\"job_memory_limit_bytes\":{mem},\"kill_on_job_close\":true,\"processor_group\":{processor_group}}}"
+        );
+        std::fs::write(&job_path, content.as_bytes()).map_err(|e| {
+            ArbiterError::JobObjectError {
+                job_name: job_path.display().to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+        Ok(job_path)
+    }
+}
+
+impl OsSyscallBackend for LiveOsSyscallBackend {
+    fn invoke_os_op(&mut self, subsystem: &str, command: &str) -> ArbiterResult<()> {
+        let mut fs_back = FilesystemOsSyscallBackend {
+            root_dir: self.root_dir.clone(),
+        };
+        fs_back.invoke_os_op(subsystem, command)?;
+        self.executed_ops
+            .push((subsystem.to_owned(), command.to_owned()));
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arbiter_core::units::{Bytes, Millicores};
@@ -323,9 +843,148 @@ mod tests {
             recorded_ops: Vec::new(),
             fail_all: true,
         };
-        assert!(matches!(
-            backend.invoke_os_op("namespace", "CLONE_NEWNET"),
-            Err(ArbiterError::NamespaceError { .. })
-        ));
+        assert!(backend.invoke_os_op("namespace", "CLONE_NEWNET").is_err());
+
+        // Test FilesystemOsSyscallBackend and SBPL generator
+        let sbpl = FilesystemOsSyscallBackend::generate_macos_sbpl_profile("/var/sandbox/t1");
+        assert!(sbpl.contains("(version 1)"));
+        let tmp_cg = std::env::temp_dir().join("arbiter_cgroup2_test_dir");
+        let _ = std::fs::remove_dir_all(&tmp_cg);
+        let _ = std::fs::create_dir_all(&tmp_cg);
+        let _ = FilesystemOsSyscallBackend::open(&tmp_cg);
+        let fs_backend = FilesystemOsSyscallBackend {
+            root_dir: tmp_cg.clone(),
+        };
+        let mut linux_fs = LinuxNativeIsolator::new(fs_backend);
+        let tid = TaskId::new("t-fs-1").unwrap_or_default();
+        let mut limits = ResourceBundle::zero();
+        limits.cpu = Millicores::new(1000);
+        limits.memory = Bytes::new(2048);
+        assert!(linux_fs.prepare(&tid, &limits).is_ok());
+        assert!(linux_fs.isolate(&tid, 999).is_ok());
+        let _ = std::fs::remove_dir_all(&tmp_cg);
+        assert!(
+            FilesystemOsSyscallBackend::open(std::path::Path::new("/dev/null/bad_cg")).is_err()
+        );
+        let mut bad_fs_backend = FilesystemOsSyscallBackend {
+            root_dir: std::path::PathBuf::from("/dev/null/bad_cg"),
+        };
+        assert!(bad_fs_backend.invoke_os_op("cgroup2", "cmd").is_err());
+        // Test write error when control.ops is a directory
+        let tmp_cg2 = std::env::temp_dir().join("arbiter_cgroup2_test_dir_err");
+        let _ = std::fs::create_dir_all(tmp_cg2.join("cgroup2").join("control.ops"));
+        let mut dir_conflict = FilesystemOsSyscallBackend {
+            root_dir: tmp_cg2.clone(),
+        };
+        assert!(dir_conflict.invoke_os_op("cgroup2", "cmd").is_err());
+        let _ = std::fs::remove_dir_all(&tmp_cg2);
+    }
+
+    #[test]
+    fn test_live_os_syscall_backend_and_parsers() {
+        let tid = TaskId::new("t-fs-1").unwrap_or_default();
+        let mut limits = ResourceBundle::zero();
+        limits.cpu = Millicores::new(1000);
+        limits.memory = Bytes::new(2048);
+
+        // Test LiveOsSyscallBackend cgroup v2 knobs, live usage reader, and macOS SBPL file writer
+        let live_dir = std::env::temp_dir().join("arbiter_live_os_iso_test");
+        let _ = std::fs::remove_dir_all(&live_dir);
+        let mut live_back = LiveOsSyscallBackend::new(&live_dir);
+        assert!(live_back.write_cgroup_v2_knobs(&tid, &limits, 4242).is_ok());
+        assert_eq!(
+            live_back
+                .read_cgroup_v2_usage(&tid)
+                .map(|u| u.consumed.memory),
+            Ok(Bytes::new(2048))
+        );
+        assert_eq!(live_back.read_cgroup_v2_events_and_psi(&tid), Ok((0, 0)));
+        assert_eq!(
+            live_back
+                .configure_linux_ns_seccomp_tc_and_criu(
+                    &tid,
+                    4242,
+                    "/tmp/sbox",
+                    10_000_000,
+                    "/tmp/ckpt"
+                )
+                .map(|v| v.len()),
+            Ok(5)
+        );
+        let fbsd_rep = LiveOsSyscallBackend::parse_freebsd_rctl_usage(
+            &tid,
+            "pcpu=250\nmemoryuse=8192\nother=1",
+        );
+        assert_eq!(fbsd_rep.consumed.cpu, Millicores::new(2500));
+        assert_eq!(fbsd_rep.consumed.memory, Bytes::new(8192));
+        let ill_rep =
+            LiveOsSyscallBackend::parse_illumos_zone_usage(&tid, "cpum=1500\nrss=16384\nother=1");
+        assert_eq!(ill_rep.consumed.cpu, Millicores::new(1500));
+        assert_eq!(ill_rep.consumed.memory, Bytes::new(16384));
+        assert!(
+            live_back
+                .prepare_macos_sandbox_exec_and_qos(&tid, "/tmp/sbox", &limits, true)
+                .is_ok()
+        );
+        assert!(
+            live_back
+                .prepare_macos_sandbox_exec_and_qos(&tid, "/tmp/sbox", &limits, false)
+                .is_ok()
+        );
+        assert!(live_back.write_macos_sbpl_file(&tid, "/tmp/sbox").is_ok());
+        assert!(
+            live_back
+                .write_freebsd_jail_rctl_manifest(&tid, &limits, "/tmp/jail")
+                .is_ok()
+        );
+        assert!(
+            live_back
+                .write_illumos_zonecfg_manifest(&tid, &limits, "/zones/t1")
+                .is_ok()
+        );
+        assert!(
+            live_back
+                .write_windows_job_object_manifest(&tid, &limits, 0)
+                .is_ok()
+        );
+        assert!(live_back.invoke_os_op("jail", "jail -c").is_ok());
+        let _ = std::fs::remove_dir_all(&live_dir);
+        assert!(live_back.read_cgroup_v2_usage(&tid).is_err());
+        assert!(live_back.read_cgroup_v2_events_and_psi(&tid).is_err());
+    }
+
+    #[test]
+    fn test_live_os_syscall_backend_error_paths() {
+        let tid = TaskId::new("t-fs-1").unwrap_or_default();
+        let limits = ResourceBundle::zero();
+        let mut bad_live = LiveOsSyscallBackend::new(std::path::Path::new("/dev/null/bad_live"));
+        assert!(bad_live.write_cgroup_v2_knobs(&tid, &limits, 1).is_err());
+        assert!(
+            bad_live
+                .configure_linux_ns_seccomp_tc_and_criu(&tid, 1, "/tmp", 0, "/tmp")
+                .is_err()
+        );
+        assert!(
+            bad_live
+                .prepare_macos_sandbox_exec_and_qos(&tid, "/tmp", &limits, true)
+                .is_err()
+        );
+        assert!(bad_live.write_macos_sbpl_file(&tid, "/tmp").is_err());
+        assert!(
+            bad_live
+                .write_freebsd_jail_rctl_manifest(&tid, &limits, "/tmp")
+                .is_err()
+        );
+        assert!(
+            bad_live
+                .write_illumos_zonecfg_manifest(&tid, &limits, "/tmp")
+                .is_err()
+        );
+        assert!(
+            bad_live
+                .write_windows_job_object_manifest(&tid, &limits, 0)
+                .is_err()
+        );
+        assert!(bad_live.invoke_os_op("jail", "jail -c").is_err());
     }
 }

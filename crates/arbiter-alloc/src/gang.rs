@@ -16,7 +16,10 @@ use arbiter_core::resources::{TorusCoordinate, TpuDevice, TpuTopologySlice};
 use arbiter_core::workload::{TaskGroupSpec, TopologyConstraint};
 use serde::{Deserialize, Serialize};
 
-use crate::topology_packer::{AgentHardwareInventory, TopologyPlacementPlan, pack_task_on_agent};
+use crate::topology_packer::{
+    AgentHardwareInventory, AgentSchedulingProfile, TopologyPlacementPlan,
+    pack_task_on_agent_with_profile,
+};
 
 /// Extended Agent inventory including available TPU chips for gang/Pod co-scheduling.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -57,8 +60,10 @@ impl GangReservation {
     }
 }
 
-/// Matches a contiguous 3D torus of healthy [`TpuDevice`]s of dimensions `(dim_x, dim_y, dim_z)`
-/// starting at origin `(0, 0, 0)` across the candidate Agents.
+/// Matches a contiguous 3D torus of healthy [`TpuDevice`]s of dimensions `(dim_x, dim_y, dim_z)`.
+///
+/// Searches origin `(0, 0, 0)` first and then any shifted sub-torus origin `(x0, y0, z0)`
+/// present in `candidates`.
 ///
 /// # Arguments
 ///
@@ -92,25 +97,56 @@ pub fn match_contiguous_tpu_torus(
         }
     }
 
-    let mut matched = Vec::new();
-    for x in 0..slice_req.dim_x {
-        for y in 0..slice_req.dim_y {
-            for z in 0..slice_req.dim_z {
-                let target_coord = TorusCoordinate { x, y, z };
-                let Some((agent_id, dev_id)) = coord_map.get(&target_coord) else {
-                    return Err(ArbiterError::InvalidTpuTopologySlice {
-                        slice: slice_req.slice_id.to_string(),
-                        reason: format!(
-                            "missing or unhealthy TPU chip at torus coordinate ({x}, {y}, {z})"
-                        ),
-                    });
-                };
-                matched.push((agent_id.clone(), dev_id.clone(), target_coord));
-            }
+    let mut candidate_origins = vec![TorusCoordinate { x: 0, y: 0, z: 0 }];
+    for &coord in coord_map.keys() {
+        if coord != (TorusCoordinate { x: 0, y: 0, z: 0 }) {
+            candidate_origins.push(coord);
         }
     }
 
-    Ok(matched)
+    let mut first_missing: Option<TorusCoordinate> = None;
+    for origin in candidate_origins {
+        let mut matched = Vec::new();
+        let mut missing_coord: Option<TorusCoordinate> = None;
+        for dx in 0..slice_req.dim_x {
+            for dy in 0..slice_req.dim_y {
+                for dz in 0..slice_req.dim_z {
+                    let target_coord = TorusCoordinate {
+                        x: origin.x.saturating_add(dx),
+                        y: origin.y.saturating_add(dy),
+                        z: origin.z.saturating_add(dz),
+                    };
+                    if let Some((agent_id, dev_id)) = coord_map.get(&target_coord) {
+                        matched.push((agent_id.clone(), dev_id.clone(), target_coord));
+                    } else {
+                        missing_coord = Some(target_coord);
+                        break;
+                    }
+                }
+                if missing_coord.is_some() {
+                    break;
+                }
+            }
+            if missing_coord.is_some() {
+                break;
+            }
+        }
+        if missing_coord.is_none() {
+            return Ok(matched);
+        }
+        if first_missing.is_none() {
+            first_missing = missing_coord;
+        }
+    }
+
+    let miss = first_missing.unwrap_or(TorusCoordinate { x: 0, y: 0, z: 0 });
+    Err(ArbiterError::InvalidTpuTopologySlice {
+        slice: slice_req.slice_id.to_string(),
+        reason: format!(
+            "missing or unhealthy TPU chip at torus coordinate ({}, {}, {})",
+            miss.x, miss.y, miss.z
+        ),
+    })
 }
 
 /// Atomically places all tasks in a [`TaskGroupSpec`] across `candidates` using optimistic
@@ -140,6 +176,31 @@ pub fn schedule_gang_atomic(
     candidates: &[GangAgentCandidate],
     current_tick: u64,
 ) -> ArbiterResult<(GangReservation, Vec<GangAgentCandidate>)> {
+    schedule_gang_atomic_with_profiles(group, candidates, &BTreeMap::new(), current_tick)
+}
+
+/// Atomically places all tasks in a [`TaskGroupSpec`] across `candidates` while enforcing `profiles`.
+///
+/// # Arguments
+///
+/// * `group` - The [`TaskGroupSpec`] to co-schedule.
+/// * `candidates` - Available [`GangAgentCandidate`]s in the cluster.
+/// * `profiles` - Optional map of per-Agent [`AgentSchedulingProfile`]s.
+/// * `current_tick` - Current monotonic scheduler tick for TTL computation.
+///
+/// # Returns
+///
+/// Tuple `(GangReservation, Vec<GangAgentCandidate>)`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::GangConstraintUnsatisfied`] or [`ArbiterError::InvalidTpuTopologySlice`] on failure.
+pub fn schedule_gang_atomic_with_profiles(
+    group: &TaskGroupSpec,
+    candidates: &[GangAgentCandidate],
+    profiles: &BTreeMap<AgentId, AgentSchedulingProfile>,
+    current_tick: u64,
+) -> ArbiterResult<(GangReservation, Vec<GangAgentCandidate>)> {
     // Sort candidates deterministically by AgentId to guarantee deadlock-free global acquisition order.
     let mut working_pool: Vec<GangAgentCandidate> = candidates.to_vec();
     working_pool.sort_by(|a, b| a.hardware.agent_id.cmp(&b.hardware.agent_id));
@@ -151,10 +212,12 @@ pub fn schedule_gang_atomic(
         Vec::new()
     };
 
-    // 2. Place each member task sequentially onto the working pool, respecting AntiAffinityHost.
+    // 2. Place each member task sequentially onto the working pool, respecting AntiAffinityHost and PlacementConstraint counts.
     let mut member_placements: Vec<(TaskId, TopologyPlacementPlan)> =
         Vec::with_capacity(group.tasks.len());
     let mut used_hosts: BTreeSet<AgentId> = BTreeSet::new();
+    let mut host_task_counts: BTreeMap<AgentId, u32> = BTreeMap::new();
+    let mut zone_task_counts: BTreeMap<String, u32> = BTreeMap::new();
 
     for task in &group.tasks {
         let require_anti_affinity = task
@@ -164,10 +227,27 @@ pub fn schedule_gang_atomic(
 
         let mut placed_on_idx: Option<(usize, TopologyPlacementPlan)> = None;
         for (idx, candidate) in working_pool.iter().enumerate() {
-            if require_anti_affinity && used_hosts.contains(&candidate.hardware.agent_id) {
+            let aid = &candidate.hardware.agent_id;
+            if require_anti_affinity && used_hosts.contains(aid) {
                 continue;
             }
-            if let Ok(plan) = pack_task_on_agent(task, &candidate.hardware) {
+            let mut effective_profile = profiles.get(aid).cloned().unwrap_or_default();
+            let added_host = host_task_counts.get(aid).copied().unwrap_or(0);
+            effective_profile.existing_tasks_on_host = effective_profile
+                .existing_tasks_on_host
+                .saturating_add(added_host);
+            let zone_key = effective_profile
+                .domain_info
+                .as_ref()
+                .map_or_else(String::new, |d| d.fault_domain.zone.as_str().to_owned());
+            let added_zone = zone_task_counts.get(&zone_key).copied().unwrap_or(0);
+            effective_profile.existing_tasks_in_zone = effective_profile
+                .existing_tasks_in_zone
+                .saturating_add(added_zone);
+
+            if let Ok(plan) =
+                pack_task_on_agent_with_profile(task, &candidate.hardware, &effective_profile)
+            {
                 placed_on_idx = Some((idx, plan));
                 break;
             }
@@ -182,17 +262,19 @@ pub fn schedule_gang_atomic(
             });
         };
 
-        // Deduct allocated bundle from the chosen candidate in working_pool.
+        // Deduct allocated bundle, NUMA capacity, and per-GPU capacity from the chosen candidate.
         for (idx, candidate) in working_pool.iter_mut().enumerate() {
             if idx == chosen_idx {
-                candidate.hardware.available_bundle = candidate
-                    .hardware
-                    .available_bundle
-                    .try_sub(&task.resources)
-                    .unwrap_or_default();
+                candidate.hardware.apply_placement_deduction(task, &plan);
             }
         }
 
+        let zone_key = profiles
+            .get(&plan.agent_id)
+            .and_then(|p| p.domain_info.as_ref())
+            .map_or_else(String::new, |d| d.fault_domain.zone.as_str().to_owned());
+        *host_task_counts.entry(plan.agent_id.clone()).or_insert(0) += 1;
+        *zone_task_counts.entry(zone_key).or_insert(0) += 1;
         used_hosts.insert(plan.agent_id.clone());
         member_placements.push((task.task_id.clone(), plan));
     }
@@ -214,6 +296,54 @@ pub fn schedule_gang_atomic(
     };
 
     Ok((reservation, working_pool))
+}
+
+/// Computes the aggregate communication hop cost across all placed gang members in `reservation`.
+///
+/// Pairs of tasks placed on:
+/// - The **same Agent host** incur `0` inter-host fabric penalty (or `10` if no `NVLink` / `PCIe` switch affinity).
+/// - The **same availability zone / rack** (`DomainInfo.fault_domain.zone` matches) incur `100` cost units.
+/// - The **same geographic region** (`DomainInfo.fault_domain.region` matches, different zone) incur `500` cost units.
+/// - **Different geographic regions** incur `5_000` cost units.
+///
+/// # Arguments
+///
+/// * `reservation` - Completed [`GangReservation`].
+/// * `profiles` - Map of per-Agent [`AgentSchedulingProfile`]s containing [`arbiter_core::workload::DomainInfo`].
+///
+/// # Returns
+///
+/// Total pairwise communication cost in deterministic integer units (lower means tighter fabric locality).
+pub fn compute_gang_fabric_communication_cost(
+    reservation: &GangReservation,
+    profiles: &BTreeMap<AgentId, AgentSchedulingProfile>,
+) -> u64 {
+    let mut total_cost = 0_u64;
+    for (i, (_, plan_a)) in reservation.member_placements.iter().enumerate() {
+        for (_, plan_b) in reservation.member_placements.iter().skip(i + 1) {
+            let pair_cost = if plan_a.agent_id == plan_b.agent_id {
+                if plan_a.affinity_score.min(plan_b.affinity_score) >= 900 {
+                    0
+                } else {
+                    10
+                }
+            } else {
+                let dom_a = profiles
+                    .get(&plan_a.agent_id)
+                    .and_then(|p| p.domain_info.as_ref());
+                let dom_b = profiles
+                    .get(&plan_b.agent_id)
+                    .and_then(|p| p.domain_info.as_ref());
+                match (dom_a, dom_b) {
+                    (Some(da), Some(db)) if da.fault_domain.zone == db.fault_domain.zone => 100,
+                    (Some(da), Some(db)) if !da.is_remote_region(db) => 500,
+                    _ => 5_000,
+                }
+            };
+            total_cost = total_cost.saturating_add(pair_cost);
+        }
+    }
+    total_cost
 }
 
 #[cfg(test)]
@@ -370,6 +500,31 @@ mod tests {
         let scheduled = schedule_gang_atomic(&group, &[agent.clone()], 10);
         assert!(scheduled.is_ok());
 
+        // Shifted non-origin 2x2x1 sub-torus at origin (2, 2, 0) also matches!
+        let mut shifted_chips = Vec::new();
+        for x in 2..4 {
+            for y in 2..4 {
+                shifted_chips.push(TpuDevice {
+                    device_id: DeviceId::new(&format!("tpu-shift-{x}-{y}")).unwrap_or_default(),
+                    generation: TpuGeneration::CloudTpuV5p,
+                    chip_index: x * 4 + y,
+                    hbm_bytes: Bytes::new(96 * 1024 * 1024 * 1024),
+                    coordinate: TorusCoordinate { x, y, z: 0 },
+                    ici_links_healthy: true,
+                    wrap_around_links: true,
+                    slice_id: slice_req.slice_id.clone(),
+                });
+            }
+        }
+        let shifted_agent = make_candidate("agent-tpu-shifted", 32_000, shifted_chips);
+        let shifted_matched =
+            match_contiguous_tpu_torus(&slice_req, &[shifted_agent]).unwrap_or_default();
+        assert_eq!(shifted_matched.len(), 4);
+        assert_eq!(
+            shifted_matched.first().map(|(_, _, c)| *c),
+            Some(TorusCoordinate { x: 2, y: 2, z: 0 })
+        );
+
         // Break ICI link health on one chip -> must reject slice via schedule_gang_atomic too
         let mut broken_agent = agent;
         for (idx, chip) in broken_agent.tpu_devices.iter_mut().enumerate() {
@@ -387,5 +542,122 @@ mod tests {
         let mut relaxed_slice = slice_req;
         relaxed_slice.require_wrap_around = false;
         assert!(match_contiguous_tpu_torus(&relaxed_slice, &[broken_agent]).is_err());
+    }
+
+    #[test]
+    fn test_gang_with_profiles_and_fault_domain_spread() {
+        use arbiter_core::ids::{RegionName, ZoneName};
+        use arbiter_core::workload::{DomainInfo, PlacementConstraint};
+
+        use crate::topology_packer::TaskSchedulingRequirements;
+
+        let c1 = make_candidate("agent-01", 32_000, Vec::new());
+        let c2 = make_candidate("agent-02", 32_000, Vec::new());
+        let mut profiles = BTreeMap::new();
+        profiles.insert(
+            c1.hardware.agent_id.clone(),
+            AgentSchedulingProfile {
+                domain_info: Some(DomainInfo::new(
+                    RegionName::new("us-east-1").unwrap_or_default(),
+                    ZoneName::new("zone-a").unwrap_or_default(),
+                )),
+                ..AgentSchedulingProfile::default()
+            },
+        );
+        profiles.insert(
+            c2.hardware.agent_id.clone(),
+            AgentSchedulingProfile {
+                domain_info: Some(DomainInfo::new(
+                    RegionName::new("us-east-1").unwrap_or_default(),
+                    ZoneName::new("zone-b").unwrap_or_default(),
+                )),
+                ..AgentSchedulingProfile::default()
+            },
+        );
+
+        let mut t0 = make_task("rank-0", 4_000, false);
+        let mut t1 = make_task("rank-1", 4_000, false);
+        let reqs = TaskSchedulingRequirements {
+            placement_constraints: vec![PlacementConstraint::MaxPerFaultDomain(1)],
+            ..TaskSchedulingRequirements::default()
+        };
+        reqs.attach_to_task(&mut t0);
+        reqs.attach_to_task(&mut t1);
+
+        let group = TaskGroupSpec {
+            group_id: TaskGroupId::new("gang-zone-spread").unwrap_or_default(),
+            role: RoleName::new("ml-gang").unwrap_or_default(),
+            tasks: vec![t0, t1],
+            tpu_slice: None,
+            placement_timeout_ms: 500,
+        };
+        let (gang_reservation, _) =
+            schedule_gang_atomic_with_profiles(&group, &[c1, c2], &profiles, 10)
+                .unwrap_or_default();
+        assert_eq!(gang_reservation.locked_agents_ordered.len(), 2);
+        // Same region ("us-east-1"), different zones ("zone-a" vs "zone-b") -> 500 cost units
+        assert_eq!(
+            compute_gang_fabric_communication_cost(&gang_reservation, &profiles),
+            500
+        );
+    }
+
+    #[test]
+    fn test_compute_gang_fabric_communication_cost() {
+        use arbiter_core::ids::{RegionName, ZoneName};
+        use arbiter_core::workload::DomainInfo;
+
+        let mut profiles = BTreeMap::new();
+        let a1 = AgentId::new("agent-01").unwrap_or_default();
+        let a2 = AgentId::new("agent-02").unwrap_or_default();
+        let a3 = AgentId::new("agent-03").unwrap_or_default();
+        let a4 = AgentId::new("agent-04").unwrap_or_default();
+        for (aid, reg, zone) in [
+            (&a1, "us-east-1", "zone-a"),
+            (&a2, "us-east-1", "zone-b"),
+            (&a3, "us-east-1", "zone-a"),
+            (&a4, "eu-west-1", "zone-eu"),
+        ] {
+            profiles.insert(
+                aid.clone(),
+                AgentSchedulingProfile {
+                    domain_info: Some(DomainInfo::new(
+                        RegionName::new(reg).unwrap_or_default(),
+                        ZoneName::new(zone).unwrap_or_default(),
+                    )),
+                    ..AgentSchedulingProfile::default()
+                },
+            );
+        }
+        let member_placements = [
+            ("t1", &a1, 1000_u64),
+            ("t2", &a1, 950),
+            ("t3", &a1, 500),
+            ("t4", &a3, 1000),
+            ("t5", &a2, 1000),
+            ("t6", &a4, 1000),
+        ]
+        .into_iter()
+        .map(|(tid, aid, score)| {
+            (
+                TaskId::new(tid).unwrap_or_default(),
+                TopologyPlacementPlan {
+                    agent_id: aid.clone(),
+                    selected_numa_node: 0,
+                    assigned_gpus: Vec::new(),
+                    paired_rdma_nic: None,
+                    affinity_score: score,
+                },
+            )
+        })
+        .collect();
+        let custom_res = GangReservation {
+            group_id: TaskGroupId::new("g-cost").unwrap_or_default(),
+            member_placements,
+            assigned_tpu_torus: Vec::new(),
+            locked_agents_ordered: Vec::new(),
+            lease_expires_at_tick: 100,
+        };
+        assert!(compute_gang_fabric_communication_cost(&custom_res, &profiles) > 5_000);
     }
 }

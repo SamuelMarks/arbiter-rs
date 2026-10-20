@@ -52,6 +52,74 @@ impl AcceleratorIsolator {
             tpu_slice,
         }
     }
+
+    /// Formats NVIDIA Dynamic MIG instance creation (`nvidia-smi mig -cgi <profile> -C`) and
+    /// CUDA MPS daemon (`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`) configuration commands.
+    ///
+    /// # Arguments
+    ///
+    /// * `mps_thread_pct` - Optional CUDA MPS active thread percentage (`1..=100`).
+    ///
+    /// # Returns
+    ///
+    /// Vector of MIG/MPS setup commands and environment pairs.
+    pub fn format_mig_and_mps_commands(&self, mps_thread_pct: Option<u32>) -> Vec<String> {
+        let mut cmds = Vec::new();
+        for (id, part) in &self.assigned_gpus {
+            if let GpuPartition::NvidiaMig(mig) = part {
+                cmds.push(format!(
+                    "nvidia-smi mig -i {id} -cgi {} -C",
+                    mig.profile.as_str()
+                ));
+            }
+        }
+        if let Some(pct) = mps_thread_pct {
+            cmds.push(format!("CUDA_MPS_ACTIVE_THREAD_PERCENTAGE={pct}"));
+        }
+        cmds
+    }
+
+    /// Generates RDMA / `InfiniBand` / `RoCEv2` device cgroup whitelist paths (`/dev/infiniband/uverbs*`,
+    /// `/dev/infiniband/rdma_cm`) and SR-IOV VF netns attachment commands.
+    ///
+    /// # Arguments
+    ///
+    /// * `uverbs_index` - `uverbs` device index (`0` for `/dev/infiniband/uverbs0`).
+    /// * `sriov_pf_vf` - Optional `(pf_name, vf_index, target_pid)` for SR-IOV VF namespace move.
+    ///
+    /// # Returns
+    ///
+    /// Vector of device paths and `ip link` commands.
+    pub fn format_rdma_device_whitelist(
+        uverbs_index: u32,
+        sriov_pf_vf: Option<(&str, u32, u32)>,
+    ) -> Vec<String> {
+        let mut out = vec![
+            "/dev/infiniband/rdma_cm".to_owned(),
+            format!("/dev/infiniband/uverbs{uverbs_index}"),
+            "ulimit -l unlimited".to_owned(),
+        ];
+        if let Some((pf, vf, pid)) = sriov_pf_vf {
+            out.push(format!("ip link set {pf} vf {vf} netns {pid}"));
+        }
+        out
+    }
+    /// Generates `cgroups v2` BPF device controller (`BPF_PROG_TYPE_CGROUP_DEVICE`) allowlist rules
+    /// (`c *:* rwm`) for the whitelisted `device_mounts`.
+    ///
+    /// # Arguments
+    ///
+    /// * `device_mounts` - Slice of device paths (e.g., `"/dev/nvidia0"`, `"/dev/kfd"`).
+    ///
+    /// # Returns
+    ///
+    /// Vector of BPF cgroup device allowlist rule strings.
+    pub fn format_cgroup_bpf_device_allowlist(device_mounts: &[String]) -> Vec<String> {
+        device_mounts
+            .iter()
+            .map(|dev| format!("bpf_cgroup_device:allow:c {dev} rwm"))
+            .collect()
+    }
 }
 
 impl Isolator for AcceleratorIsolator {
@@ -83,6 +151,8 @@ impl Isolator for AcceleratorIsolator {
                     for (id, part) in &self.assigned_gpus {
                         mounts.push(format!("/dev/{id}"));
                         if let GpuPartition::NvidiaMig(mig) = part {
+                            mounts
+                                .push(format!("/dev/nvidia-caps/nvidia-cap{}", mig.instance_index));
                             env.push((
                                 "NVIDIA_MIG_CONFIG_DEVICES".to_owned(),
                                 format!("{}:{}", mig.profile.as_str(), mig.instance_index),
@@ -217,11 +287,31 @@ mod tests {
                 .iter()
                 .any(|(k, _)| k == "NVIDIA_MIG_CONFIG_DEVICES")
         );
+        assert!(
+            nv_prep
+                .device_mounts
+                .iter()
+                .any(|m| m.starts_with("/dev/nvidia-caps/"))
+        );
+        assert_eq!(
+            AcceleratorIsolator::format_cgroup_bpf_device_allowlist(&nv_prep.device_mounts).len(),
+            nv_prep.device_mounts.len()
+        );
         assert!(nv_iso.isolate(&tid, 100).is_ok());
         assert!(nv_iso.update_limits(&tid, &limits).is_ok());
         assert!(nv_iso.usage(&tid).is_ok());
         assert!(nv_iso.checkpoint(&tid, "/tmp").is_ok());
-        assert!(nv_iso.cleanup(&tid).is_ok());
+        assert!(nv_iso.cleanup(&tid,).is_ok());
+        assert_eq!(nv_iso.format_mig_and_mps_commands(Some(50)).len(), 2);
+        assert_eq!(nv_iso.format_mig_and_mps_commands(None).len(), 1);
+        assert_eq!(
+            AcceleratorIsolator::format_rdma_device_whitelist(0, Some(("mlx5_0", 1, 999))).len(),
+            4
+        );
+        assert_eq!(
+            AcceleratorIsolator::format_rdma_device_whitelist(0, None).len(),
+            3
+        );
 
         let mut amd_iso = AcceleratorIsolator::new(
             Some(GpuVendor::Amd),

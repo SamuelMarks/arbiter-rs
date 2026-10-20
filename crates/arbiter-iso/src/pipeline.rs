@@ -349,6 +349,240 @@ impl Default for IsolatorPipeline {
     }
 }
 
+/// Standard Apache Mesos Containerizer `--isolation` plugin identifiers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum MesosIsolatorPlugin {
+    /// `posix/cpu` POSIX rlimit CPU isolator.
+    PosixCpu,
+    /// `posix/mem` POSIX rlimit memory isolator.
+    PosixMem,
+    /// `posix/disk` POSIX du/prjquota disk isolator.
+    PosixDisk,
+    /// `cgroups/cpu` Linux cgroups v2 CPU isolator.
+    CgroupsCpu,
+    /// `cgroups/mem` Linux cgroups v2 memory isolator.
+    CgroupsMem,
+    /// `cgroups/devices` Linux cgroups v2 eBPF device whitelist isolator.
+    CgroupsDevices,
+    /// `gpu/nvidia` NVIDIA GPU/MIG/MPS isolator.
+    GpuNvidia,
+    /// `network/cni` Container Network Interface (`CNI`) plugin isolator.
+    NetworkCni,
+    /// `volume/sandbox_path` sandbox volume bind-mount isolator.
+    VolumeSandboxPath,
+    /// `volume/image` OCI image rootfs volume isolator.
+    VolumeImage,
+    /// `volume/secret` in-memory `tmpfs` secret volume isolator.
+    VolumeSecret,
+    /// `namespaces/pid` Linux PID namespace isolator.
+    NamespacesPid,
+    /// `namespaces/ipc` Linux IPC namespace isolator.
+    NamespacesIpc,
+    /// `docker/runtime` Docker/OCI runtime manifest configuration isolator.
+    DockerRuntime,
+}
+
+impl MesosIsolatorPlugin {
+    /// Parses a comma-separated `--isolation="cgroups/cpu,cgroups/mem,network/cni,..."` flag string
+    /// into a vector of [`MesosIsolatorPlugin`]s.
+    ///
+    /// # Arguments
+    ///
+    /// * `isolation_flag` - Comma-separated Mesos isolator names.
+    ///
+    /// # Returns
+    ///
+    /// Ordered vector of parsed [`MesosIsolatorPlugin`]s.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SandboxError`](arbiter_core::error::ArbiterError::SandboxError) if any plugin name is unrecognized.
+    pub fn parse_isolation_flag(isolation_flag: &str) -> ArbiterResult<Vec<Self>> {
+        let mut out = Vec::new();
+        for token in isolation_flag.split(',') {
+            let trimmed = token.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let plugin = match trimmed {
+                "posix/cpu" => Self::PosixCpu,
+                "posix/mem" => Self::PosixMem,
+                "posix/disk" => Self::PosixDisk,
+                "cgroups/cpu" => Self::CgroupsCpu,
+                "cgroups/mem" => Self::CgroupsMem,
+                "cgroups/devices" => Self::CgroupsDevices,
+                "gpu/nvidia" => Self::GpuNvidia,
+                "network/cni" => Self::NetworkCni,
+                "volume/sandbox_path" => Self::VolumeSandboxPath,
+                "volume/image" => Self::VolumeImage,
+                "volume/secret" => Self::VolumeSecret,
+                "namespaces/pid" => Self::NamespacesPid,
+                "namespaces/ipc" => Self::NamespacesIpc,
+                "docker/runtime" => Self::DockerRuntime,
+                _ => {
+                    return Err(arbiter_core::error::ArbiterError::SandboxError {
+                        mechanism: "mesos-isolation-flag".to_owned(),
+                        reason: format!("unknown Mesos isolator plugin '{trimmed}'"),
+                    });
+                }
+            };
+            out.push(plugin);
+        }
+        Ok(out)
+    }
+
+    /// Returns the canonical Mesos `--isolation` flag token for this plugin.
+    ///
+    /// # Returns
+    ///
+    /// Static Mesos isolator name.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::PosixCpu => "posix/cpu",
+            Self::PosixMem => "posix/mem",
+            Self::PosixDisk => "posix/disk",
+            Self::CgroupsCpu => "cgroups/cpu",
+            Self::CgroupsMem => "cgroups/mem",
+            Self::CgroupsDevices => "cgroups/devices",
+            Self::GpuNvidia => "gpu/nvidia",
+            Self::NetworkCni => "network/cni",
+            Self::VolumeSandboxPath => "volume/sandbox_path",
+            Self::VolumeImage => "volume/image",
+            Self::VolumeSecret => "volume/secret",
+            Self::NamespacesPid => "namespaces/pid",
+            Self::NamespacesIpc => "namespaces/ipc",
+            Self::DockerRuntime => "docker/runtime",
+        }
+    }
+}
+
+/// Standard CNI (`Container Network Interface`) command operation (`CNI_COMMAND`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CniCommand {
+    /// `ADD` — attach container network namespace to CNI network.
+    Add,
+    /// `DEL` — detach container network namespace from CNI network.
+    Del,
+    /// `CHECK` — verify container network attachment health.
+    Check,
+}
+
+impl CniCommand {
+    /// Returns the `CNI_COMMAND` environment variable value.
+    ///
+    /// # Returns
+    ///
+    /// `"ADD"`, `"DEL"`, or `"CHECK"`.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Add => "ADD",
+            Self::Del => "DEL",
+            Self::Check => "CHECK",
+        }
+    }
+}
+
+/// Mesos `network/cni` Container Network Interface (`CNI`) isolator (`CniPluginIsolator`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CniPluginIsolator {
+    /// CNI network name (e.g., `"arbiter-br0"`).
+    pub network_name: String,
+    /// CNI plugin binary name (`"bridge"`, `"macvlan"`, `"calico"`, `"cilium"`).
+    pub plugin_bin: String,
+    /// Subnet CIDR assigned by IPAM (e.g., `"10.42.0.0/16"`).
+    pub subnet_cidr: String,
+    /// Assigned container interface name (e.g., `"eth0"`).
+    pub ifname: String,
+}
+
+impl CniPluginIsolator {
+    /// Formats the CNI environment variables (`CNI_COMMAND`, `CNI_CONTAINERID`, `CNI_NETNS`,
+    /// `CNI_IFNAME`, `CNI_PATH`) and JSON stdin configuration for `cmd`.
+    ///
+    /// # Arguments
+    ///
+    /// * `cmd` - [`CniCommand`] (`Add`, `Del`, `Check`).
+    /// * `task_id` - Container [`TaskId`].
+    /// * `pid` - Target container PID (`0` before isolate).
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(env_vars, cni_config_json)`.
+    pub fn format_cni_invocation(
+        &self,
+        cmd: CniCommand,
+        task_id: &TaskId,
+        pid: u32,
+    ) -> (Vec<(String, String)>, String) {
+        let env = vec![
+            ("CNI_COMMAND".to_owned(), cmd.as_str().to_owned()),
+            ("CNI_CONTAINERID".to_owned(), task_id.to_string()),
+            ("CNI_NETNS".to_owned(), format!("/proc/{pid}/ns/net")),
+            ("CNI_IFNAME".to_owned(), self.ifname.clone()),
+            ("CNI_PATH".to_owned(), "/opt/cni/bin".to_owned()),
+        ];
+        let cfg_json = format!(
+            r#"{{"cniVersion":"1.0.0","name":"{}","type":"{}","ipam":{{"type":"host-local","subnet":"{}"}}}}"#,
+            self.network_name, self.plugin_bin, self.subnet_cidr
+        );
+        (env, cfg_json)
+    }
+}
+
+impl Isolator for CniPluginIsolator {
+    fn name(&self) -> &'static str {
+        "network/cni"
+    }
+
+    fn prepare(
+        &mut self,
+        task_id: &TaskId,
+        _limits: &ResourceBundle,
+    ) -> ArbiterResult<SandboxPreparation> {
+        if self.network_name.trim().is_empty() || self.plugin_bin.trim().is_empty() {
+            return Err(arbiter_core::error::ArbiterError::SandboxError {
+                mechanism: "network/cni".to_owned(),
+                reason: "CNI network_name and plugin_bin must not be empty".to_owned(),
+            });
+        }
+        let (env, cfg) = self.format_cni_invocation(CniCommand::Add, task_id, 1);
+        Ok(SandboxPreparation {
+            device_mounts: Vec::new(),
+            injected_env: env,
+            applied_commands: vec![format!("cni:{}:{cfg}", self.plugin_bin)],
+        })
+    }
+
+    fn isolate(&mut self, task_id: &TaskId, pid: u32) -> ArbiterResult<()> {
+        let (_, _) = self.format_cni_invocation(CniCommand::Check, task_id, pid);
+        Ok(())
+    }
+
+    fn update_limits(
+        &mut self,
+        _task_id: &TaskId,
+        _new_limits: &ResourceBundle,
+    ) -> ArbiterResult<()> {
+        Ok(())
+    }
+
+    fn usage(&self, task_id: &TaskId) -> ArbiterResult<IsolatorUsageReport> {
+        Ok(IsolatorUsageReport {
+            task_id: task_id.clone(),
+            consumed: ResourceBundle::zero(),
+        })
+    }
+
+    fn checkpoint(&mut self, _task_id: &TaskId, _checkpoint_dir: &str) -> ArbiterResult<()> {
+        Ok(())
+    }
+
+    fn cleanup(&mut self, task_id: &TaskId) -> ArbiterResult<()> {
+        let (_, _) = self.format_cni_invocation(CniCommand::Del, task_id, 0);
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arbiter_core::error::ArbiterError;
@@ -513,5 +747,41 @@ mod tests {
         assert!(p_err.usage_all(&tid).is_err());
         assert!(p_err.checkpoint_all(&tid, "/tmp").is_err());
         assert!(p_err.cleanup_all(&tid).is_err());
+    }
+
+    #[test]
+    fn test_mesos_isolator_plugins_and_cni_isolator() {
+        let all_flag = "posix/cpu, posix/mem, posix/disk, cgroups/cpu, cgroups/mem, cgroups/devices, gpu/nvidia, network/cni, volume/sandbox_path, volume/image, volume/secret, namespaces/pid, namespaces/ipc, docker/runtime, ";
+        let parsed = MesosIsolatorPlugin::parse_isolation_flag(all_flag).unwrap_or_default();
+        assert_eq!(parsed.len(), 14);
+        for p in parsed {
+            let s = std::hint::black_box(p.as_str());
+            assert!(!s.is_empty());
+        }
+        assert!(MesosIsolatorPlugin::parse_isolation_flag("unknown/plugin").is_err());
+
+        let tid = TaskId::new("task-cni-1").unwrap_or_default();
+        let limits = ResourceBundle::zero();
+        let mut cni = CniPluginIsolator {
+            network_name: "arbiter-net0".to_owned(),
+            plugin_bin: "bridge".to_owned(),
+            subnet_cidr: "10.42.0.0/16".to_owned(),
+            ifname: "eth0".to_owned(),
+        };
+        assert_eq!(cni.name(), "network/cni");
+        let prep = cni.prepare(&tid, &limits).unwrap_or_default();
+        assert_eq!(prep.injected_env.len(), 5);
+        assert!(cni.isolate(&tid, 4242).is_ok());
+        assert!(cni.update_limits(&tid, &limits).is_ok());
+        assert!(cni.usage(&tid).is_ok());
+        assert!(cni.checkpoint(&tid, "/tmp").is_ok());
+        assert!(cni.cleanup(&tid).is_ok());
+
+        let mut bad_cni1 = cni.clone();
+        bad_cni1.network_name = "  ".to_owned();
+        assert!(bad_cni1.prepare(&tid, &limits).is_err());
+        let mut bad_cni2 = cni;
+        bad_cni2.plugin_bin = String::new();
+        assert!(bad_cni2.prepare(&tid, &limits).is_err());
     }
 }

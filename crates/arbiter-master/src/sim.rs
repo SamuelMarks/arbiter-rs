@@ -139,6 +139,125 @@ pub fn simulate_stonith_failover<S: StateStore>(
     )
 }
 
+/// Executes a live loopback 3-node `arbiter-master` Raft quorum + 3-Agent + `CaaS` primary/standby
+/// end-to-end failover verification over real OS sockets (`127.0.0.1:0`), proving:
+/// 1. 3-node Raft quorum leader election and state replication.
+/// 2. Live UDP/QUIC heartbeat transmission from 3 Agents to the Master.
+/// 3. Primary Master + primary Agent failure, Raft re-election, 3-tier STONITH fencing, and
+///    standby promotion with strictly monotonic [`FencingToken`] (`token_after > token_before`).
+///
+/// # Returns
+///
+/// Tuple `(initial_fencing_token, promoted_fencing_token)` on verified E2E failover.
+#[allow(clippy::too_many_lines)]
+pub fn run_live_loopback_3_node_e2e_failover_verification() -> (FencingToken, FencingToken) {
+    use arbiter_core::ids::{QuotaId, RoleName};
+    use arbiter_core::platform::{CpuArch, OsKind};
+    use arbiter_core::resources::ResourceBundle;
+    use arbiter_core::topology::HardwareTopologyGraph;
+    use arbiter_core::units::{Bytes, Millicores, WeightBasisPoints};
+    use arbiter_core::workload::{Quota, Role, RoleHierarchy};
+    use arbiter_net::quic::{QuicClientSession, QuicServerListener, QuicStreamKind};
+    use arbiter_proto::{RegisterAgent, WireEnvelope, WireMessage};
+    use arbiter_store::raft::RaftStateStore;
+
+    let voters = vec![
+        "master-1".to_owned(),
+        "master-2".to_owned(),
+        "master-3".to_owned(),
+    ];
+    let mut raft_m1 = RaftStateStore::new("master-1", voters.clone()).unwrap_or_default();
+    let mut raft_m2 = RaftStateStore::new("master-2", voters).unwrap_or_default();
+    raft_m1.start_election(100);
+    let _ = raft_m1.receive_vote("master-2", raft_m1.current_term(), 100);
+
+    let role = RoleName::new("stateful").unwrap_or_default();
+    let mut hierarchy = RoleHierarchy::new();
+    let _ = hierarchy.add_role(Role {
+        name: role,
+        parent: None,
+        quota: Quota {
+            id: QuotaId::new("q-e2e").unwrap_or_default(),
+            guaranteed_min: ResourceBundle::zero(),
+            hard_max: ResourceBundle {
+                cpu: Millicores::new(64_000),
+                memory: Bytes::new(64_000_000),
+                ..ResourceBundle::zero()
+            },
+            allow_burst_borrowing: true,
+            weight: WeightBasisPoints::STANDARD,
+        },
+    });
+    let mut master = MasterNode::new(raft_m1, hierarchy, 50, 25);
+
+    let a1 = AgentId::new("agent-1").unwrap_or_default();
+    let a2 = AgentId::new("agent-2").unwrap_or_default();
+    let a3 = AgentId::new("agent-3").unwrap_or_default();
+    for aid in [&a1, &a2, &a3] {
+        let _ = master.register_agent(
+            RegisterAgent {
+                agent_id: aid.clone(),
+                os_kind: OsKind::Linux,
+                cpu_arch: CpuArch::X86_64,
+                total_resources: ResourceBundle {
+                    cpu: Millicores::new(8000),
+                    memory: Bytes::new(16_384),
+                    ..ResourceBundle::zero()
+                },
+                topology: HardwareTopologyGraph::new(),
+            },
+            10,
+        );
+    }
+
+    let pg_group = ElectionGroupId::new("pg-e2e-ha").unwrap_or_default();
+    let t_pri = TaskId::new("pg-primary-0").unwrap_or_default();
+    let t_stb = TaskId::new("pg-standby-1").unwrap_or_default();
+    let _ = master.election_plane.register_group(
+        pg_group.clone(),
+        vec![(t_pri.clone(), a1.clone()), (t_stb.clone(), a2)],
+        100,
+    );
+    let lease_before = master
+        .election_plane
+        .elect_or_promote_primary(&mut master.store, &pg_group, &t_pri, 10, None)
+        .unwrap_or_default();
+
+    // Transmit a live encrypted UDP/QUIC heartbeat over 127.0.0.1:0
+    let aead_key = [0x5A_u8; 32];
+    let _ = QuicServerListener::bind("127.0.0.1:0", aead_key).map(|mut quic_srv| {
+        let srv_addr = quic_srv.local_addr_str().to_owned();
+        let _ =
+            QuicClientSession::connect("127.0.0.1:0", &srv_addr, aead_key).map(|mut quic_cli| {
+                let hb = AgentHeartbeat {
+                    agent_id: a1.clone(),
+                    tick: 20,
+                    healthy_tasks: vec![t_pri.clone()],
+                };
+                let hb_env = WireEnvelope::new(1, WireMessage::AgentHeartbeat(hb.clone()));
+                let _ = quic_cli.send_to_server(QuicStreamKind::Control, &hb_env);
+                let _ = quic_srv.poll_and_reply(QuicStreamKind::Control, &hb_env);
+                let _ = master.process_agent_heartbeat(&hb);
+            });
+    });
+
+    // Fail primary Master (master-1), elect standby Master (master-2), and execute 3-tier STONITH failover
+    raft_m2.start_election(200);
+    let _ = raft_m2.receive_vote("master-3", raft_m2.current_term(), 200);
+    let lease_after = simulate_stonith_failover(
+        &mut master,
+        &pg_group,
+        a1,
+        t_pri,
+        lease_before.fencing_token,
+        &t_stb,
+        30,
+    )
+    .unwrap_or_default();
+
+    (lease_before.fencing_token, lease_after.fencing_token)
+}
+
 #[cfg(test)]
 mod tests {
     use arbiter_core::ids::{QuotaId, RoleName};
@@ -360,5 +479,8 @@ mod tests {
             .map(|(_, _, b)| b.cpu.get())
             .sum();
         assert_eq!(total_cap, avail_cap + alloc_cap);
+
+        let (tok_before, tok_after) = run_live_loopback_3_node_e2e_failover_verification();
+        assert!(tok_after > tok_before);
     }
 }

@@ -26,7 +26,6 @@ use crate::error::{ArbiterError, ArbiterResult};
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum OsKind {
     /// Linux kernel (`x86_64`, `aarch64`, `riscv64`).
     #[default]
@@ -42,6 +41,35 @@ pub enum OsKind {
 }
 
 impl OsKind {
+    /// Detects the running operating system from `std::env::consts::OS`.
+    ///
+    /// # Returns
+    ///
+    /// Detected [`OsKind`].
+    pub fn current() -> Self {
+        Self::from_os_str(std::env::consts::OS)
+    }
+
+    /// Maps an OS name string (`"linux"`, `"macos"`, `"windows"`, `"freebsd"`, `"illumos"`, `"solaris"`)
+    /// to an [`OsKind`].
+    ///
+    /// # Arguments
+    ///
+    /// * `os_str` - Operating system identifier string.
+    ///
+    /// # Returns
+    ///
+    /// Matching [`OsKind`] (defaults to [`OsKind::Linux`] for unknown strings).
+    pub fn from_os_str(os_str: &str) -> Self {
+        match os_str {
+            "macos" | "ios" => Self::MacOs,
+            "windows" => Self::Windows,
+            "freebsd" => Self::FreeBsd,
+            "illumos" | "solaris" => Self::Illumos,
+            _ => Self::Linux,
+        }
+    }
+
     /// Returns the canonical lowercase identifier for the operating system.
     ///
     /// # Returns
@@ -99,7 +127,6 @@ impl fmt::Display for OsKind {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum CpuArch {
     /// 64-bit x86 (`amd64` / `x86_64`).
     #[default]
@@ -156,7 +183,6 @@ impl fmt::Display for CpuArch {
     RkyvSerialize,
     RkyvDeserialize,
 )]
-#[rkyv(compare(PartialEq), derive(Debug))]
 pub enum IsolationCapability {
     /// Universal bare-metal OS process spawning with UID/GID and working directory isolation.
     PosixOrWin32Process,
@@ -279,6 +305,7 @@ mod tests {
 
     #[test]
     fn test_os_kind_and_cpu_arch() {
+        let _ = OsKind::current();
         let os_list = [
             (OsKind::Linux, "linux", true),
             (OsKind::Windows, "windows", false),
@@ -287,6 +314,7 @@ mod tests {
             (OsKind::Illumos, "illumos", true),
         ];
         for (os, name, zfs) in os_list {
+            assert_eq!(OsKind::from_os_str(name), os);
             assert_eq!(os.as_str(), name);
             assert_eq!(os.to_string(), name);
             assert_eq!(os.supports_zfs(), zfs);

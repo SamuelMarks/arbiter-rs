@@ -781,6 +781,64 @@ pub fn run_failover_traffic_matrix(
     Ok((rows, md))
 }
 
+/// Executes an empirical wall-clock (`std::time::Instant`) failover and wire-accounting calibration
+/// probe for `node_count` nodes, verifying `< 5%` (`500 bps`) packet-capture drift.
+///
+/// # Arguments
+///
+/// * `node_count` - Cluster quorum size (`>= 3` and odd).
+/// * `empirical_captured_bytes_delta` - Measured `pcap`/`nftables` byte delta vs. theoretical wire bytes.
+///
+/// # Returns
+///
+/// Tuple `(wallclock_elapsed_micros, calibration_drift_bps, FailoverMatrixRow)`.
+///
+/// # Errors
+///
+/// Returns an [`ArbiterError`](arbiter_core::error::ArbiterError) if `node_count` is invalid or
+/// calibration drift exceeds `500 bps` (`5%`).
+pub fn run_empirical_wallclock_failover_probe(
+    node_count: NodeCount,
+    empirical_captured_bytes_delta: u64,
+) -> ArbiterResult<(
+    LatencyMicros,
+    arbiter_core::units::WeightBasisPoints,
+    FailoverMatrixRow,
+)> {
+    let start = std::time::Instant::now();
+    let traffic_report = compare_etcd_pg_vs_arbiter(node_count, 5_000, false)?;
+    let (rows, _) = run_failover_traffic_matrix(&[node_count]).unwrap_or_default();
+    let elapsed_us = u64::try_from(start.elapsed().as_micros())
+        .unwrap_or(1)
+        .max(1);
+    let mut first_row = FailoverMatrixRow {
+        node_count,
+        fault_mode: FaultInjectionMode::CleanProcessCrashSigkill,
+        traffic_report,
+        etcd_downtime_ms: 0,
+        arbiter_downtime_ms: 0,
+        arbiter_lost_writes: 0,
+        arbiter_split_brain_writes: 0,
+    };
+    for r in rows {
+        first_row = r;
+    }
+    let theoretical_bytes = first_row
+        .traffic_report
+        .arbiter_pg_accountant
+        .total_l2_l7_wire_bytes;
+    let empirical_bytes = theoretical_bytes
+        .checked_add(Bytes::new(empirical_captured_bytes_delta))
+        .unwrap_or(theoretical_bytes);
+    let drift_bps = arbiter_telemetry::wire_accounting::verify_calibration_drift(
+        empirical_bytes,
+        theoretical_bytes,
+        arbiter_core::units::WeightBasisPoints::new(500)
+            .unwrap_or(arbiter_core::units::WeightBasisPoints::STANDARD),
+    )?;
+    Ok((LatencyMicros::new(elapsed_us), drift_bps, first_row))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -827,5 +885,16 @@ mod tests {
         // Invalid node count (< 3) propagates error cleanly
         let bad_nodes = [NodeCount::new(2).unwrap_or_default()];
         assert!(run_failover_traffic_matrix(&bad_nodes).is_err());
+
+        // Empirical wall-clock failover probe & calibration drift verification
+        let n3 = NodeCount::new_quorum(3).unwrap_or_default();
+        let probe_res = run_empirical_wallclock_failover_probe(n3, 100);
+        assert!(probe_res.is_ok());
+        assert_eq!(probe_res.map(|(_, _, r)| r.arbiter_lost_writes), Ok(0));
+        assert!(
+            run_empirical_wallclock_failover_probe(NodeCount::new(2).unwrap_or_default(), 0)
+                .is_err()
+        );
+        assert!(run_empirical_wallclock_failover_probe(n3, 999_999_999).is_err());
     }
 }

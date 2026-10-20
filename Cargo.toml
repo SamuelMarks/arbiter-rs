@@ -45,19 +45,17 @@ arbiter-telemetry = { path = "crates/arbiter-telemetry", version = "0.1.0" }
 arbiter-master = { path = "crates/arbiter-master", version = "0.1.0" }
 arbiter-agent = { path = "crates/arbiter-agent", version = "0.1.0" }
 arbiter-executor = { path = "crates/arbiter-executor", version = "0.1.0" }
-arbiter-sdk = { path = "crates/arbiter-sdk", version = "0.1.0" }
-arbiter-tui = { path = "crates/arbiter-tui", version = "0.1.0" }
 arbiter-master-bin = { path = "bins/arbiter-master", version = "0.1.0" }
 arbiter-agent-bin = { path = "bins/arbiter-agent", version = "0.1.0" }
 arbiter-executor-bin = { path = "bins/arbiter-executor", version = "0.1.0" }
 arbiter-cli = { path = "bins/arbiter-cli", version = "0.1.0" }
 
-derive_more = { version = "2.0", features = ["display", "error", "from"] }
-serde = { version = "1.0", features = ["derive"] }
-serde_json = "1.0"
-rkyv = "0.8"
-sha2 = "0.10"
-proptest = "=1.6.0"
+derive_more = { version = "2.1", default-features = false, features = ["std", "display", "error", "from"] }
+serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
+serde_json = { version = "1.0", default-features = false, features = ["std"] }
+rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck"] }
+sha2 = { version = "0.11", default-features = false }
+proptest = { version = "~1.11", default-features = false, features = ["std"] }
 
 [workspace.lints.rust]
 missing_docs = "forbid"
