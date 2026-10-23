@@ -138,6 +138,33 @@ pub enum CpuArch {
 }
 
 impl CpuArch {
+    /// Detects the running CPU architecture from `std::env::consts::ARCH`.
+    ///
+    /// # Returns
+    ///
+    /// Detected [`CpuArch`].
+    pub fn current() -> Self {
+        Self::from_arch_str(std::env::consts::ARCH)
+    }
+
+    /// Maps a target architecture string (`"x86_64"`, `"aarch64"`, `"arm64"`, `"riscv64"`)
+    /// to a [`CpuArch`].
+    ///
+    /// # Arguments
+    ///
+    /// * `arch_str` - Target architecture identifier string.
+    ///
+    /// # Returns
+    ///
+    /// Matching [`CpuArch`] (defaults to [`CpuArch::X86_64`] for unknown strings).
+    pub fn from_arch_str(arch_str: &str) -> Self {
+        match arch_str {
+            "aarch64" | "arm64" => Self::Aarch64,
+            "riscv64" | "riscv64gc" => Self::Riscv64,
+            _ => Self::X86_64,
+        }
+    }
+
     /// Returns the canonical target architecture string.
     ///
     /// # Returns
@@ -320,12 +347,14 @@ mod tests {
             assert_eq!(os.supports_zfs(), zfs);
         }
 
+        let _ = CpuArch::current();
         let arches = [
             (CpuArch::X86_64, "x86_64"),
             (CpuArch::Aarch64, "aarch64"),
             (CpuArch::Riscv64, "riscv64"),
         ];
         for (arch, name) in arches {
+            assert_eq!(CpuArch::from_arch_str(name), arch);
             assert_eq!(arch.as_str(), name);
             assert_eq!(arch.to_string(), name);
         }

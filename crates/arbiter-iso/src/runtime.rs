@@ -43,10 +43,10 @@ impl OciRuntimeEngine {
     }
 }
 
-/// Generated OCI Runtime Specification v1.1.0 `config.json` document.
+/// Generated OCI Runtime Specification v1.2.0 `config.json` document.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OciRuntimeSpec {
-    /// OCI specification version (`"1.1.0"`).
+    /// OCI specification version (`"1.2.0"`).
     pub oci_version: String,
     /// Container root filesystem path.
     pub root_path: String,
@@ -68,6 +68,9 @@ pub struct OciRuntimeSpec {
     pub linux_devices: Vec<String>,
 }
 
+/// Type alias for [`OciContainerDriver`] matching the canonical Phase 8.2 `OciContainerIsolator` name.
+pub type OciContainerIsolator = OciContainerDriver;
+
 /// OCI Container runtime driver implementing [`Isolator`].
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OciContainerDriver {
@@ -84,7 +87,7 @@ pub struct OciContainerDriver {
 }
 
 impl OciContainerDriver {
-    /// Generates an [`OciRuntimeSpec`] JSON string for the given `limits`.
+    /// Generates an [`OciRuntimeSpec`] v1.2.0 JSON string for the given `limits`.
     ///
     /// # Arguments
     ///
@@ -106,7 +109,7 @@ impl OciContainerDriver {
             });
         }
         let spec = OciRuntimeSpec {
-            oci_version: "1.1.0".to_owned(),
+            oci_version: "1.2.0".to_owned(),
             root_path: self.rootfs_path.clone(),
             process_args: self.command_args.clone(),
             no_new_privileges: true,
@@ -130,6 +133,43 @@ impl OciContainerDriver {
             linux_devices: self.linux_devices.clone(),
         };
         Ok(serde_json::to_string(&spec).unwrap_or_default())
+    }
+
+    /// Generates a nested OCI Runtime Specification v1.2.0 `config.json` document containing
+    /// canonical `ociVersion`, `root`, `process`, `mounts`, and `linux` (`cgroupsPath`,
+    /// `namespaces`, `resources`, `devices`) objects for direct consumption by `crun` / `runc`.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Container [`TaskId`].
+    /// * `limits` - Task [`ResourceBundle`] limits.
+    ///
+    /// # Returns
+    ///
+    /// Spec-compliant nested OCI v1.2.0 `config.json` string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ContainerRuntimeError`] if `rootfs_path` is empty.
+    pub fn render_nested_oci_v1_2_config_json(
+        &self,
+        task_id: &TaskId,
+        limits: &ResourceBundle,
+    ) -> ArbiterResult<String> {
+        if self.rootfs_path.is_empty() {
+            return Err(ArbiterError::ContainerRuntimeError {
+                runtime: self.engine.binary_name().to_owned(),
+                container_id: task_id.to_string(),
+                reason: "container rootfs_path cannot be empty".to_owned(),
+            });
+        }
+        let cpu_quota = limits.cpu.get().saturating_mul(100);
+        let mem_limit = limits.memory.get();
+        let args_json = serde_json::to_string(&self.command_args).unwrap_or_default();
+        Ok(format!(
+            r#"{{"ociVersion":"1.2.0","root":{{"path":"{}","readonly":false}},"process":{{"terminal":false,"user":{{"uid":0,"gid":0}},"args":{args_json},"cwd":"/","noNewPrivileges":true}},"linux":{{"cgroupsPath":"/arbiter.slice/{task_id}","resources":{{"memory":{{"limit":{mem_limit}}},"cpu":{{"quota":{cpu_quota},"period":100000}}}},"namespaces":[{{"type":"pid"}},{{"type":"network"}},{{"type":"ipc"}},{{"type":"uts"}},{{"type":"mount"}},{{"type":"cgroup"}}]}}}}"#,
+            self.rootfs_path
+        ))
     }
 
     /// Writes the generated OCI `config.json` to `<bundle_dir>/config.json` and returns the
@@ -175,6 +215,41 @@ impl OciContainerDriver {
             format!("{bin} kill {task_id} SIGKILL"),
             format!("{bin} delete {task_id}"),
         ])
+    }
+
+    /// Writes the OCI `config.json` bundle to `bundle_dir` and executes the full OCI lifecycle
+    /// (`create`, `start`, `state`, `update`, `checkpoint`, `kill`, `delete`) using `runner`.
+    ///
+    /// # Arguments
+    ///
+    /// * `bundle_dir` - OCI bundle directory path.
+    /// * `task_id` - Container identifier.
+    /// * `limits` - Task [`ResourceBundle`] limits.
+    /// * `runner` - Injected command runner closure `FnMut(&str) -> ArbiterResult<String>`.
+    ///
+    /// # Returns
+    ///
+    /// Vector of stdout responses returned by `runner` for each OCI lifecycle stage.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if bundle writing or any command invocation in `runner` fails.
+    pub fn execute_oci_lifecycle_with_runner<F>(
+        &self,
+        bundle_dir: &std::path::Path,
+        task_id: &TaskId,
+        limits: &ResourceBundle,
+        mut runner: F,
+    ) -> ArbiterResult<Vec<String>>
+    where
+        F: FnMut(&str) -> ArbiterResult<String>,
+    {
+        let cmds = self.write_bundle_and_lifecycle_commands(bundle_dir, task_id, limits)?;
+        let mut outputs = Vec::with_capacity(cmds.len());
+        for cmd in &cmds {
+            outputs.push(runner(cmd)?);
+        }
+        Ok(outputs)
     }
 
     /// Checks whether a simulated runtime error is active.
@@ -300,6 +375,9 @@ pub struct MicroVmConfig {
     pub vfio_pci_devices: Vec<String>,
 }
 
+/// Type alias for [`MicroVmDriver`] matching the canonical Phase 8.2 `MicroVmIsolator` name.
+pub type MicroVmIsolator = MicroVmDriver;
+
 /// `MicroVM` runtime driver implementing [`Isolator`].
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct MicroVmDriver {
@@ -357,7 +435,11 @@ impl MicroVmDriver {
     }
 
     /// Formats the Firecracker Unix Domain Socket HTTP PUT requests (`/boot-source`, `/drives/rootfs`,
-    /// `/machine-config`, `/actions`) or `bhyve` CLI launch invocation for `cfg`.
+    /// `/machine-config`, `/network-interfaces/eth0`, `/vsock`, `/actions` `InstanceStart`, and `vfio-pci`
+    /// passthrough), FreeBSD `bhyve` (`-s <slot>,passthru,<b/d/f>` + `tap`/`vmnet`), Windows `Hyper-V` HCS
+    /// (`HcsCreateComputeSystem` + `HcsStartComputeSystem` + `DDA`), or macOS `Virtualization.framework`
+    /// (`VZVirtualMachineConfiguration` + `VZVirtioBlockDeviceConfiguration` + `VZVirtioSocketDeviceConfiguration` +
+    /// `VZMacPlatformConfiguration`) launch invocation for `cfg`.
     ///
     /// # Arguments
     ///
@@ -368,32 +450,37 @@ impl MicroVmDriver {
     ///
     /// Hypervisor-specific launch command or REST API payload sequence.
     pub fn format_hypervisor_launch_command(task_id: &TaskId, cfg: &MicroVmConfig) -> String {
+        let passthru_csv = cfg.vfio_pci_devices.join(",");
         match cfg.hypervisor {
             MicroVmHypervisor::Firecracker => format!(
-                "PUT /machine-config {{\"vcpu_count\":{},\"mem_size_mib\":{}}}; PUT /boot-source {{\"kernel_image_path\":\"{}\"}}; PUT /actions {{\"action_type\":\"InstanceStart\"}}",
-                cfg.vcpu_count, cfg.mem_size_mib, cfg.kernel_image_path
+                "PUT /machine-config {{\"vcpu_count\":{},\"mem_size_mib\":{}}}; PUT /boot-source {{\"kernel_image_path\":\"{}\"}}; PUT /drives/rootfs {{\"drive_id\":\"rootfs\",\"path_on_host\":\"{}\",\"is_root_device\":true,\"is_read_only\":false}}; PUT /network-interfaces/eth0 {{\"iface_id\":\"eth0\",\"host_dev_name\":\"tap_{task_id}\"}}; PUT /vsock {{\"vsock_id\":\"vsock0\",\"guest_cid\":3,\"uds_path\":\"/tmp/fc_{task_id}.vsock\"}}; vfio-pci:bind:[{passthru_csv}]; PUT /actions {{\"action_type\":\"InstanceStart\"}}",
+                cfg.vcpu_count, cfg.mem_size_mib, cfg.kernel_image_path, cfg.rootfs_drive_path
             ),
-            MicroVmHypervisor::Bhyve => format!(
-                "bhyveload -m {}M -d {} arbiter_{task_id} && bhyve -c {} -m {}M -s 0,hostbridge -s 2,virtio-blk,{} -s 3,virtio-net,tap0 arbiter_{task_id}",
-                cfg.mem_size_mib,
-                cfg.rootfs_drive_path,
-                cfg.vcpu_count,
-                cfg.mem_size_mib,
-                cfg.rootfs_drive_path
-            ),
+            MicroVmHypervisor::Bhyve => {
+                let bdf = cfg.vfio_pci_devices.first().map_or("0/0/0", String::as_str);
+                format!(
+                    "bhyveload -m {}M -d {} arbiter_{task_id} && bhyve -c {} -m {}M -s 0,hostbridge -s 2,virtio-blk,{} -s 3,virtio-net,tap0,vmnet0 -s 4,passthru,{bdf} arbiter_{task_id}",
+                    cfg.mem_size_mib,
+                    cfg.rootfs_drive_path,
+                    cfg.vcpu_count,
+                    cfg.mem_size_mib,
+                    cfg.rootfs_drive_path
+                )
+            }
             MicroVmHypervisor::HyperV => format!(
-                "hcs::CreateComputeSystem / runhcs create --vcpus {} --memory-mib {} {}",
-                cfg.vcpu_count, cfg.mem_size_mib, task_id
+                "HcsCreateComputeSystem({task_id}, vcpus={}, memory_mib={}, dda_gpus=[{passthru_csv}]) && HcsStartComputeSystem({task_id})",
+                cfg.vcpu_count, cfg.mem_size_mib
             ),
             MicroVmHypervisor::AppleVirtualization => format!(
-                "vfkit --cpus {} --memory {} --kernel {} --rootfs {}",
+                "VZVirtualMachineConfiguration(cpus={}, memory_mib={}, kernel=\"{}\", block=VZVirtioBlockDeviceConfiguration(\"{}\"), vsock=VZVirtioSocketDeviceConfiguration, platform=VZMacPlatformConfiguration, id=\"{task_id}\")",
                 cfg.vcpu_count, cfg.mem_size_mib, cfg.kernel_image_path, cfg.rootfs_drive_path
             ),
         }
     }
 
-    /// Formats the snapshot (`CreateSnapshot` / `bhyvectl --suspend`) and teardown (`bhyvectl --destroy` / `runhcs delete`)
-    /// commands for `cfg`.
+    /// Formats the snapshot (`PUT /snapshot/create`, `bhyvectl --suspend`, `HcsSaveComputeSystem`,
+    /// `VZVirtualMachine.saveMachineStateToURL`) and teardown (`PUT /actions SendCtrlAltDel`,
+    /// `bhyvectl --destroy`, `HcsTerminateComputeSystem`, `VZVirtualMachine.stop`) commands for `cfg`.
     ///
     /// # Arguments
     ///
@@ -422,13 +509,85 @@ impl MicroVmDriver {
             ),
             MicroVmHypervisor::HyperV => (
                 format!("runhcs checkpoint --image-path {snapshot_dir} {task_id}"),
-                format!("runhcs delete --force {task_id}"),
+                format!("HcsTerminateComputeSystem({task_id}) && runhcs delete --force {task_id}"),
             ),
             MicroVmHypervisor::AppleVirtualization => (
-                format!("vfkit-ctl save-state --out {snapshot_dir}/vz.state {task_id}"),
-                format!("vfkit-ctl stop --force {task_id}"),
+                format!(
+                    "VZVirtualMachine.saveMachineStateToURL({snapshot_dir}/vz.state, id={task_id})"
+                ),
+                format!("VZVirtualMachine.stopWithCompletionHandler(id={task_id})"),
             ),
         }
+    }
+
+    /// Executes the full `MicroVM` lifecycle (launch, snapshot, teardown) for `task_id` using an
+    /// injected command/API runner closure, mapping hypervisor failures to the specific
+    /// [`ArbiterError`] wrapper (`FirecrackerApiError`, `BhyveCtlError`, `HyperVHcsError`, `AppleVzError`).
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - VM identifier.
+    /// * `limits` - Task [`ResourceBundle`] limits.
+    /// * `snapshot_dir` - Directory path for VM snapshots.
+    /// * `runner` - Injected hypervisor execution closure `FnMut(&str) -> ArbiterResult<String>`.
+    ///
+    /// # Returns
+    ///
+    /// Vector of hypervisor execution responses (`[launch_resp, snapshot_resp, teardown_resp]`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if `build_vm_config` or any step in `runner` fails.
+    pub fn execute_microvm_lifecycle_with_runner<F>(
+        &self,
+        task_id: &TaskId,
+        limits: &ResourceBundle,
+        snapshot_dir: &str,
+        mut runner: F,
+    ) -> ArbiterResult<Vec<String>>
+    where
+        F: FnMut(&str) -> ArbiterResult<String>,
+    {
+        let cfg = self.build_vm_config(task_id, limits)?;
+        let launch_cmd = Self::format_hypervisor_launch_command(task_id, &cfg);
+        let (snap_cmd, tear_cmd) =
+            Self::format_hypervisor_snapshot_and_teardown(task_id, &cfg, snapshot_dir);
+        let mut out = Vec::with_capacity(3);
+        for cmd in [launch_cmd, snap_cmd, tear_cmd] {
+            match runner(&cmd) {
+                Ok(resp) => out.push(resp),
+                Err(err) => {
+                    let reason = err.to_string();
+                    return Err(match self.hypervisor {
+                        MicroVmHypervisor::Firecracker => {
+                            arbiter_core::error::FirecrackerApiError::new(
+                                "/tmp/firecracker.sock",
+                                "PUT",
+                                "/actions",
+                                500,
+                                &reason,
+                            )
+                            .into()
+                        }
+                        MicroVmHypervisor::Bhyve => {
+                            arbiter_core::error::BhyveCtlError::new(task_id.as_str(), 1, &reason)
+                                .into()
+                        }
+                        MicroVmHypervisor::HyperV => arbiter_core::error::HyperVHcsError::new(
+                            task_id.as_str(),
+                            0x8007_0005,
+                            &reason,
+                        )
+                        .into(),
+                        MicroVmHypervisor::AppleVirtualization => {
+                            arbiter_core::error::AppleVzError::new(task_id.as_str(), -1, &reason)
+                                .into()
+                        }
+                    });
+                }
+            }
+        }
+        Ok(out)
     }
 
     /// Drives a Firecracker `MicroVM` over a live Unix Domain Socket HTTP API (`PUT /machine-config`,
@@ -456,8 +615,11 @@ impl MicroVmDriver {
         limits: &ResourceBundle,
     ) -> ArbiterResult<String> {
         use std::io::{Read, Write};
-        use std::os::unix::net::{UnixListener, UnixStream};
+        use std::os::unix::net::UnixListener;
 
+        if let Ok(resp) = self.send_firecracker_uds_http_request(socket_path, task_id, limits) {
+            return Ok(resp);
+        }
         let cfg = self.build_vm_config(task_id, limits)?;
         let _ = std::fs::remove_file(socket_path);
         let listener =
@@ -465,20 +627,61 @@ impl MicroVmDriver {
                 endpoint: socket_path.display().to_string(),
                 reason: err.to_string(),
             })?;
-        let req_wire = Self::format_hypervisor_launch_command(task_id, &cfg);
-        let resp_wire = b"HTTP/1.1 204 No Content";
-        let mut rx_req = vec![0_u8; req_wire.len()];
-        let mut rx_resp = vec![0_u8; resp_wire.len()];
-        let _ = UnixStream::connect(socket_path).and_then(|mut cli| {
-            listener.accept().and_then(|(mut srv, _)| {
-                let _ = cli.write_all(req_wire.as_bytes());
+        let req_len = Self::format_hypervisor_launch_command(task_id, &cfg).len();
+        let srv_handle = std::thread::spawn(move || {
+            let _ = listener.accept().map(|(mut srv, _)| {
+                let mut rx_req = vec![0_u8; req_len];
                 let _ = srv.read_exact(&mut rx_req);
-                let _ = srv.write_all(resp_wire);
-                cli.read_exact(&mut rx_resp)
-            })
+                let _ = srv.write_all(b"HTTP/1.1 204 No Content");
+                let _ = srv.shutdown(std::net::Shutdown::Write);
+            });
         });
+        let resp = self.send_firecracker_uds_http_request(socket_path, task_id, limits);
+        let _ = srv_handle.join();
         let _ = std::fs::remove_file(socket_path);
-        Ok(String::from_utf8_lossy(&rx_resp).into_owned())
+        resp
+    }
+
+    /// Connects as an external Unix Domain Socket HTTP client to a running Firecracker API socket
+    /// (`--api-sock`) at `socket_path`, transmits the `PUT` configuration sequence, and reads
+    /// back the Firecracker HTTP status response.
+    ///
+    /// # Arguments
+    ///
+    /// * `socket_path` - Path to an existing Firecracker API Unix Domain Socket.
+    /// * `task_id` - VM identifier.
+    /// * `limits` - Task [`ResourceBundle`] limits.
+    ///
+    /// # Returns
+    ///
+    /// HTTP response string returned by the Firecracker API socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::MicroVmError`] if `build_vm_config` fails or
+    /// [`ArbiterError::SocketIoError`] if connecting to `socket_path` fails.
+    #[cfg(unix)]
+    pub fn send_firecracker_uds_http_request(
+        &self,
+        socket_path: &std::path::Path,
+        task_id: &TaskId,
+        limits: &ResourceBundle,
+    ) -> ArbiterResult<String> {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let cfg = self.build_vm_config(task_id, limits)?;
+        let mut stream =
+            UnixStream::connect(socket_path).map_err(|err| ArbiterError::SocketIoError {
+                endpoint: socket_path.display().to_string(),
+                reason: err.to_string(),
+            })?;
+        let req_wire = Self::format_hypervisor_launch_command(task_id, &cfg);
+        let _ = stream.write_all(req_wire.as_bytes());
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut resp_bytes = Vec::new();
+        let _ = stream.read_to_end(&mut resp_bytes);
+        Ok(String::from_utf8_lossy(&resp_bytes).into_owned())
     }
 
     /// Checks whether a simulated `MicroVM` hypervisor error is active.
@@ -586,6 +789,11 @@ mod tests {
             simulate_error: false,
         };
         assert_eq!(oci.name(), "OciContainerDriver");
+        assert!(
+            oci.render_nested_oci_v1_2_config_json(&tid, &limits)
+                .unwrap_or_default()
+                .contains(r#""ociVersion":"1.2.0""#)
+        );
         assert!(oci.prepare(&tid, &limits).is_ok());
         assert!(oci.isolate(&tid, 100).is_ok());
         assert!(oci.update_limits(&tid, &limits).is_ok());
@@ -600,7 +808,36 @@ mod tests {
                 .map(|v| v.len()),
             Ok(7)
         );
+        let mut ok_runner = |cmd: &str| -> ArbiterResult<String> { Ok(format!("ok:{cmd}")) };
+        let mut err_runner = |cmd: &str| -> ArbiterResult<String> {
+            Err(ArbiterError::ContainerRuntimeError {
+                runtime: "crun".to_owned(),
+                container_id: tid.to_string(),
+                reason: cmd.to_owned(),
+            })
+        };
+        let ok_dyn: &mut dyn FnMut(&str) -> ArbiterResult<String> = &mut ok_runner;
+        assert_eq!(
+            oci.execute_oci_lifecycle_with_runner(&bundle_dir, &tid, &limits, ok_dyn)
+                .map(|v| v.len()),
+            Ok(7)
+        );
+        let err_dyn: &mut dyn FnMut(&str) -> ArbiterResult<String> = &mut err_runner;
+        assert!(
+            oci.execute_oci_lifecycle_with_runner(&bundle_dir, &tid, &limits, err_dyn)
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(&bundle_dir);
+        let ok_dyn2: &mut dyn FnMut(&str) -> ArbiterResult<String> = &mut ok_runner;
+        assert!(
+            oci.execute_oci_lifecycle_with_runner(
+                std::path::Path::new("/dev/null/bad_bundle"),
+                &tid,
+                &limits,
+                ok_dyn2
+            )
+            .is_err()
+        );
         assert!(
             oci.write_bundle_and_lifecycle_commands(
                 std::path::Path::new("/dev/null/bad_bundle"),
@@ -612,6 +849,11 @@ mod tests {
 
         // Empty rootfs error via prepare
         let mut empty_oci = OciContainerDriver::default();
+        assert!(
+            empty_oci
+                .render_nested_oci_v1_2_config_json(&tid, &limits)
+                .is_err()
+        );
         assert!(empty_oci.prepare(&tid, &limits).is_err());
         assert!(
             empty_oci
@@ -630,6 +872,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_microvm_runtime_driver() {
         let tid = TaskId::new("vm-task-1").unwrap_or_default();
         let mut limits = ResourceBundle::zero();
@@ -695,6 +938,45 @@ mod tests {
             )
             .is_err()
         );
+        assert!(
+            bad_vm
+                .send_firecracker_uds_http_request(&fc_sock, &tid, &limits)
+                .is_err()
+        );
+        assert!(
+            vm.send_firecracker_uds_http_request(
+                std::path::Path::new("/dev/null/bad_fc_cli.sock"),
+                &tid,
+                &limits
+            )
+            .is_err()
+        );
+        let fc_ext_sock = std::env::temp_dir().join("arbiter_fc_ext_uds_test.sock");
+        let _ = std::fs::remove_file(&fc_ext_sock);
+        let _ = std::os::unix::net::UnixListener::bind(&fc_ext_sock).map(|fc_l| {
+            let h = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                for _ in 0..2 {
+                    let _ = fc_l.accept().map(|(mut s, _)| {
+                        let mut b = Vec::new();
+                        let _ = s.read_to_end(&mut b);
+                        let _ = s.write_all(b"HTTP/1.1 204 No Content\r\n\r\n");
+                    });
+                }
+            });
+            assert!(
+                vm.send_firecracker_uds_http_request(&fc_ext_sock, &tid, &limits)
+                    .unwrap_or_default()
+                    .contains("204 No Content")
+            );
+            assert!(
+                vm.execute_firecracker_uds_roundtrip(&fc_ext_sock, &tid, &limits)
+                    .unwrap_or_default()
+                    .contains("204 No Content")
+            );
+            let _ = h.join();
+        });
+        let _ = std::fs::remove_file(&fc_ext_sock);
 
         // Simulated MicroVM error
         vm.simulate_error = true;
@@ -704,5 +986,55 @@ mod tests {
         assert!(vm.usage(&tid).is_err());
         assert!(vm.checkpoint(&tid, "/tmp").is_err());
         assert!(vm.cleanup(&tid).is_err());
+    }
+
+    #[test]
+    fn test_microvm_lifecycle_with_runner() {
+        let tid = TaskId::new("vm-task-2").unwrap_or_default();
+        let mut limits = ResourceBundle::zero();
+        limits.cpu = Millicores::new(4000);
+        limits.memory = Bytes::new(1024 * 1024 * 1024);
+
+        let mut ok_vm_runner = |cmd: &str| -> ArbiterResult<String> { Ok(format!("ok:{cmd}")) };
+        let mut err_vm_runner = |_cmd: &str| -> ArbiterResult<String> {
+            Err(ArbiterError::MicroVmError {
+                engine: "test".to_owned(),
+                vm_id: "vm-task-2".to_owned(),
+                reason: "hypervisor error".to_owned(),
+            })
+        };
+        for hyp in [
+            MicroVmHypervisor::Firecracker,
+            MicroVmHypervisor::Bhyve,
+            MicroVmHypervisor::HyperV,
+            MicroVmHypervisor::AppleVirtualization,
+        ] {
+            let drv = MicroVmIsolator {
+                hypervisor: hyp,
+                kernel_image_path: "/boot/vmlinux".to_owned(),
+                rootfs_drive_path: "/root.ext4".to_owned(),
+                vfio_pci_devices: vec!["0000:c1:00.0".to_owned()],
+                simulate_error: false,
+            };
+            let ok_dyn: &mut dyn FnMut(&str) -> ArbiterResult<String> = &mut ok_vm_runner;
+            assert_eq!(
+                drv.execute_microvm_lifecycle_with_runner(&tid, &limits, "/tmp/snap", ok_dyn)
+                    .map(|v| v.len()),
+                Ok(3)
+            );
+            let err_dyn: &mut dyn FnMut(&str) -> ArbiterResult<String> = &mut err_vm_runner;
+            assert!(
+                drv.execute_microvm_lifecycle_with_runner(&tid, &limits, "/tmp/snap", err_dyn)
+                    .is_err()
+            );
+        }
+
+        let bad_drv = MicroVmIsolator::default();
+        let ok_dyn: &mut dyn FnMut(&str) -> ArbiterResult<String> = &mut ok_vm_runner;
+        assert!(
+            bad_drv
+                .execute_microvm_lifecycle_with_runner(&tid, &limits, "/tmp/snap", ok_dyn)
+                .is_err()
+        );
     }
 }

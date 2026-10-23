@@ -225,7 +225,7 @@ impl<F: FrameworkScheduler> FrameworkRunner<F> {
         let req = HttpRequest {
             path: "/api/v1/scheduler".to_owned(),
             client_svid: Some(client_svid),
-            body_json: env.to_json_string(),
+            body_json: env.to_json_string().unwrap_or_default(),
         };
         let (_, parsed_env, _) =
             gateway.execute_loopback_tcp_exchange(bind_addr, &req, current_tick)?;
@@ -510,7 +510,7 @@ impl RemoteArbiterClient {
         let req = HttpRequest {
             path: "/api/v1/jobs".to_owned(),
             client_svid: Some(self.client_svid.clone()),
-            body_json: env.to_json_string(),
+            body_json: env.to_json_string().unwrap_or_default(),
         };
         let (_, resp_env, _) = gateway.execute_loopback_tcp_exchange(
             &self.master_http_endpoint,
@@ -518,6 +518,183 @@ impl RemoteArbiterClient {
             current_tick,
         )?;
         Ok(resp_env)
+    }
+
+    /// Connects as an external TCP/HTTP client to a listening `arbiter-master` at
+    /// `self.master_http_endpoint`, sends `envelope` to `path`, and decodes the response [`WireEnvelope`].
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Target HTTP API path (`"/api/v1/scheduler"`, `"/api/v1/jobs"`, `"/api/v1/operator"`).
+    /// * `envelope` - Outbound [`WireEnvelope`].
+    ///
+    /// # Returns
+    ///
+    /// Decoded response [`WireEnvelope`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketIoError`] or [`ArbiterError::DeserializationError`] on failure.
+    pub fn post_to_remote_master_http(
+        &self,
+        path: &str,
+        envelope: &WireEnvelope,
+    ) -> ArbiterResult<WireEnvelope> {
+        use std::io::{Read, Write};
+
+        let mut stream = std::net::TcpStream::connect(&self.master_http_endpoint).map_err(|e| {
+            ArbiterError::SocketIoError {
+                endpoint: self.master_http_endpoint.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+        let body_json = envelope.to_json_string()?;
+        let req_wire = format!(
+            "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_json}",
+            self.master_http_endpoint,
+            body_json.len()
+        );
+        let _ = stream.write_all(req_wire.as_bytes());
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut resp_bytes = Vec::new();
+        let _ = stream.read_to_end(&mut resp_bytes);
+        let resp_str = String::from_utf8_lossy(&resp_bytes);
+        let body = resp_str
+            .split_once("\r\n\r\n")
+            .map_or(resp_str.as_ref(), |(_, b)| b);
+        WireEnvelope::from_json_str(body.trim())
+    }
+
+    /// Sends `envelope` to `path` on `self.master_http_endpoint`, automatically following HTTP
+    /// `307 Temporary Redirect` `Location` headers to the active Raft leader and retrying transient
+    /// connection failures with exponential backoff.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Target HTTP API path (`"/api/v1/scheduler"`, `"/api/v1/jobs"`, `"/api/v1/operator"`).
+    /// * `envelope` - Outbound [`WireEnvelope`].
+    /// * `max_retries` - Maximum retry attempts (`>= 1`).
+    /// * `initial_backoff_ms` - Initial backoff delay in milliseconds (doubled on each retry).
+    ///
+    /// # Returns
+    ///
+    /// Decoded response [`WireEnvelope`] from the leader Master.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketIoError`] or [`ArbiterError::DeserializationError`] if all
+    /// retry attempts fail.
+    pub fn post_with_redirect_and_backoff(
+        &mut self,
+        path: &str,
+        envelope: &WireEnvelope,
+        max_retries: u32,
+        initial_backoff_ms: u64,
+    ) -> ArbiterResult<WireEnvelope> {
+        use std::io::{Read, Write};
+
+        let attempts = max_retries.max(1);
+        let mut backoff_ms = initial_backoff_ms;
+        let mut last_err = ArbiterError::SocketIoError {
+            endpoint: self.master_http_endpoint.clone(),
+            reason: "exhausted retries".to_owned(),
+        };
+        for _ in 0..attempts {
+            match std::net::TcpStream::connect(&self.master_http_endpoint) {
+                Ok(mut stream) => {
+                    let body_json = envelope.to_json_string()?;
+                    let req_wire = format!(
+                        "POST {path} HTTP/1.1\r\nHost: {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body_json}",
+                        self.master_http_endpoint,
+                        body_json.len()
+                    );
+                    let _ = stream.write_all(req_wire.as_bytes());
+                    let _ = stream.shutdown(std::net::Shutdown::Write);
+                    let mut resp_bytes = Vec::new();
+                    let _ = stream.read_to_end(&mut resp_bytes);
+                    let resp_str = String::from_utf8_lossy(&resp_bytes);
+                    if resp_str.starts_with("HTTP/1.1 307") {
+                        for line in resp_str.lines() {
+                            if let Some(loc) = line.strip_prefix("Location:") {
+                                let trimmed = loc.trim().trim_start_matches("http://");
+                                let host_port =
+                                    trimmed.split('/').next().unwrap_or(trimmed).to_owned();
+                                self.master_http_endpoint = host_port;
+                            }
+                        }
+                        continue;
+                    }
+                    let body = resp_str
+                        .split_once("\r\n\r\n")
+                        .map_or(resp_str.as_ref(), |(_, b)| b);
+                    return WireEnvelope::from_json_str(body.trim());
+                }
+                Err(err) => {
+                    last_err = ArbiterError::SocketIoError {
+                        endpoint: self.master_http_endpoint.clone(),
+                        reason: err.to_string(),
+                    };
+                    std::thread::sleep(std::time::Duration::from_millis(backoff_ms));
+                    backoff_ms = backoff_ms.saturating_mul(2);
+                }
+            }
+        }
+        Err(last_err)
+    }
+}
+
+/// Zero-packet co-located `CaaS` client SDK (`CaasLeaseClient`) communicating with the local
+/// `arbiter-agent` over Unix Domain Socket (`/var/run/arbiter/caas.sock`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CaasLeaseClient {
+    /// Path to the local Agent's `CaaS` Unix Domain Socket.
+    pub uds_socket_path: String,
+}
+
+impl CaasLeaseClient {
+    /// Creates a new [`CaasLeaseClient`] bound to `uds_socket_path`.
+    ///
+    /// # Arguments
+    ///
+    /// * `uds_socket_path` - Path to `/var/run/arbiter/caas.sock`.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`CaasLeaseClient`].
+    pub const fn new(uds_socket_path: String) -> Self {
+        Self { uds_socket_path }
+    }
+
+    /// Exchanges a JSON `CaasIpcRequest` over the local Unix Domain Socket (`self.uds_socket_path`)
+    /// with `0` network packets.
+    ///
+    /// # Arguments
+    ///
+    /// * `request_json` - Serialized `CaasIpcRequest` JSON payload.
+    ///
+    /// # Returns
+    ///
+    /// Raw JSON response string from the local `arbiter-agent` `CaaS` server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketIoError`] if connecting to `self.uds_socket_path` fails.
+    #[cfg(unix)]
+    pub fn exchange_uds_request(&self, request_json: &str) -> ArbiterResult<String> {
+        use std::io::{Read, Write};
+
+        let mut stream =
+            std::os::unix::net::UnixStream::connect(&self.uds_socket_path).map_err(|e| {
+                ArbiterError::SocketIoError {
+                    endpoint: self.uds_socket_path.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+        let _ = stream.write_all(request_json.as_bytes());
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut resp = Vec::new();
+        let _ = stream.read_to_end(&mut resp);
+        Ok(String::from_utf8_lossy(&resp).into_owned())
     }
 }
 
@@ -588,6 +765,175 @@ impl<F: FrameworkScheduler> RemoteFrameworkDriver<F> {
             seq,
             current_tick,
         )
+    }
+
+    /// Processes a decoded [`arbiter_proto::SchedulerEvent`] received from a streaming `RecordIO`
+    /// `/api/v1/scheduler` connection, invoking [`FrameworkScheduler`] callbacks and returning
+    /// any follow-up [`SchedulerCall`]s (`Accept` or `Acknowledge`) to transmit back to the Master.
+    ///
+    /// # Arguments
+    ///
+    /// * `event` - Inbound [`arbiter_proto::SchedulerEvent`].
+    ///
+    /// # Returns
+    ///
+    /// Vector of outbound [`SchedulerCall`]s generated in response.
+    ///
+    /// # Errors
+    ///
+    /// Propagates any [`ArbiterError`] from `on_offers_received` or `on_task_status_update`.
+    pub fn handle_scheduler_event(
+        &mut self,
+        event: arbiter_proto::SchedulerEvent,
+    ) -> ArbiterResult<Vec<SchedulerCall>> {
+        match event {
+            arbiter_proto::SchedulerEvent::Subscribed(..) => {
+                self.runner.is_subscribed = true;
+                Ok(Vec::new())
+            }
+            arbiter_proto::SchedulerEvent::Offers(offers) => {
+                let accepts = self.runner.scheduler.on_offers_received(&offers)?;
+                Ok(accepts
+                    .into_iter()
+                    .map(|acc| SchedulerCall::Accept(acc, None, OfferFilter::default()))
+                    .collect())
+            }
+            arbiter_proto::SchedulerEvent::Update(upd, uuid_opt) => {
+                self.runner.scheduler.on_task_status_update(&upd)?;
+                if let Some(uuid) = uuid_opt {
+                    Ok(vec![SchedulerCall::Acknowledge(
+                        self.runner.scheduler.framework_id(),
+                        upd.agent_id,
+                        upd.task_id,
+                        uuid,
+                    )])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            _ => Ok(Vec::new()),
+        }
+    }
+}
+
+/// Persistent streaming `RecordIO` runtime loop (`FrameworkRuntimeLoop`) driving a
+/// [`RemoteFrameworkDriver`] against a live Master `/api/v1/scheduler` endpoint.
+///
+/// Tracks the negotiated `Mesos-Stream-Id` header, follows `HTTP/1.1 307 Temporary Redirect`
+/// responses to the current Raft leader, decodes `RecordIO`-framed [`arbiter_proto::SchedulerEvent`]s,
+/// and dispatches generated follow-up [`SchedulerCall`]s (`Accept`, `Acknowledge`).
+pub struct FrameworkRuntimeLoop<F: FrameworkScheduler> {
+    /// Underlying [`RemoteFrameworkDriver`].
+    pub driver: RemoteFrameworkDriver<F>,
+    /// Active `Mesos-Stream-Id` assigned by the Master upon `SUBSCRIBED`.
+    pub active_stream_id: Option<String>,
+    /// Incremental `RecordIO` stream decoder.
+    pub recordio_decoder: arbiter_proto::RecordIoStreamDecoder,
+}
+
+impl<F: FrameworkScheduler> FrameworkRuntimeLoop<F> {
+    /// Creates a new [`FrameworkRuntimeLoop`] wrapping `driver`.
+    ///
+    /// # Arguments
+    ///
+    /// * `driver` - [`RemoteFrameworkDriver`] instance.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`FrameworkRuntimeLoop`].
+    pub const fn new(driver: RemoteFrameworkDriver<F>) -> Self {
+        Self {
+            driver,
+            active_stream_id: None,
+            recordio_decoder: arbiter_proto::RecordIoStreamDecoder::new(),
+        }
+    }
+
+    /// Connects to `self.driver.client.master_http_endpoint` (following `307 Temporary Redirect`
+    /// if the contacted node is a follower), sends `SchedulerCall::Subscribe`, extracts any
+    /// `Mesos-Stream-Id` response header, decodes all `RecordIO` [`arbiter_proto::SchedulerEvent`]
+    /// frames in the stream chunk, and returns the resulting outbound [`SchedulerCall`]s.
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` - Monotonic wire sequence number.
+    ///
+    /// # Returns
+    ///
+    /// Vector of follow-up [`SchedulerCall`]s produced by the [`FrameworkScheduler`] callbacks.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if TCP connection, `RecordIO` decoding, or a scheduler callback fails.
+    pub fn connect_and_pump_recordio_once(
+        &mut self,
+        seq: u64,
+    ) -> ArbiterResult<Vec<SchedulerCall>> {
+        use std::io::{Read, Write};
+
+        let role = self.driver.runner.scheduler.role();
+        let sub_call = SchedulerCall::Subscribe(
+            SubscribeFramework {
+                framework_id: self.driver.runner.scheduler.framework_id(),
+                role: role.clone(),
+                failover_timeout_ms: self.driver.runner.scheduler.failover_timeout_ms(),
+            },
+            arbiter_core::workload::CheckpointMode::Enabled,
+            vec![role],
+            Vec::new(),
+        );
+        let sub_env = WireEnvelope::new(seq, WireMessage::SchedulerCall(Box::new(sub_call)));
+        let recordio_req = encode_recordio_frame(&sub_env);
+
+        for _ in 0..2 {
+            let mut stream = std::net::TcpStream::connect(&self.driver.client.master_http_endpoint)
+                .map_err(|e| ArbiterError::SocketIoError {
+                    endpoint: self.driver.client.master_http_endpoint.clone(),
+                    reason: e.to_string(),
+                })?;
+            let req_wire = format!(
+                "POST /api/v1/scheduler HTTP/1.1\r\nHost: {}\r\nContent-Type: application/x-recordio\r\nAccept: application/x-recordio\r\nContent-Length: {}\r\n\r\n{recordio_req}",
+                self.driver.client.master_http_endpoint,
+                recordio_req.len()
+            );
+            let _ = stream.write_all(req_wire.as_bytes());
+            let _ = stream.shutdown(std::net::Shutdown::Write);
+            let mut resp_bytes = Vec::new();
+            let _ = stream.read_to_end(&mut resp_bytes);
+            let resp_str = String::from_utf8_lossy(&resp_bytes);
+            if let Some(loc) = HttpGateway::extract_redirect_location(&resp_str) {
+                let host_port = loc
+                    .trim_start_matches("http://")
+                    .split('/')
+                    .next()
+                    .unwrap_or(&loc)
+                    .to_owned();
+                self.driver.client.master_http_endpoint = host_port;
+                continue;
+            }
+            let (headers, body) = resp_str.split_once("\r\n\r\n").unwrap_or(("", ""));
+            for line in headers.lines() {
+                if let Some(sid) = line
+                    .strip_prefix("Mesos-Stream-Id:")
+                    .or_else(|| line.strip_prefix("mesos-stream-id:"))
+                {
+                    self.active_stream_id = Some(sid.trim().to_owned());
+                }
+            }
+            let envs = self.recordio_decoder.feed_chunk(body)?;
+            let mut follow_ups = Vec::new();
+            for env in envs {
+                if let WireMessage::SchedulerEvent(ev_box) = env.message {
+                    let calls = self.driver.handle_scheduler_event(*ev_box)?;
+                    follow_ups.extend(calls);
+                }
+            }
+            return Ok(follow_ups);
+        }
+        Err(ArbiterError::SocketIoError {
+            endpoint: self.driver.client.master_http_endpoint.clone(),
+            reason: "exceeded maximum leader redirect hops".to_owned(),
+        })
     }
 }
 
@@ -837,6 +1183,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_sdk_client_quic_submission() {
         let (_, role) = setup_master();
         let client = ArbiterClient::new(role);
@@ -905,7 +1252,126 @@ mod tests {
             rem_client,
         );
         assert!(rem_fw.subscribe_over_http(&gw, 4, 20).is_ok());
+
+        // Test handle_scheduler_event across Subscribed, Offers, Update, and Heartbeat
+        assert_eq!(
+            rem_fw.handle_scheduler_event(arbiter_proto::SchedulerEvent::Subscribed(
+                FrameworkId::new("rem-fw").unwrap_or_default(),
+                arbiter_core::workload::MasterInfo {
+                    leader_id: "m1".to_owned(),
+                    elected_term: 1,
+                    version: "0.1.0".to_owned(),
+                },
+                arbiter_core::units::BenchmarkTicks::new(15),
+            )),
+            Ok(Vec::new())
+        );
+        let sample_offer = ResourceOffer {
+            offer_id: OfferId::new("off-rem-1").unwrap_or_default(),
+            framework_id: FrameworkId::new("rem-fw").unwrap_or_default(),
+            agent_id: AgentId::new("agent-1").unwrap_or_default(),
+            role: client.default_role.clone(),
+            resources: ResourceBundle::zero(),
+            revocable: false,
+            expires_at_tick: 100,
+        };
+        assert_eq!(
+            rem_fw
+                .handle_scheduler_event(arbiter_proto::SchedulerEvent::Offers(vec![
+                    sample_offer.clone()
+                ]))
+                .map(|v| v.len()),
+            Ok(1)
+        );
+        rem_fw.runner.scheduler.fail_on_offer = true;
+        assert!(
+            rem_fw
+                .handle_scheduler_event(arbiter_proto::SchedulerEvent::Offers(vec![sample_offer]))
+                .is_err()
+        );
+        rem_fw.runner.scheduler.fail_on_offer = false;
+        let sample_upd = TaskStatusUpdate {
+            task_id: TaskId::new("t-rem-1").unwrap_or_default(),
+            agent_id: AgentId::new("agent-1").unwrap_or_default(),
+            state: TaskState::Running,
+            message: "ok".to_owned(),
+        };
+        assert_eq!(
+            rem_fw
+                .handle_scheduler_event(arbiter_proto::SchedulerEvent::Update(
+                    sample_upd.clone(),
+                    Some(arbiter_core::ids::StatusUpdateUuid::new("u-rem-1").unwrap_or_default()),
+                ))
+                .map(|v| v.len()),
+            Ok(1)
+        );
+        assert_eq!(
+            rem_fw
+                .handle_scheduler_event(arbiter_proto::SchedulerEvent::Update(sample_upd, None))
+                .map(|v| v.len()),
+            Ok(0)
+        );
+        assert_eq!(
+            rem_fw.handle_scheduler_event(arbiter_proto::SchedulerEvent::Heartbeat),
+            Ok(Vec::new())
+        );
+
+        // Test post_to_remote_master_http against a live TcpListener (both HTTP headers and raw body)
+        for with_headers in [true, false] {
+            let _ = std::net::TcpListener::bind("127.0.0.1:0").map(|listener| {
+                let _ = listener.local_addr().map(|addr| {
+                    let handle = std::thread::spawn(move || {
+                        use std::io::{Read, Write};
+                        let _ = listener.accept().map(|(mut srv, _)| {
+                            let mut req = Vec::new();
+                            let _ = srv.read_to_end(&mut req);
+                            let ack_env = WireEnvelope::new(
+                                99,
+                                WireMessage::SchedulerEvent(Box::new(
+                                    arbiter_proto::SchedulerEvent::Heartbeat,
+                                )),
+                            );
+                            let body = ack_env.to_json_string().unwrap_or_default();
+                            let wire = if with_headers {
+                                format!(
+                                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                                    body.len()
+                                )
+                            } else {
+                                body
+                            };
+                            let _ = srv.write_all(wire.as_bytes());
+                        });
+                    });
+                    let mut live_cli = rem_fw.client.clone();
+                    live_cli.master_http_endpoint = addr.to_string();
+                    let out_env = WireEnvelope::new(
+                        98,
+                        WireMessage::OperatorCall(Box::new(arbiter_proto::OperatorCall::GetHealth)),
+                    );
+                    assert!(
+                        live_cli
+                            .post_to_remote_master_http("/api/v1/operator", &out_env)
+                            .is_ok()
+                    );
+                    let _ = handle.join();
+                });
+            });
+        }
+
         rem_fw.client.master_http_endpoint = "invalid-addr".to_owned();
+        assert!(
+            rem_fw
+                .client
+                .post_to_remote_master_http(
+                    "/api/v1/operator",
+                    &WireEnvelope::new(
+                        1,
+                        WireMessage::OperatorCall(Box::new(arbiter_proto::OperatorCall::GetHealth)),
+                    )
+                )
+                .is_err()
+        );
         assert!(rem_fw.subscribe_over_http(&gw, 5, 20).is_err());
         assert!(
             rem_fw
@@ -1010,5 +1476,242 @@ mod tests {
                 .submit_gang_or_tpu_job(&mut master, gid, popped_tasks, None, 1000)
                 .is_err()
         );
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_sdk_leader_redirect_backoff_and_caas_uds_client() {
+        use std::io::{Read, Write};
+
+        let (_, role) = setup_master();
+        let auth = arbiter_net::security::SvidAuthority::new("arbiter.internal", [3_u8; 32], 100);
+        let svid = auth
+            .issue_svid("spiffe://arbiter.internal/role/ml/task/redir", 10)
+            .unwrap_or_default();
+
+        // 1. Follower listener returning HTTP/1.1 307 Temporary Redirect -> Leader listener returning 200 OK
+        let leader_listener = std::net::TcpListener::bind("127.0.0.1:0").ok();
+        let leader_addr = leader_listener
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let follower_listener = std::net::TcpListener::bind("127.0.0.1:0").ok();
+        let follower_addr = follower_listener
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+
+        let leader_addr_clone = leader_addr.clone();
+        let follower_thread = std::thread::spawn(move || {
+            let _ = follower_listener
+                .as_ref()
+                .and_then(|l| l.accept().ok())
+                .map(|(mut srv, _)| {
+                    let mut req = Vec::new();
+                    let _ = srv.read_to_end(&mut req);
+                    let redir = format!(
+                        "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{leader_addr_clone}/api/v1/operator\r\nContent-Length: 0\r\n\r\n"
+                    );
+                    let _ = srv.write_all(redir.as_bytes());
+                });
+        });
+        let leader_thread = std::thread::spawn(move || {
+            let _ = leader_listener
+                .as_ref()
+                .and_then(|l| l.accept().ok())
+                .map(|(mut srv, _)| {
+                    let mut req = Vec::new();
+                    let _ = srv.read_to_end(&mut req);
+                    let ack_env = WireEnvelope::new(
+                        77,
+                        WireMessage::SchedulerEvent(Box::new(
+                            arbiter_proto::SchedulerEvent::Heartbeat,
+                        )),
+                    );
+                    let body = ack_env.to_json_string().unwrap_or_default();
+                    let resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = srv.write_all(resp.as_bytes());
+                });
+        });
+
+        let mut cli =
+            RemoteArbiterClient::new(follower_addr, "127.0.0.1:5050".to_owned(), svid, role);
+        let req_env = WireEnvelope::new(
+            76,
+            WireMessage::OperatorCall(Box::new(arbiter_proto::OperatorCall::GetHealth)),
+        );
+        assert!(
+            cli.post_with_redirect_and_backoff("/api/v1/operator", &req_env, 2, 0)
+                .is_ok()
+        );
+        assert_eq!(cli.master_http_endpoint, leader_addr);
+        let _ = follower_thread.join();
+        let _ = leader_thread.join();
+
+        // Backoff failure path (both initial_backoff_ms == 0 and > 0)
+        "invalid-addr".clone_into(&mut cli.master_http_endpoint);
+        assert!(
+            cli.post_with_redirect_and_backoff("/api/v1/operator", &req_env, 2, 1)
+                .is_err()
+        );
+
+        // 2. CaasLeaseClient over live Unix Domain Socket
+        let uds_path =
+            std::env::temp_dir().join(format!("arbiter_sdk_caas_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&uds_path);
+        let uds_listener = std::os::unix::net::UnixListener::bind(&uds_path).ok();
+        let uds_srv = std::thread::spawn(move || {
+            let _ = uds_listener
+                .as_ref()
+                .and_then(|l| l.accept().ok())
+                .map(|(mut s, _)| {
+                    let mut rx = Vec::new();
+                    let _ = s.read_to_end(&mut rx);
+                    let _ = s.write_all(b"{\"status\":\"VerifyLeaseValid\"}");
+                });
+        });
+        let caas_cli = CaasLeaseClient::new(uds_path.to_string_lossy().into_owned());
+        assert_eq!(
+            caas_cli.exchange_uds_request("{\"op\":\"VerifyLease\"}"),
+            Ok("{\"status\":\"VerifyLeaseValid\"}".to_owned())
+        );
+        let _ = uds_srv.join();
+        let _ = std::fs::remove_file(&uds_path);
+        assert!(caas_cli.exchange_uds_request("{}").is_err());
+
+        // 3. FrameworkRuntimeLoop (307 follower redirect -> leader RecordIO stream with Mesos-Stream-Id)
+        let (_, role2) = setup_master();
+        let auth2 = arbiter_net::security::SvidAuthority::new("arbiter.internal", [4_u8; 32], 100);
+        let svid2 = auth2
+            .issue_svid("spiffe://arbiter.internal/role/ml/task/rt", 10)
+            .unwrap_or_default();
+        let l_srv = std::net::TcpListener::bind("127.0.0.1:0").ok();
+        let l_addr = l_srv
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let f_srv = std::net::TcpListener::bind("127.0.0.1:0").ok();
+        let f_addr = f_srv
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let role2_clone = role2.clone();
+        let f_handle = std::thread::spawn(move || {
+            let _ = f_srv.as_ref().and_then(|l| l.accept().ok()).map(|(mut s, _)| {
+                let mut rx = Vec::new();
+                let _ = s.read_to_end(&mut rx);
+                let redir = format!(
+                    "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{l_addr}/api/v1/scheduler\r\nContent-Length: 0\r\n\r\n"
+                );
+                let _ = s.write_all(redir.as_bytes());
+            });
+        });
+        let l_handle = std::thread::spawn(move || {
+            let _ = l_srv.as_ref().and_then(|l| l.accept().ok()).map(|(mut s, _)| {
+                let mut rx = Vec::new();
+                let _ = s.read_to_end(&mut rx);
+                let sub_ev = WireEnvelope::new(
+                    1,
+                    WireMessage::SchedulerEvent(Box::new(
+                        arbiter_proto::SchedulerEvent::Subscribed(
+                            FrameworkId::new("rt-fw").unwrap_or_default(),
+                            arbiter_core::workload::MasterInfo {
+                                leader_id: "m1".to_owned(),
+                                elected_term: 1,
+                                version: "0.1.0".to_owned(),
+                            },
+                            arbiter_core::units::BenchmarkTicks::new(15),
+                        ),
+                    )),
+                );
+                let off_ev = WireEnvelope::new(
+                    2,
+                    WireMessage::SchedulerEvent(Box::new(arbiter_proto::SchedulerEvent::Offers(
+                        vec![ResourceOffer {
+                            offer_id: OfferId::new("off-rt-1").unwrap_or_default(),
+                            framework_id: FrameworkId::new("rt-fw").unwrap_or_default(),
+                            agent_id: AgentId::new("agent-1").unwrap_or_default(),
+                            role: role2_clone,
+                            resources: ResourceBundle::zero(),
+                            revocable: false,
+                            expires_at_tick: 100,
+                        }],
+                    ))),
+                );
+                let non_sched_ev = WireEnvelope::new(
+                    3,
+                    WireMessage::OperatorCall(Box::new(arbiter_proto::OperatorCall::GetHealth)),
+                );
+                let body = format!(
+                    "{}{}{}",
+                    encode_recordio_frame(&sub_ev),
+                    encode_recordio_frame(&off_ev),
+                    encode_recordio_frame(&non_sched_ev)
+                );
+                let resp = format!(
+                    "HTTP/1.1 200 OK\r\nMesos-Stream-Id: stream-rt-77\r\nContent-Type: application/x-recordio\r\nContent-Length: {}\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = s.write_all(resp.as_bytes());
+            });
+        });
+        let rt_cli =
+            RemoteArbiterClient::new(f_addr, "127.0.0.1:5050".to_owned(), svid2, role2.clone());
+        let rt_drv = RemoteFrameworkDriver::new(
+            GreedyTestFramework {
+                fw_id: FrameworkId::new("rt-fw").unwrap_or_default(),
+                role: role2,
+                launch_on_offer: true,
+                fail_on_offer: false,
+                observed_updates: 0,
+            },
+            rt_cli,
+        );
+        let mut rt_loop = FrameworkRuntimeLoop::new(rt_drv);
+        let follow_ups = rt_loop
+            .connect_and_pump_recordio_once(1)
+            .unwrap_or_default();
+        assert_eq!(follow_ups.len(), 1);
+        assert_eq!(rt_loop.active_stream_id, Some("stream-rt-77".to_owned()));
+        assert!(rt_loop.driver.runner.is_subscribed);
+        let _ = f_handle.join();
+        let _ = l_handle.join();
+
+        // Exceeded redirect hops and connect error branches
+        let loop_redir_srv = std::net::TcpListener::bind("127.0.0.1:0").ok();
+        let loop_redir_addr = loop_redir_srv
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let loop_redir_addr_c = loop_redir_addr.clone();
+        let loop_redir_h = std::thread::spawn(move || {
+            for _ in 0..2 {
+                let _ = loop_redir_srv
+                    .as_ref()
+                    .and_then(|l| l.accept().ok())
+                    .map(|(mut s, _)| {
+                        let mut rx = Vec::new();
+                        let _ = s.read_to_end(&mut rx);
+                        let redir = format!(
+                            "HTTP/1.1 307 Temporary Redirect\r\nLocation: http://{loop_redir_addr_c}/api/v1/scheduler\r\nContent-Length: 0\r\n\r\n"
+                        );
+                        let _ = s.write_all(redir.as_bytes());
+                    });
+            }
+        });
+        rt_loop.driver.client.master_http_endpoint = loop_redir_addr;
+        assert!(rt_loop.connect_and_pump_recordio_once(2).is_err());
+        let _ = loop_redir_h.join();
+
+        "invalid-addr".clone_into(&mut rt_loop.driver.client.master_http_endpoint);
+        assert!(rt_loop.connect_and_pump_recordio_once(3).is_err());
     }
 }

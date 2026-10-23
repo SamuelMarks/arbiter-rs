@@ -1,0 +1,325 @@
+name: Release OS+Arch Binaries
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release version tag (e.g., v0.1.0) for manual workflow dispatch"
+        required: false
+        default: "v0.1.0"
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Stage 1: Pre-Release Quality Gate (All Pre-commit Hooks)
+  # ---------------------------------------------------------------------------
+  pre-release-checks:
+    name: "Pre-Release Quality Gate (Pre-commit Suite)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-docs
+
+      - name: Install Rust nightly toolchain with llvm-tools-preview
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview, rust-docs
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run complete pre-commit verification pipeline
+        run: python3 scripts/pre_commit.py all --check
+
+  # ---------------------------------------------------------------------------
+  # Stage 2: Build OS + Arch Release Binaries
+  # ---------------------------------------------------------------------------
+  build-release-binaries:
+    name: "Build (${{ matrix.os_name }}-${{ matrix.arch_name }} / ${{ matrix.target }})"
+    needs: pre-release-checks
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux (glibc & static musl across x86_64, aarch64, riscv64gc)
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            os_name: linux
+            arch_name: x86_64-gnu
+            archive_ext: tar.gz
+            bin_ext: ""
+            use_cross: false
+
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            os_name: linux
+            arch_name: x86_64-musl
+            archive_ext: tar.gz
+            bin_ext: ""
+            use_cross: false
+
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            os_name: linux
+            arch_name: aarch64-gnu
+            archive_ext: tar.gz
+            bin_ext: ""
+            use_cross: false
+
+          - runner: ubuntu-latest
+            target: aarch64-unknown-linux-musl
+            os_name: linux
+            arch_name: aarch64-musl
+            archive_ext: tar.gz
+            bin_ext: ""
+            use_cross: false
+
+          - runner: ubuntu-latest
+            target: riscv64gc-unknown-linux-gnu
+            os_name: linux
+            arch_name: riscv64gc-gnu
+            archive_ext: tar.gz
+            bin_ext: ""
+            use_cross: false
+
+          # macOS / Darwin (Intel x86_64 & Apple Silicon aarch64)
+          - runner: macos-latest
+            target: x86_64-apple-darwin
+            os_name: macos
+            arch_name: x86_64
+            archive_ext: tar.gz
+            bin_ext: ""
+            use_cross: false
+
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            os_name: macos
+            arch_name: aarch64
+            archive_ext: tar.gz
+            bin_ext: ""
+            use_cross: false
+
+          # Windows (MSVC x86_64 & aarch64)
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            os_name: windows
+            arch_name: x86_64
+            archive_ext: zip
+            bin_ext: ".exe"
+            use_cross: false
+
+          - runner: windows-latest
+            target: aarch64-pc-windows-msvc
+            os_name: windows
+            arch_name: aarch64
+            archive_ext: zip
+            bin_ext: ".exe"
+            use_cross: false
+
+          # FreeBSD & illumos (via cargo-cross container toolchains)
+          - runner: ubuntu-latest
+            target: x86_64-unknown-freebsd
+            os_name: freebsd
+            arch_name: x86_64
+            archive_ext: tar.gz
+            bin_ext: ""
+            use_cross: true
+
+          - runner: ubuntu-latest
+            target: x86_64-unknown-illumos
+            os_name: illumos
+            arch_name: x86_64
+            archive_ext: tar.gz
+            bin_ext: ""
+            use_cross: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Resolve release version tag
+        id: version
+        shell: bash
+        run: |
+          if [[ "${GITHUB_REF:-}" == refs/tags/v* ]]; then
+            TAG="${GITHUB_REF#refs/tags/}"
+          elif [[ -n "${{ inputs.tag }}" ]]; then
+            TAG="${{ inputs.tag }}"
+          else
+            TAG="v0.1.0"
+          fi
+          echo "tag=${TAG}" >> "${GITHUB_OUTPUT}"
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Set up cross-compilation C linker toolchain (Linux targets)
+        if: ${{ !matrix.use_cross && matrix.os_name == 'linux' }}
+        uses: taiki-e/setup-cross-toolchain-action@v1
+        with:
+          target: ${{ matrix.target }}
+
+      - name: Install cross for FreeBSD and illumos targets
+        if: ${{ matrix.use_cross }}
+        uses: taiki-e/install-action@cross
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.target }}
+
+      - name: Build release binaries with Cargo
+        if: ${{ !matrix.use_cross }}
+        run: cargo build --workspace --bins --release --locked --target ${{ matrix.target }}
+
+      - name: Build release binaries with cross
+        if: ${{ matrix.use_cross }}
+        run: cross build --workspace --bins --release --locked --target ${{ matrix.target }}
+
+      - name: Package OS+arch release archive and standalone multicall binary (Unix)
+        if: ${{ matrix.archive_ext == 'tar.gz' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          OS_NAME="${{ matrix.os_name }}"
+          ARCH_NAME="${{ matrix.arch_name }}"
+          TARGET="${{ matrix.target }}"
+          BIN_EXT="${{ matrix.bin_ext }}"
+
+          PKG_BASENAME="arbiter-${TAG}-${OS_NAME}-${ARCH_NAME}"
+          STAGE_DIR="dist/${PKG_BASENAME}"
+          mkdir -p "${STAGE_DIR}"
+
+          REL_DIR="target/${TARGET}/release"
+          cp "${REL_DIR}/arbiter${BIN_EXT}" "${STAGE_DIR}/arbiter${BIN_EXT}"
+          cp "${REL_DIR}/arbiter-master-bin${BIN_EXT}" "${STAGE_DIR}/arbiter-master${BIN_EXT}"
+          cp "${REL_DIR}/arbiter-agent-bin${BIN_EXT}" "${STAGE_DIR}/arbiter-agent${BIN_EXT}"
+          cp "${REL_DIR}/arbiter-executor-bin${BIN_EXT}" "${STAGE_DIR}/arbiter-executor${BIN_EXT}"
+          cp "${REL_DIR}/arbiter-cli${BIN_EXT}" "${STAGE_DIR}/arbiter-cli${BIN_EXT}"
+
+          chmod +x "${STAGE_DIR}/arbiter${BIN_EXT}" "${STAGE_DIR}/arbiter-master${BIN_EXT}" "${STAGE_DIR}/arbiter-agent${BIN_EXT}" "${STAGE_DIR}/arbiter-executor${BIN_EXT}" "${STAGE_DIR}/arbiter-cli${BIN_EXT}"
+
+          cp README.md ARCHITECTURE.md BENCHMARKS.md SECURITY.md LICENSE-APACHE LICENSE-MIT "${STAGE_DIR}/"
+
+          # Create .tar.gz bundle and standalone multicall binary
+          tar -C dist -czf "dist/${PKG_BASENAME}.tar.gz" "${PKG_BASENAME}"
+          cp "${REL_DIR}/arbiter${BIN_EXT}" "dist/arbiter-${OS_NAME}-${ARCH_NAME}${BIN_EXT}"
+          chmod +x "dist/arbiter-${OS_NAME}-${ARCH_NAME}${BIN_EXT}"
+
+          # Compute SHA-256 digests
+          (
+            cd dist
+            if command -v sha256sum >/dev/null 2>&1; then
+              sha256sum "${PKG_BASENAME}.tar.gz" > "${PKG_BASENAME}.tar.gz.sha256"
+              sha256sum "arbiter-${OS_NAME}-${ARCH_NAME}${BIN_EXT}" > "arbiter-${OS_NAME}-${ARCH_NAME}${BIN_EXT}.sha256"
+            else
+              shasum -a 256 "${PKG_BASENAME}.tar.gz" > "${PKG_BASENAME}.tar.gz.sha256"
+              shasum -a 256 "arbiter-${OS_NAME}-${ARCH_NAME}${BIN_EXT}" > "arbiter-${OS_NAME}-${ARCH_NAME}${BIN_EXT}.sha256"
+            fi
+          )
+          rm -rf "${STAGE_DIR}"
+
+      - name: Package OS+arch release archive and standalone multicall binary (Windows)
+        if: ${{ matrix.archive_ext == 'zip' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.version.outputs.tag }}"
+          OS_NAME="${{ matrix.os_name }}"
+          ARCH_NAME="${{ matrix.arch_name }}"
+          TARGET="${{ matrix.target }}"
+          BIN_EXT="${{ matrix.bin_ext }}"
+
+          PKG_BASENAME="arbiter-${TAG}-${OS_NAME}-${ARCH_NAME}"
+          STAGE_DIR="dist/${PKG_BASENAME}"
+          mkdir -p "${STAGE_DIR}"
+
+          REL_DIR="target/${TARGET}/release"
+          cp "${REL_DIR}/arbiter${BIN_EXT}" "${STAGE_DIR}/arbiter${BIN_EXT}"
+          cp "${REL_DIR}/arbiter-master-bin${BIN_EXT}" "${STAGE_DIR}/arbiter-master${BIN_EXT}"
+          cp "${REL_DIR}/arbiter-agent-bin${BIN_EXT}" "${STAGE_DIR}/arbiter-agent${BIN_EXT}"
+          cp "${REL_DIR}/arbiter-executor-bin${BIN_EXT}" "${STAGE_DIR}/arbiter-executor${BIN_EXT}"
+          cp "${REL_DIR}/arbiter-cli${BIN_EXT}" "${STAGE_DIR}/arbiter-cli${BIN_EXT}"
+          cp README.md ARCHITECTURE.md BENCHMARKS.md SECURITY.md LICENSE-APACHE LICENSE-MIT "${STAGE_DIR}/"
+
+          powershell -NoProfile -Command "Compress-Archive -Path 'dist/${PKG_BASENAME}' -DestinationPath 'dist/${PKG_BASENAME}.zip' -Force"
+          cp "${REL_DIR}/arbiter${BIN_EXT}" "dist/arbiter-${OS_NAME}-${ARCH_NAME}${BIN_EXT}"
+
+          (
+            cd dist
+            sha256sum "${PKG_BASENAME}.zip" > "${PKG_BASENAME}.zip.sha256"
+            sha256sum "arbiter-${OS_NAME}-${ARCH_NAME}${BIN_EXT}" > "arbiter-${OS_NAME}-${ARCH_NAME}${BIN_EXT}.sha256"
+          )
+          rm -rf "${STAGE_DIR}"
+
+      - name: Upload OS+arch release artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.os_name }}-${{ matrix.arch_name }}
+          path: dist/*
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # Stage 3: Publish GitHub Release on `v*` Tag Push
+  # ---------------------------------------------------------------------------
+  publish-github-release:
+    name: "Publish GitHub Release"
+    needs: build-release-binaries
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download all OS+arch artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release-assets
+          merge-multiple: true
+
+      - name: Generate consolidated SHA256SUMS.txt
+        run: |
+          cd release-assets
+          cat *.sha256 | sort -k2 > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Publish GitHub Release with OS+arch binaries
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Arbiter ${{ github.ref_name }}"
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release-assets/*.tar.gz
+            release-assets/*.zip
+            release-assets/arbiter-*
+            release-assets/*.sha256
+            release-assets/SHA256SUMS.txt

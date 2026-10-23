@@ -169,6 +169,7 @@ Instead of running dedicated external `etcd` or Consul clusters plus per-service
 
 ```text
 arbiter-rs/
+├── .github/workflows/      # Pre-commit CI quality gates (pre-commit.yml) & OS+arch binary releases (release.yml)
 ├── ARCHITECTURE.md         # System design, 3-tier fencing & wire-protocol mechanics
 ├── BENCHMARKS.md           # Multicluster & 3/5/7/N-node failover wire-traffic benchmark results
 ├── SECURITY.md             # Zero-trust SPIFFE mTLS, RBAC/ABAC, AEAD secrets & safety invariants

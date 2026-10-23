@@ -873,6 +873,10 @@ pub enum TaskState {
     Failed,
     /// Terminal state: task was terminated via preemption, fencing, or kill command.
     Killed,
+    /// Terminal state: task specification contained malformed parameters (`TASK_ERROR`).
+    Error,
+    /// Terminal state: task launch or status message was dropped in transit during a partition (`TASK_DROPPED`).
+    Dropped,
     /// Terminal state: hosting Agent lost contact beyond lease TTL and was fenced.
     Lost,
     /// Terminal state: hosting Agent was permanently decommissioned during a partition (`TASK_GONE`).
@@ -903,6 +907,8 @@ impl TaskState {
             Self::Finished => "Finished",
             Self::Failed => "Failed",
             Self::Killed => "Killed",
+            Self::Error => "Error",
+            Self::Dropped => "Dropped",
             Self::Lost => "Lost",
             Self::Gone => "Gone",
             Self::GoneByOperator => "GoneByOperator",
@@ -910,7 +916,7 @@ impl TaskState {
         }
     }
 
-    /// Returns `true` if this state is a terminal lifecycle state (`Finished`, `Failed`, `Killed`, `Lost`, `Gone`, `GoneByOperator`, `Unknown`).
+    /// Returns `true` if this state is a terminal lifecycle state (`Finished`, `Failed`, `Killed`, `Error`, `Dropped`, `Lost`, `Gone`, `GoneByOperator`, `Unknown`).
     ///
     /// # Returns
     ///
@@ -921,6 +927,8 @@ impl TaskState {
             Self::Finished
                 | Self::Failed
                 | Self::Killed
+                | Self::Error
+                | Self::Dropped
                 | Self::Lost
                 | Self::Gone
                 | Self::GoneByOperator
@@ -949,11 +957,13 @@ impl TaskState {
                 to_state: next.as_str().to_owned(),
             });
         }
-        // Any non-terminal state can transition to Failed, Killed, Lost, Killing, Unreachable, Gone, or GoneByOperator
+        // Any non-terminal state can transition to Failed, Killed, Error, Dropped, Lost, Killing, Unreachable, Gone, or GoneByOperator
         if matches!(
             next,
             Self::Failed
                 | Self::Killed
+                | Self::Error
+                | Self::Dropped
                 | Self::Lost
                 | Self::Killing
                 | Self::Unreachable
@@ -1636,6 +1646,7 @@ pub struct ResourceRequest {
 /// Master leader metadata returned to subscribed Frameworks and Operators.
 #[derive(
     Debug,
+    Default,
     Clone,
     PartialEq,
     Eq,
@@ -2084,6 +2095,8 @@ mod tests {
             TaskState::Finished,
             TaskState::Failed,
             TaskState::Killed,
+            TaskState::Error,
+            TaskState::Dropped,
             TaskState::Lost,
             TaskState::Gone,
             TaskState::GoneByOperator,
@@ -2176,23 +2189,27 @@ mod tests {
             TaskState::Unreachable,
         ] {
             assert!(!non_term.is_terminal());
-            assert!(non_term.validate_transition(TaskState::Failed).is_ok());
-            assert!(non_term.validate_transition(TaskState::Killed).is_ok());
-            assert!(non_term.validate_transition(TaskState::Lost).is_ok());
-            assert!(non_term.validate_transition(TaskState::Killing).is_ok());
-            assert!(non_term.validate_transition(TaskState::Unreachable).is_ok());
-            assert!(non_term.validate_transition(TaskState::Gone).is_ok());
-            assert!(
-                non_term
-                    .validate_transition(TaskState::GoneByOperator)
-                    .is_ok()
-            );
+            for target in [
+                TaskState::Failed,
+                TaskState::Killed,
+                TaskState::Error,
+                TaskState::Dropped,
+                TaskState::Lost,
+                TaskState::Killing,
+                TaskState::Unreachable,
+                TaskState::Gone,
+                TaskState::GoneByOperator,
+            ] {
+                assert!(non_term.validate_transition(target).is_ok());
+            }
         }
 
         for term in [
             TaskState::Finished,
             TaskState::Failed,
             TaskState::Killed,
+            TaskState::Error,
+            TaskState::Dropped,
             TaskState::Lost,
             TaskState::Gone,
             TaskState::GoneByOperator,

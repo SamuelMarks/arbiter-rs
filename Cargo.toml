@@ -45,6 +45,7 @@ arbiter-telemetry = { path = "crates/arbiter-telemetry", version = "0.1.0" }
 arbiter-master = { path = "crates/arbiter-master", version = "0.1.0" }
 arbiter-agent = { path = "crates/arbiter-agent", version = "0.1.0" }
 arbiter-executor = { path = "crates/arbiter-executor", version = "0.1.0" }
+arbiter-tui = { path = "crates/arbiter-tui", version = "0.1.0" }
 arbiter-master-bin = { path = "bins/arbiter-master", version = "0.1.0" }
 arbiter-agent-bin = { path = "bins/arbiter-agent", version = "0.1.0" }
 arbiter-executor-bin = { path = "bins/arbiter-executor", version = "0.1.0" }
@@ -54,8 +55,42 @@ derive_more = { version = "2.1", default-features = false, features = ["std", "d
 serde = { version = "1.0", default-features = false, features = ["std", "derive"] }
 serde_json = { version = "1.0", default-features = false, features = ["std"] }
 rkyv = { version = "0.8", default-features = false, features = ["std", "bytecheck"] }
-sha2 = { version = "0.11", default-features = false }
-proptest = { version = "~1.11", default-features = false, features = ["std"] }
+sha2 = { version = "0.10", default-features = false }
+proptest = { version = "1.11", default-features = false, features = ["std"] }
+
+rustls = { version = "0.23", default-features = false, features = ["std", "ring", "tls12"] }
+rustls-pki-types = { version = "1.15", default-features = false, features = ["std"] }
+quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+http = { version = "1.5", default-features = false, features = ["std"] }
+http-body-util = { version = "0.1", default-features = false }
+h2 = { version = "0.4", default-features = false }
+hmac = { version = "0.12", default-features = false }
+base16ct = { version = "0.2", default-features = false, features = ["alloc"] }
+base64 = { version = "0.22", default-features = false, features = ["alloc", "std"] }
+tokio = { version = "1.44", default-features = false, features = ["rt-multi-thread", "net", "io-util", "sync", "time", "process", "signal", "fs", "macros"] }
+tokio-tungstenite = { version = "0.30", default-features = false }
+prost = { version = "0.14", default-features = false, features = ["std", "derive"] }
+prost-types = { version = "0.14", default-features = false, features = ["std"] }
+tonic = { version = "0.14", default-features = false }
+ed25519-dalek = { version = "2.2", default-features = false, features = ["alloc"] }
+p256 = { version = "0.13", default-features = false, features = ["ecdsa"] }
+rcgen = { version = "0.14", default-features = false, features = ["crypto", "ring", "pem"] }
+x509-cert = { version = "0.2", default-features = false, features = ["std"] }
+der = { version = "0.7", default-features = false, features = ["std"] }
+ring = { version = "0.17", default-features = false, features = ["alloc", "std"] }
+crc32fast = { version = "1.5", default-features = false, features = ["std"] }
+tokio-postgres = { version = "0.7", default-features = false, features = ["runtime"] }
+flate2 = { version = "1.1", default-features = false, features = ["rust_backend"] }
+zstd = { version = "0.13", default-features = false }
+tar = { version = "0.4", default-features = false }
+zip = { version = "7.3", default-features = false, features = ["deflate"] }
+lzma-rs = { version = "0.3", default-features = false }
+chacha20poly1305 = { version = "0.10", default-features = false, features = ["alloc", "std"] }
+rusqlite = { version = "0.32", default-features = false, features = ["bundled"] }
+ratatui = { version = "0.29", default-features = false, features = ["crossterm"] }
+crossterm = { version = "0.28", default-features = false }
+libloading = { version = "0.8", default-features = false }
+nix = { version = "0.31", default-features = false, features = ["term", "signal", "resource", "fs", "process"] }
 
 [workspace.lints.rust]
 missing_docs = "forbid"

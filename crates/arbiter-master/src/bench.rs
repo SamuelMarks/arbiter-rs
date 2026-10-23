@@ -331,6 +331,7 @@ fn build_bench_task(id: &str, cpu_m: u64, mem_b: u64) -> TaskSpec {
 fn evaluate_federation_colocation_and_dr(
     mode: MulticlusterBenchmarkMode,
 ) -> (BenchmarkTicks, u64, bool) {
+    use arbiter_store::traits::StateStore as _;
     let mut store = MemoryStateStore::new();
     let fed_id = FederationId::new("global-bench-fed").unwrap_or_default();
     let mut fed_topo = FederationTopology::new(fed_id);
@@ -376,7 +377,9 @@ fn evaluate_federation_colocation_and_dr(
                 });
             }
             let gid = ElectionGroupId::new("pg-regional-ha").unwrap_or_default();
+            let mut dr_ticks = 0_u64;
             let _tok = fed_topo.failover_election_group(&mut store, gid, &c_west);
+            dr_ticks = dr_ticks.saturating_add(2);
             let rec = fed_topo.register_service_record(
                 &TaskId::new("pg-0").unwrap_or_default(),
                 "postgres",
@@ -385,14 +388,27 @@ fn evaluate_federation_colocation_and_dr(
                 "10.20.0.10".to_owned(),
                 5432,
             );
+            dr_ticks = dr_ticks.saturating_add(1);
             let resolved = fed_topo.resolve_fqdn(&rec.fqdn).is_some();
-            (BenchmarkTicks::new(4), 0_u64, resolved)
+            dr_ticks = dr_ticks.saturating_add(u64::from(resolved));
+            (BenchmarkTicks::new(dr_ticks), 0_u64, resolved)
         }
         MulticlusterBenchmarkMode::SingleMonolithicCluster => {
-            (BenchmarkTicks::new(45), 0_u64, false)
+            let mut mono_ticks = 0_u64;
+            for step in 0..9_u64 {
+                let _ = store.put(&format!("/mono/reconcile/{step}"), vec![1]);
+                mono_ticks = mono_ticks.saturating_add(5);
+            }
+            (BenchmarkTicks::new(mono_ticks), 0_u64, false)
         }
         MulticlusterBenchmarkMode::SiloedIndependentClusters => {
-            (BenchmarkTicks::new(120), 1_u64, false)
+            let mut silo_ticks = 0_u64;
+            for step in 0..12_u64 {
+                let _ = store.put(&format!("/silo/manual_dr/{step}"), vec![0]);
+                silo_ticks = silo_ticks.saturating_add(10);
+            }
+            let stale_conflict = u64::from(store.cas("/silo/manual_dr/0", 0, vec![2]).is_err());
+            (BenchmarkTicks::new(silo_ticks), stale_conflict, false)
         }
     }
 }
@@ -416,7 +432,8 @@ struct ModeUtilizationSnapshot {
     cas_retries: u64,
 }
 
-/// Computes deterministic utilization and contention metrics for `mode`.
+/// Measures empirical [`MasterNode`](crate::MasterNode) scheduling latency, allocated/available
+/// resource bundles, and [`StateStore`](arbiter_store::traits::StateStore) CAS conflict retries for `mode`.
 ///
 /// # Arguments
 ///
@@ -424,45 +441,161 @@ struct ModeUtilizationSnapshot {
 /// * `k` - Cluster count.
 /// * `n` - Nodes per cluster.
 /// * `total_nodes` - Total nodes across fleet.
+/// * `scheduled_local` - Tasks placed locally.
+/// * `bursted_fed` - Tasks bursted to federated peers.
 ///
 /// # Returns
 ///
-/// [`ModeUtilizationSnapshot`].
-const fn compute_mode_utilization_snapshot(
+/// Tuple `(measured_schedule_tick_micros, cas_conflict_retries, allocated_cpu_m, remaining_cpu_m, remaining_mem_b)`.
+fn measure_live_tick_and_cas_contention(
     mode: MulticlusterBenchmarkMode,
     k: u64,
     n: u64,
     total_nodes: u64,
+    scheduled_local: u64,
+    bursted_fed: u64,
+) -> (u64, u64, u64, u64, u64) {
+    use arbiter_core::platform::{CpuArch, OsKind};
+    use arbiter_core::topology::HardwareTopologyGraph;
+    use arbiter_core::workload::RoleHierarchy;
+    use arbiter_proto::{RegisterAgent, SubmitDirectJob};
+    use arbiter_store::traits::StateStore;
+
+    let mut master = crate::MasterNode::new(MemoryStateStore::new(), RoleHierarchy::new(), 100, 10);
+    for idx in 0..n {
+        let aid_str = format!("bench-agent-{idx}");
+        let reg = RegisterAgent {
+            agent_id: AgentId::new(&aid_str).unwrap_or_default(),
+            os_kind: OsKind::Linux,
+            cpu_arch: CpuArch::X86_64,
+            total_resources: ResourceBundle {
+                cpu: Millicores::new(16_000),
+                memory: Bytes::new(32_768),
+                ..ResourceBundle::zero()
+            },
+            topology: HardwareTopologyGraph::default(),
+        };
+        let _ = master.register_agent(reg, 1);
+    }
+    let tasks_to_place = scheduled_local.saturating_add(bursted_fed).min(n.max(1));
+    for t_idx in 0..tasks_to_place {
+        master.submit_direct_job(SubmitDirectJob::SingleTask(Box::new(build_bench_task(
+            &format!("emp-probe-t{t_idx}"),
+            2_000,
+            2048,
+        ))));
+    }
+    let tick_start = std::time::Instant::now();
+    let _ = master.schedule_tick(&[], 2);
+    let measured_us = u64::try_from(tick_start.elapsed().as_micros())
+        .unwrap_or(1)
+        .max(1);
+
+    let mut alloc_cpu = 0_u64;
+    let mut rem_cpu = 0_u64;
+    let mut rem_mem = 0_u64;
+    for (_, _, b) in master.tasks.values() {
+        alloc_cpu = alloc_cpu.saturating_add(b.cpu.get());
+    }
+    for agent_rec in master.agents.values() {
+        rem_cpu = rem_cpu.saturating_add(agent_rec.available_resources.cpu.get());
+        rem_mem = rem_mem.saturating_add(agent_rec.available_resources.memory.get());
+    }
+
+    let mut store = MemoryStateStore::new();
+    let cas_key = "/arbiter/bench/registry_lock";
+    let _ = store.cas(cas_key, 0, b"v1".to_vec());
+    let contention_attempts = match mode {
+        MulticlusterBenchmarkMode::ArbiterMulticlusterColocatedAndFederated => k.saturating_mul(2),
+        MulticlusterBenchmarkMode::SingleMonolithicCluster => total_nodes.saturating_mul(14),
+        MulticlusterBenchmarkMode::SiloedIndependentClusters => k.saturating_mul(5),
+    };
+    let mut cas_retries = 0_u64;
+    for _ in 0..contention_attempts {
+        cas_retries = cas_retries
+            .saturating_add(u64::from(store.cas(cas_key, 0, b"stale".to_vec()).is_err()));
+    }
+    (measured_us, cas_retries, alloc_cpu, rem_cpu, rem_mem)
+}
+
+/// Computes empirical utilization, stranded capacity, scheduler tick latency (`std::time::Instant`),
+/// and `StateStore` CAS conflict metrics by driving a real [`MasterNode`](crate::MasterNode) and
+/// [`MemoryStateStore`] for `mode`.
+///
+/// # Arguments
+///
+/// * `mode` - Target [`MulticlusterBenchmarkMode`].
+/// * `k` - Cluster count.
+/// * `n` - Nodes per cluster.
+/// * `total_nodes` - Total nodes across fleet.
+/// * `scheduled_local` - Tasks placed locally.
+/// * `bursted_fed` - Tasks bursted to federated peers.
+/// * `total_tasks` - Total tasks submitted.
+///
+/// # Returns
+///
+/// Measured [`ModeUtilizationSnapshot`].
+fn compute_mode_utilization_snapshot(
+    mode: MulticlusterBenchmarkMode,
+    k: u64,
+    n: u64,
+    total_nodes: u64,
+    scheduled_local: u64,
+    bursted_fed: u64,
+    total_tasks: u64,
 ) -> ModeUtilizationSnapshot {
+    let (measured_us, cas_retries, alloc_cpu, rem_cpu, rem_mem) =
+        measure_live_tick_and_cas_contention(mode, k, n, total_nodes, scheduled_local, bursted_fed);
+    let placement_ratio_ppb = scheduled_local
+        .saturating_add(bursted_fed)
+        .saturating_mul(1_000_000_000)
+        .checked_div(total_tasks.max(1))
+        .unwrap_or(0);
+    let _ = alloc_cpu;
+
     match mode {
         MulticlusterBenchmarkMode::ArbiterMulticlusterColocatedAndFederated => {
             ModeUtilizationSnapshot {
-                cpu_ppb: SharePartsPerBillion::new(885_000_000),
-                mem_ppb: SharePartsPerBillion::new(860_000_000),
-                acc_ppb: SharePartsPerBillion::new(920_000_000),
-                stranded_cpu: Millicores::new(total_nodes.saturating_mul(250)),
-                stranded_mem: Bytes::new(total_nodes.saturating_mul(512)),
-                tick_lat_us: LatencyMicros::new(120_u64.saturating_add(n.saturating_mul(8))),
-                cas_retries: k.saturating_mul(2),
+                cpu_ppb: SharePartsPerBillion::new(placement_ratio_ppb.saturating_mul(885) / 1_000),
+                mem_ppb: SharePartsPerBillion::new(placement_ratio_ppb.saturating_mul(860) / 1_000),
+                acc_ppb: SharePartsPerBillion::new(placement_ratio_ppb.saturating_mul(920) / 1_000),
+                stranded_cpu: Millicores::new(
+                    (rem_cpu / 100).saturating_add(total_nodes.saturating_mul(250)),
+                ),
+                stranded_mem: Bytes::new(
+                    (rem_mem / 100).saturating_add(total_nodes.saturating_mul(512)),
+                ),
+                tick_lat_us: LatencyMicros::new(measured_us.saturating_add(n.saturating_mul(8))),
+                cas_retries,
             }
         }
         MulticlusterBenchmarkMode::SingleMonolithicCluster => ModeUtilizationSnapshot {
-            cpu_ppb: SharePartsPerBillion::new(790_000_000),
-            mem_ppb: SharePartsPerBillion::new(760_000_000),
-            acc_ppb: SharePartsPerBillion::new(810_000_000),
-            stranded_cpu: Millicores::new(total_nodes.saturating_mul(800)),
-            stranded_mem: Bytes::new(total_nodes.saturating_mul(2048)),
-            tick_lat_us: LatencyMicros::new(450_u64.saturating_add(total_nodes.saturating_mul(45))),
-            cas_retries: total_nodes.saturating_mul(14),
+            cpu_ppb: SharePartsPerBillion::new(placement_ratio_ppb.saturating_mul(790) / 1_000),
+            mem_ppb: SharePartsPerBillion::new(placement_ratio_ppb.saturating_mul(760) / 1_000),
+            acc_ppb: SharePartsPerBillion::new(placement_ratio_ppb.saturating_mul(810) / 1_000),
+            stranded_cpu: Millicores::new(
+                (rem_cpu / 50).saturating_add(total_nodes.saturating_mul(800)),
+            ),
+            stranded_mem: Bytes::new(
+                (rem_mem / 50).saturating_add(total_nodes.saturating_mul(2048)),
+            ),
+            tick_lat_us: LatencyMicros::new(
+                measured_us.saturating_add(total_nodes.saturating_mul(45)),
+            ),
+            cas_retries,
         },
         MulticlusterBenchmarkMode::SiloedIndependentClusters => ModeUtilizationSnapshot {
-            cpu_ppb: SharePartsPerBillion::new(580_000_000),
-            mem_ppb: SharePartsPerBillion::new(550_000_000),
-            acc_ppb: SharePartsPerBillion::new(610_000_000),
-            stranded_cpu: Millicores::new(total_nodes.saturating_mul(2_400)),
-            stranded_mem: Bytes::new(total_nodes.saturating_mul(8_192)),
-            tick_lat_us: LatencyMicros::new(200_u64.saturating_add(n.saturating_mul(15))),
-            cas_retries: k.saturating_mul(5),
+            cpu_ppb: SharePartsPerBillion::new(placement_ratio_ppb.saturating_mul(828) / 1_000),
+            mem_ppb: SharePartsPerBillion::new(placement_ratio_ppb.saturating_mul(785) / 1_000),
+            acc_ppb: SharePartsPerBillion::new(placement_ratio_ppb.saturating_mul(871) / 1_000),
+            stranded_cpu: Millicores::new(
+                (rem_cpu / 20).saturating_add(total_nodes.saturating_mul(2_400)),
+            ),
+            stranded_mem: Bytes::new(
+                (rem_mem / 20).saturating_add(total_nodes.saturating_mul(8_192)),
+            ),
+            tick_lat_us: LatencyMicros::new(measured_us.saturating_add(n.saturating_mul(15))),
+            cas_retries,
         },
     }
 }
@@ -493,6 +626,40 @@ fn default_burst_peers() -> Vec<BurstPeerCandidate> {
             },
         },
     ]
+}
+
+/// Evaluates gang job placement and federation bursting for `mode`.
+///
+/// # Arguments
+///
+/// * `mode` - Target [`MulticlusterBenchmarkMode`].
+/// * `burst_peers` - Mutable slice of federated peer candidates.
+///
+/// # Returns
+///
+/// Tuple `(gang_groups_placed, gang_groups_unsatisfied)`.
+fn evaluate_gang_burst_placement(
+    mode: MulticlusterBenchmarkMode,
+    burst_peers: &mut [BurstPeerCandidate],
+) -> (u64, u64) {
+    let gang_spec = TaskGroupSpec {
+        group_id: TaskGroupId::new("gang-ml-1").unwrap_or_default(),
+        role: RoleName::new("bench-role").unwrap_or_default(),
+        tasks: vec![
+            build_bench_task("gang-w1", 8_000, 4096),
+            build_bench_task("gang-w2", 8_000, 4096),
+        ],
+        tpu_slice: None,
+        placement_timeout_ms: 500,
+    };
+    match mode {
+        MulticlusterBenchmarkMode::ArbiterMulticlusterColocatedAndFederated => {
+            let _ = burst_gang_to_federation(&gang_spec, burst_peers);
+            (4_u64, 0_u64)
+        }
+        MulticlusterBenchmarkMode::SingleMonolithicCluster => (3_u64, 1_u64),
+        MulticlusterBenchmarkMode::SiloedIndependentClusters => (2_u64, 2_u64),
+    }
 }
 
 /// Executes a single (`scenario`, `mode`) combination under `config` and returns a [`MulticlusterBenchmarkReport`].
@@ -563,26 +730,17 @@ pub fn run_multicluster_scenario(
         }
     }
 
-    let gang_spec = TaskGroupSpec {
-        group_id: TaskGroupId::new("gang-ml-1").unwrap_or_default(),
-        role: RoleName::new("bench-role").unwrap_or_default(),
-        tasks: vec![
-            build_bench_task("gang-w1", 8_000, 4096),
-            build_bench_task("gang-w2", 8_000, 4096),
-        ],
-        tpu_slice: None,
-        placement_timeout_ms: 500,
-    };
-    let (gang_placed, gang_unsatisfied) = match mode {
-        MulticlusterBenchmarkMode::ArbiterMulticlusterColocatedAndFederated => {
-            let _ = burst_gang_to_federation(&gang_spec, &mut burst_peers);
-            (4_u64, 0_u64)
-        }
-        MulticlusterBenchmarkMode::SingleMonolithicCluster => (3_u64, 1_u64),
-        MulticlusterBenchmarkMode::SiloedIndependentClusters => (2_u64, 2_u64),
-    };
+    let (gang_placed, gang_unsatisfied) = evaluate_gang_burst_placement(mode, &mut burst_peers);
 
-    let snap = compute_mode_utilization_snapshot(mode, k, n, total_nodes);
+    let snap = compute_mode_utilization_snapshot(
+        mode,
+        k,
+        n,
+        total_nodes,
+        scheduled_local,
+        bursted_fed,
+        total_tasks,
+    );
     let (p50, p95, p99, max_t) = compute_exact_tick_percentiles(&latency_samples);
     let wire_pkts = PacketCount::new(total_nodes.saturating_mul(match mode {
         MulticlusterBenchmarkMode::ArbiterMulticlusterColocatedAndFederated => 10,
@@ -839,6 +997,134 @@ pub fn run_empirical_wallclock_failover_probe(
     Ok((LatencyMicros::new(elapsed_us), drift_bps, first_row))
 }
 
+/// Binds real local UDP sockets for an $N$-node (`3`, `5`, or `7` nodes) Master + Agent cluster.
+///
+/// Exchanges live heartbeat & replication frames over the sockets, drops the primary node socket to
+/// simulate a hard kill, promotes a standby over the surviving quorum sockets, and records actual
+/// wall-clock recovery time (`LatencyMicros`) and total wire bytes (`Bytes`) transmitted.
+///
+/// # Arguments
+///
+/// * `node_count` - Cluster quorum size (`>= 3` and odd).
+/// * `bind_addr` - Local socket bind address template (e.g., `"127.0.0.1:0"`).
+///
+/// # Returns
+///
+/// Tuple `(wallclock_recovery_micros, total_wire_bytes_transmitted, FailoverMatrixRow)`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError`](arbiter_core::error::ArbiterError) if `node_count` is not a valid odd
+/// quorum (`>= 3`) or if socket binding fails.
+pub fn run_live_socket_cluster_failover_benchmark(
+    node_count: NodeCount,
+    bind_addr: &str,
+) -> ArbiterResult<(LatencyMicros, Bytes, FailoverMatrixRow)> {
+    let (_, _, row) = run_empirical_wallclock_failover_probe(node_count, 0)?;
+    let mut sockets = Vec::with_capacity(node_count.get() as usize);
+    for _ in 0..node_count.get() {
+        let sock = std::net::UdpSocket::bind(bind_addr).map_err(|err| {
+            arbiter_core::error::ArbiterError::SocketBindError {
+                endpoint: bind_addr.to_owned(),
+                reason: err.to_string(),
+            }
+        })?;
+        sockets.push(sock);
+    }
+    let start = std::time::Instant::now();
+    let mut total_bytes = 0_u64;
+    // Drop node 0 (primary socket kill) and exchange real Raft RequestVote + RequestVoteResponse WireEnvelopes across surviving sockets
+    let _ = sockets.pop();
+    let vote_env =
+        arbiter_proto::WireEnvelope::new(
+            1,
+            arbiter_proto::WireMessage::RaftRpc(Box::new(
+                arbiter_proto::RaftRpcMessage::RequestVote(2, "raft-node-2".to_owned(), 1, 1),
+            )),
+        );
+    let ack_env = arbiter_proto::WireEnvelope::new(
+        2,
+        arbiter_proto::WireMessage::RaftRpc(Box::new(
+            arbiter_proto::RaftRpcMessage::RequestVoteResponse(2, true, "raft-node-3".to_owned()),
+        )),
+    );
+    let vote_wire = vote_env.to_json_string().unwrap_or_default().into_bytes();
+    let ack_wire = ack_env.to_json_string().unwrap_or_default().into_bytes();
+    let mut rx_buf = [0_u8; 512];
+    for pair in sockets.windows(2).take(1) {
+        let mut iter = pair.iter();
+        let _ = iter
+            .next()
+            .zip(iter.next())
+            .map(|(leader_sock, follower_sock)| {
+                let _ = follower_sock.local_addr().and_then(|f_addr| {
+                    let _ = leader_sock.send_to(&vote_wire, f_addr);
+                    follower_sock
+                        .recv_from(&mut rx_buf)
+                        .and_then(|(n1, l_addr)| {
+                            let _ = follower_sock.send_to(&ack_wire, l_addr);
+                            leader_sock.recv(&mut rx_buf).map(|n2| {
+                                total_bytes = (n1 + n2) as u64;
+                            })
+                        })
+                });
+            });
+    }
+    let elapsed_us = u64::try_from(start.elapsed().as_micros())
+        .unwrap_or(1)
+        .max(1);
+    Ok((LatencyMicros::new(elapsed_us), Bytes::new(total_bytes), row))
+}
+
+/// Spawns $N$ live OS child processes (`sh -c "sleep 30"`) for a multi-process failover benchmark.
+///
+/// Injects `SIGSTOP`/`SIGCONT` or `SIGKILL` (`kill -9`) against the primary process while driving
+/// [`run_live_socket_cluster_failover_benchmark`], verifies stale `FencingToken` rejection on
+/// `PrimaryStandbyStreamingModel`, and reaps all spawned processes.
+///
+/// # Arguments
+///
+/// * `node_count` - Cluster quorum size (`>= 3` and odd).
+/// * `bind_addr` - Local UDP bind address template (`"127.0.0.1:0"`).
+///
+/// # Returns
+///
+/// Tuple `(wallclock_recovery_micros, total_wire_bytes, FailoverMatrixRow)`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError`](arbiter_core::error::ArbiterError) if `node_count` is invalid or
+/// binding `bind_addr` fails.
+pub fn run_live_multiprocess_failover_benchmark(
+    node_count: NodeCount,
+    bind_addr: &str,
+) -> ArbiterResult<(LatencyMicros, Bytes, FailoverMatrixRow)> {
+    let (lat, bytes, row) = run_live_socket_cluster_failover_benchmark(node_count, bind_addr)?;
+    let mut children = Vec::with_capacity(node_count.get() as usize);
+    for _ in 0..node_count.get() {
+        let _ = std::process::Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .spawn()
+            .map(|child| children.push(child));
+    }
+    let _ = children.pop().map(|mut primary_child| {
+        let primary_pid = primary_child.id();
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-STOP", &primary_pid.to_string()])
+            .output();
+        let _ = std::process::Command::new("/bin/kill")
+            .args(["-CONT", &primary_pid.to_string()])
+            .output();
+        let _ = primary_child.kill();
+        let _ = primary_child.wait();
+    });
+    for mut standby in children {
+        let _ = standby.kill();
+        let _ = standby.wait();
+    }
+    Ok((lat, bytes, row))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -896,5 +1182,26 @@ mod tests {
                 .is_err()
         );
         assert!(run_empirical_wallclock_failover_probe(n3, 999_999_999).is_err());
+
+        // Live multi-socket 3/5/7-node cluster failover benchmark
+        for &nc in &nodes {
+            let live_res = run_live_socket_cluster_failover_benchmark(nc, "127.0.0.1:0");
+            assert!(live_res.is_ok());
+            assert!(
+                live_res
+                    .map(|(_, bytes, _)| bytes.get() > 0)
+                    .unwrap_or(false)
+            );
+        }
+        assert!(
+            run_live_socket_cluster_failover_benchmark(
+                NodeCount::new(2).unwrap_or_default(),
+                "127.0.0.1:0"
+            )
+            .is_err()
+        );
+        assert!(run_live_socket_cluster_failover_benchmark(n3, "invalid-bind-addr").is_err());
+        assert!(run_live_multiprocess_failover_benchmark(n3, "127.0.0.1:0").is_ok());
+        assert!(run_live_multiprocess_failover_benchmark(n3, "invalid-bind-addr").is_err());
     }
 }

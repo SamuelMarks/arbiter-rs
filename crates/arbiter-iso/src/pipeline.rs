@@ -493,6 +493,9 @@ pub struct CniPluginIsolator {
     pub subnet_cidr: String,
     /// Assigned container interface name (e.g., `"eth0"`).
     pub ifname: String,
+    /// Active CNI attachments keyed by [`TaskId`] storing `(pid, assigned_ip)`.
+    #[serde(default)]
+    pub active_attachments: std::collections::BTreeMap<TaskId, (u32, String)>,
 }
 
 impl CniPluginIsolator {
@@ -527,6 +530,44 @@ impl CniPluginIsolator {
         );
         (env, cfg_json)
     }
+
+    /// Executes a CNI plugin operation (`ADD`, `CHECK`, or `DEL`) by passing the CNI environment
+    /// variables and JSON configuration stdin to `runner`, returning the parsed IPv4 address.
+    ///
+    /// # Arguments
+    ///
+    /// * `cmd` - [`CniCommand`] (`Add`, `Del`, or `Check`).
+    /// * `task_id` - Container [`TaskId`].
+    /// * `pid` - Container OS PID.
+    /// * `runner` - Injected CNI plugin execution closure `FnMut(&[(String, String)], &str) -> ArbiterResult<String>`.
+    ///
+    /// # Returns
+    ///
+    /// Assigned container IPv4/IPv6 address returned by the CNI plugin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CniPlugin`](arbiter_core::error::ArbiterError::CniPlugin) if the CNI plugin execution fails.
+    pub fn execute_cni_command_with_runner<F>(
+        &mut self,
+        cmd: CniCommand,
+        task_id: &TaskId,
+        pid: u32,
+        mut runner: F,
+    ) -> ArbiterResult<String>
+    where
+        F: FnMut(&[(String, String)], &str) -> ArbiterResult<String>,
+    {
+        let (env, cfg_json) = self.format_cni_invocation(cmd, task_id, pid);
+        let output = runner(&env, &cfg_json)?;
+        if cmd == CniCommand::Add {
+            self.active_attachments
+                .insert(task_id.clone(), (pid, output.clone()));
+        } else if cmd == CniCommand::Del {
+            self.active_attachments.remove(task_id);
+        }
+        Ok(output)
+    }
 }
 
 impl Isolator for CniPluginIsolator {
@@ -554,7 +595,26 @@ impl Isolator for CniPluginIsolator {
     }
 
     fn isolate(&mut self, task_id: &TaskId, pid: u32) -> ArbiterResult<()> {
+        if pid == 0 {
+            return Err(arbiter_core::error::ArbiterError::from(
+                arbiter_core::error::CniPluginError::new(
+                    &self.plugin_bin,
+                    task_id.as_str(),
+                    "CNI netns isolate requires non-zero PID",
+                ),
+            ));
+        }
+        let (_, _) = self.format_cni_invocation(CniCommand::Add, task_id, pid);
         let (_, _) = self.format_cni_invocation(CniCommand::Check, task_id, pid);
+        let prefix = self
+            .subnet_cidr
+            .split('/')
+            .next()
+            .unwrap_or("10.42.0.0")
+            .trim_end_matches(".0");
+        let assigned_ip = format!("{prefix}.2");
+        self.active_attachments
+            .insert(task_id.clone(), (pid, assigned_ip));
         Ok(())
     }
 
@@ -578,7 +638,139 @@ impl Isolator for CniPluginIsolator {
     }
 
     fn cleanup(&mut self, task_id: &TaskId) -> ArbiterResult<()> {
-        let (_, _) = self.format_cni_invocation(CniCommand::Del, task_id, 0);
+        let removed = self.active_attachments.remove(task_id);
+        let pid = match removed {
+            Some((p, _)) => p,
+            None => 0,
+        };
+        let (_, _) = self.format_cni_invocation(CniCommand::Del, task_id, pid);
+        Ok(())
+    }
+}
+
+/// Mesos `network/port_mapping` isolator (`PortMappingIsolator`).
+///
+/// Configures host-to-container DNAT/SNAT port forwarding (`nftables` / `pfctl`) and
+/// eBPF Earliest Departure Time (`EDT`) / `tc qdisc fq` egress bandwidth shaping.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PortMappingIsolator {
+    /// Host-to-container `(host_port, container_port)` mappings.
+    pub port_mappings: Vec<(u16, u16)>,
+    /// Container IPv4 address target for DNAT rules.
+    pub container_ip: String,
+    /// Recorded `nftables` / `pfctl` / `tc` EDT commands executed across lifecycle stages.
+    #[serde(default)]
+    pub applied_rules: Vec<String>,
+}
+
+impl PortMappingIsolator {
+    /// Creates a new [`PortMappingIsolator`].
+    ///
+    /// # Arguments
+    ///
+    /// * `container_ip` - Assigned container IPv4 address.
+    /// * `port_mappings` - Vector of `(host_port, container_port)` pairs.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`PortMappingIsolator`].
+    pub fn new(container_ip: &str, port_mappings: Vec<(u16, u16)>) -> Self {
+        Self {
+            port_mappings,
+            container_ip: container_ip.to_owned(),
+            applied_rules: Vec::new(),
+        }
+    }
+
+    /// Formats `nftables` DNAT (`prerouting`) and eBPF EDT / `tc qdisc fq` egress shaping rules.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task identifier.
+    /// * `egress_bps` - Egress bandwidth cap in bits per second.
+    ///
+    /// # Returns
+    ///
+    /// Vector of formatted `nft` and `tc` commands.
+    pub fn format_dnat_and_edt_commands(&self, task_id: &TaskId, egress_bps: u64) -> Vec<String> {
+        let mut cmds = Vec::with_capacity(self.port_mappings.len().saturating_add(1));
+        for &(host_port, container_port) in &self.port_mappings {
+            cmds.push(format!(
+                "nft add rule ip arbiter_nat prerouting tcp dport {host_port} dnat to {}:{container_port}",
+                self.container_ip
+            ));
+        }
+        let maxrate = egress_bps.max(1_000_000);
+        cmds.push(format!(
+            "tc qdisc replace dev veth_{task_id} root fq maxrate {maxrate}bit"
+        ));
+        cmds
+    }
+}
+
+impl Isolator for PortMappingIsolator {
+    fn name(&self) -> &'static str {
+        "network/port_mapping"
+    }
+
+    fn prepare(
+        &mut self,
+        task_id: &TaskId,
+        limits: &ResourceBundle,
+    ) -> ArbiterResult<SandboxPreparation> {
+        if self.container_ip.trim().is_empty() {
+            return Err(arbiter_core::error::ArbiterError::SandboxError {
+                mechanism: "network/port_mapping".to_owned(),
+                reason: "container_ip must not be empty".to_owned(),
+            });
+        }
+        let cmds = self.format_dnat_and_edt_commands(task_id, limits.network_bandwidth.get());
+        self.applied_rules.extend(cmds.clone());
+        Ok(SandboxPreparation {
+            device_mounts: Vec::new(),
+            injected_env: Vec::new(),
+            applied_commands: cmds,
+        })
+    }
+
+    fn isolate(&mut self, task_id: &TaskId, pid: u32) -> ArbiterResult<()> {
+        if pid == 0 {
+            return Err(arbiter_core::error::ArbiterError::SandboxError {
+                mechanism: "network/port_mapping".to_owned(),
+                reason: "pid must be non-zero".to_owned(),
+            });
+        }
+        self.applied_rules
+            .push(format!("ebpf_edt_attach:{task_id}:{pid}"));
+        Ok(())
+    }
+
+    fn update_limits(
+        &mut self,
+        task_id: &TaskId,
+        new_limits: &ResourceBundle,
+    ) -> ArbiterResult<()> {
+        let maxrate = new_limits.network_bandwidth.get().max(1_000_000);
+        self.applied_rules.push(format!(
+            "tc qdisc change dev veth_{task_id} root fq maxrate {maxrate}bit"
+        ));
+        Ok(())
+    }
+
+    fn usage(&self, task_id: &TaskId) -> ArbiterResult<IsolatorUsageReport> {
+        Ok(IsolatorUsageReport {
+            task_id: task_id.clone(),
+            consumed: ResourceBundle::zero(),
+        })
+    }
+
+    fn checkpoint(&mut self, _task_id: &TaskId, _checkpoint_dir: &str) -> ArbiterResult<()> {
+        Ok(())
+    }
+
+    fn cleanup(&mut self, task_id: &TaskId) -> ArbiterResult<()> {
+        self.applied_rules
+            .push(format!("nft flush chain ip arbiter_nat task_{task_id}"));
         Ok(())
     }
 }
@@ -767,15 +959,51 @@ mod tests {
             plugin_bin: "bridge".to_owned(),
             subnet_cidr: "10.42.0.0/16".to_owned(),
             ifname: "eth0".to_owned(),
+            active_attachments: std::collections::BTreeMap::new(),
         };
         assert_eq!(cni.name(), "network/cni");
         let prep = cni.prepare(&tid, &limits).unwrap_or_default();
         assert_eq!(prep.injected_env.len(), 5);
+        assert!(cni.isolate(&tid, 0).is_err());
         assert!(cni.isolate(&tid, 4242).is_ok());
+        assert!(cni.active_attachments.contains_key(&tid));
         assert!(cni.update_limits(&tid, &limits).is_ok());
         assert!(cni.usage(&tid).is_ok());
         assert!(cni.checkpoint(&tid, "/tmp").is_ok());
         assert!(cni.cleanup(&tid).is_ok());
+        assert!(cni.cleanup(&tid).is_ok());
+        assert!(!cni.active_attachments.contains_key(&tid));
+
+        let mut cni_runner = |env: &[(String, String)], _cfg: &str| -> ArbiterResult<String> {
+            let is_fail = env.iter().any(|(k, v)| k == "CNI_IFNAME" && v == "fail");
+            if is_fail {
+                Err(ArbiterError::SandboxError {
+                    mechanism: "cni".to_owned(),
+                    reason: "failed".to_owned(),
+                })
+            } else {
+                Ok("10.42.0.9".to_owned())
+            }
+        };
+        assert_eq!(
+            cni.execute_cni_command_with_runner(CniCommand::Add, &tid, 4242, &mut cni_runner),
+            Ok("10.42.0.9".to_owned())
+        );
+        assert!(cni.active_attachments.contains_key(&tid));
+        assert_eq!(
+            cni.execute_cni_command_with_runner(CniCommand::Del, &tid, 4242, &mut cni_runner),
+            Ok("10.42.0.9".to_owned())
+        );
+        assert!(!cni.active_attachments.contains_key(&tid));
+        assert_eq!(
+            cni.execute_cni_command_with_runner(CniCommand::Check, &tid, 4242, &mut cni_runner),
+            Ok("10.42.0.9".to_owned())
+        );
+        cni.ifname = "fail".to_owned();
+        assert!(
+            cni.execute_cni_command_with_runner(CniCommand::Check, &tid, 4242, &mut cni_runner)
+                .is_err()
+        );
 
         let mut bad_cni1 = cni.clone();
         bad_cni1.network_name = "  ".to_owned();
@@ -783,5 +1011,23 @@ mod tests {
         let mut bad_cni2 = cni;
         bad_cni2.plugin_bin = String::new();
         assert!(bad_cni2.prepare(&tid, &limits).is_err());
+    }
+
+    #[test]
+    fn test_port_mapping_isolator() {
+        let tid = TaskId::new("task-pmap-1").unwrap_or_default();
+        let limits = ResourceBundle::zero();
+        let mut pmap = PortMappingIsolator::new("10.42.0.2", vec![(8080, 80), (8443, 443)]);
+        assert_eq!(pmap.name(), "network/port_mapping");
+        assert!(pmap.prepare(&tid, &limits).is_ok());
+        assert!(pmap.isolate(&tid, 0).is_err());
+        assert!(pmap.isolate(&tid, 4242).is_ok());
+        assert!(pmap.update_limits(&tid, &limits).is_ok());
+        assert!(pmap.usage(&tid).is_ok());
+        assert!(pmap.checkpoint(&tid, "/tmp").is_ok());
+        assert!(pmap.cleanup(&tid).is_ok());
+        assert_eq!(pmap.applied_rules.len(), 6);
+        let mut bad_pmap = PortMappingIsolator::new("   ", Vec::new());
+        assert!(bad_pmap.prepare(&tid, &limits).is_err());
     }
 }

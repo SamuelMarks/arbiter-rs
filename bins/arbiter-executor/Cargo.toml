@@ -14,6 +14,9 @@ categories.workspace = true
 [dependencies]
 arbiter-core = { workspace = true }
 arbiter-executor = { workspace = true }
+arbiter-proto = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

@@ -471,33 +471,114 @@ impl LinuxSysfsProbe {
     }
 }
 
+/// Executes an OS probe binary with `args`, returning its UTF-8 stdout if the binary exists
+/// and succeeds, or an empty `String` otherwise.
+///
+/// # Arguments
+///
+/// * `program` - Executable path (e.g., `"/sbin/sysctl"` or `"/usr/bin/kstat"`).
+/// * `args` - Slice of command-line arguments.
+///
+/// # Returns
+///
+/// Captured stdout text, or an empty string if the command could not be spawned.
+pub fn run_host_probe_command(program: &str, args: &[&str]) -> String {
+    match std::process::Command::new(program).args(args).output() {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Err(_) => String::new(),
+    }
+}
+
 impl FreeBsdSysctlProbe {
-    /// Discovers FreeBSD `sysctl` CPU and NUMA domain topology from the host.
+    /// Discovers FreeBSD `sysctl` CPU and NUMA domain topology via an injectable command runner
+    /// (`runner("/sbin/sysctl", &["hw.ncpu", "vm.ndomains", "hw.physmem"])`).
+    ///
+    /// # Arguments
+    ///
+    /// * `runner` - Closure executing `/sbin/sysctl` and returning its stdout text.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`FreeBsdSysctlProbe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ProbeFailed`] if the command fails or returns empty output.
+    pub fn from_sysctl_runner<F>(mut runner: F) -> ArbiterResult<Self>
+    where
+        F: FnMut(&str, &[&str]) -> ArbiterResult<String>,
+    {
+        let sysctl_output = runner("/sbin/sysctl", &["hw.ncpu", "vm.ndomains", "hw.physmem"])?;
+        let probe = Self {
+            arch: CpuArch::current(),
+            sysctl_output,
+        };
+        let _ = probe.probe_system()?;
+        Ok(probe)
+    }
+
+    /// Discovers FreeBSD `sysctl` CPU and NUMA domain topology from the host via `/sbin/sysctl`
+    /// (falling back to a valid baseline descriptor on non-FreeBSD hosts).
     ///
     /// # Returns
     ///
     /// Host-discovered [`FreeBsdSysctlProbe`].
     pub fn from_host() -> Self {
-        Self {
-            arch: CpuArch::X86_64,
+        let fallback = Self {
+            arch: CpuArch::current(),
             sysctl_output: "hw.ncpu: 8\nvm.ndomains: 1\nhw.physmem: 17179869184\n".to_owned(),
-        }
+        };
+        Self::from_sysctl_runner(|cmd, args| Ok(run_host_probe_command(cmd, args)))
+            .unwrap_or(fallback)
     }
 }
 
 impl IllumosKstatProbe {
-    /// Discovers illumos `kstat` and `lgrp` locality group topology from the host.
+    /// Discovers illumos `kstat` and `lgrpinfo` locality group topology via an injectable command runner
+    /// (`runner("/usr/bin/kstat", &["-p", "cpu_info:0::clock_MHz", "unix:0:system_misc:ncpus", "unix:0:system_pages:physmem"])`).
+    ///
+    /// # Arguments
+    ///
+    /// * `runner` - Closure executing `/usr/bin/kstat` and returning its stdout text.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`IllumosKstatProbe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ProbeFailed`] if parsing fails or counts are zero.
+    pub fn from_kstat_runner<F>(mut runner: F) -> ArbiterResult<Self>
+    where
+        F: FnMut(&str, &[&str]) -> ArbiterResult<String>,
+    {
+        let kstat_out = runner(
+            "/usr/bin/kstat",
+            &[
+                "-p",
+                "cpu_info:0::clock_MHz",
+                "unix:0:system_misc:ncpus",
+                "unix:0:system_pages:physmem",
+            ],
+        )?;
+        let parsed = Self::from_kstat_text(&kstat_out)?;
+        let _ = parsed.probe_system()?;
+        Ok(parsed)
+    }
+
+    /// Discovers illumos `kstat` and `lgrp` locality group topology from the host via `/usr/bin/kstat`
+    /// (falling back to a valid baseline descriptor on non-illumos hosts).
     ///
     /// # Returns
     ///
     /// Host-discovered [`IllumosKstatProbe`].
     pub fn from_host() -> Self {
-        Self {
+        Self::from_kstat_runner(|cmd, args| Ok(run_host_probe_command(cmd, args))).unwrap_or(Self {
             cpu_count: 8,
             lgrp_count: 1,
             clock_mhz: 2800,
             physmem_bytes: 17_179_869_184,
-        }
+        })
     }
 
     /// Parses `kstat -p` and `lgrpinfo` output lines (`ncpus=<n>`, `lgrps=<n>`, `clock_MHz=<n>`, `physmem_bytes=<n>`).
@@ -539,6 +620,37 @@ impl IllumosKstatProbe {
 }
 
 impl WindowsProcessorInfoProbe {
+    /// Discovers Windows processor groups, P/E efficiency classes, and NUMA topology via an injectable
+    /// command runner (`runner("powershell", &["-NoProfile", "-Command", ...])`).
+    ///
+    /// # Arguments
+    ///
+    /// * `runner` - Closure executing the Windows CIM/processor query and returning formatted lines.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`WindowsProcessorInfoProbe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ProbeFailed`] if the runner or parser fails.
+    pub fn from_cim_runner<F>(mut runner: F) -> ArbiterResult<Self>
+    where
+        F: FnMut(&str, &[&str]) -> ArbiterResult<String>,
+    {
+        let cim_out = runner(
+            "powershell",
+            &[
+                "-NoProfile",
+                "-Command",
+                "Get-CimInstance Win32_Processor; Get-CimInstance Win32_ComputerSystem",
+            ],
+        )?;
+        let parsed = Self::from_cim_text(CpuArch::current(), &cim_out)?;
+        let _ = parsed.probe_system()?;
+        Ok(parsed)
+    }
+
     /// Discovers Windows processor groups, P/E efficiency classes, and NUMA topology from the host.
     ///
     /// # Returns
@@ -726,6 +838,19 @@ impl SystemProbe for HostSystemProbe {
     }
 }
 
+/// Discovers the CPU, NUMA, cache, and memory topology of the current running host (`OsKind::current()`).
+///
+/// # Returns
+///
+/// [`DiscoveredSystemTopology`] for the local host.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::ProbeFailed`] if the underlying OS probe fails.
+pub fn discover_host_cpu_topology() -> ArbiterResult<DiscoveredSystemTopology> {
+    HostSystemProbe::discover_live_host()
+}
+
 /// Parses a Linux `/sys/devices/system/node/node*/distance` ACPI SLIT distance row (`"10 21 31"`).
 ///
 /// # Arguments
@@ -789,7 +914,140 @@ pub fn parse_proc_cpuinfo_extensions(cpuinfo_text: &str) -> Vec<CpuInstructionEx
     if tokens.contains(&"sve") || tokens.contains(&"sve2") {
         out.push(CpuInstructionExtension::Sve);
     }
+    if tokens.contains(&"rvv") || tokens.contains(&"rvv1.0") {
+        out.push(CpuInstructionExtension::Rvv10);
+    }
     out
+}
+
+/// Scans a Linux `/sys/devices/system/node` directory to discover per-NUMA-node CPU lists
+/// (`node*/cpulist`) and total memory (`node*/meminfo`).
+///
+/// # Arguments
+///
+/// * `sysfs_node_dir` - Path to `/sys/devices/system/node` or a synthetic test directory.
+///
+/// # Returns
+///
+/// Sorted vector of `(numa_node_id, cpu_core_ids, total_ram_bytes)` tuples.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::ProbeFailed`] if `sysfs_node_dir` cannot be read or contains malformed `cpulist`.
+pub fn discover_linux_numa_sysfs_dir(
+    sysfs_node_dir: &std::path::Path,
+) -> ArbiterResult<Vec<(u32, Vec<u32>, u64)>> {
+    let entries = std::fs::read_dir(sysfs_node_dir).map_err(|e| ArbiterError::ProbeFailed {
+        probe_name: "LinuxSysfsProbe".to_owned(),
+        reason: e.to_string(),
+    })?;
+    let mut nodes = Vec::new();
+    for entry in entries.flatten() {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        let Some(id_str) = fname.strip_prefix("node") else {
+            continue;
+        };
+        let Ok(node_id) = id_str.parse::<u32>() else {
+            continue;
+        };
+        let node_path = entry.path();
+        let cpulist_raw = std::fs::read_to_string(node_path.join("cpulist")).unwrap_or_default();
+        let cpus = parse_linux_cpulist_range(&cpulist_raw)?;
+        let meminfo_raw = std::fs::read_to_string(node_path.join("meminfo")).unwrap_or_default();
+        let mut ram_bytes = 0_u64;
+        for line in meminfo_raw.lines() {
+            if let Some(idx) = line.find("MemTotal:") {
+                let after = line.get(idx + 9..).unwrap_or("");
+                ram_bytes = parse_first_u64(after, "LinuxSysfsProbe")?.saturating_mul(1024);
+            }
+        }
+        nodes.push((node_id, cpus, ram_bytes));
+    }
+    nodes.sort_by_key(|(id, _, _)| *id);
+    Ok(nodes)
+}
+
+/// Parses FreeBSD `sysctl kern.sched.topology_spec` XML (`<group level="2"...><cpus count="4"...>`)
+/// into `(numa_domain_count, total_cpu_count)`.
+///
+/// # Arguments
+///
+/// * `xml_text` - Raw `kern.sched.topology_spec` XML string.
+///
+/// # Returns
+///
+/// Tuple `(numa_domain_count, total_cpu_count)`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::ProbeFailed`] if no `<cpus count="...">` elements are present or a count is invalid.
+pub fn parse_freebsd_topology_spec_xml(xml_text: &str) -> ArbiterResult<(u32, u32)> {
+    let mut leaf_groups = 0_u32;
+    let mut total_cpus = 0_u32;
+    for line in xml_text.lines() {
+        let trimmed = line.trim();
+        if let Some(after) = trimmed.split("count=\"").nth(1) {
+            let num_str = after.split('"').next().unwrap_or("");
+            let c = num_str
+                .parse::<u32>()
+                .map_err(|_| ArbiterError::ProbeFailed {
+                    probe_name: "FreeBsdSysctlProbe::topology_spec".to_owned(),
+                    reason: format!("invalid CPU count '{num_str}' in topology_spec XML"),
+                })?;
+            leaf_groups = leaf_groups.saturating_add(1);
+            total_cpus = total_cpus.saturating_add(c);
+        }
+    }
+    if leaf_groups == 0 || total_cpus == 0 {
+        return Err(ArbiterError::ProbeFailed {
+            probe_name: "FreeBsdSysctlProbe::topology_spec".to_owned(),
+            reason: "no <cpus count=\"...\"> groups found in kern.sched.topology_spec".to_owned(),
+        });
+    }
+    Ok((leaf_groups, total_cpus))
+}
+
+/// Scans a Linux `/sys/kernel/mm/hugepages` directory (`hugepages-2048kB/nr_hugepages` and
+/// `hugepages-1048576kB/nr_hugepages`) to return `(hugepages_2mib_bytes, hugepages_1gib_bytes)`.
+///
+/// # Arguments
+///
+/// * `mm_hugepages_dir` - Path to `/sys/kernel/mm/hugepages` or a synthetic test directory.
+///
+/// # Returns
+///
+/// Tuple `(hugepages_2mib_bytes, hugepages_1gib_bytes)`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::ProbeFailed`] if `mm_hugepages_dir` cannot be read.
+pub fn discover_linux_mm_hugepages_dir(
+    mm_hugepages_dir: &std::path::Path,
+) -> ArbiterResult<(u64, u64)> {
+    let _ = std::fs::read_dir(mm_hugepages_dir).map_err(|e| ArbiterError::ProbeFailed {
+        probe_name: "LinuxSysfsProbe::hugepages".to_owned(),
+        reason: e.to_string(),
+    })?;
+    let pages_two_mib = std::fs::read_to_string(
+        mm_hugepages_dir
+            .join("hugepages-2048kB")
+            .join("nr_hugepages"),
+    )
+    .ok()
+    .and_then(|s| s.trim().parse::<u64>().ok())
+    .unwrap_or(0);
+    let pages_one_gib = std::fs::read_to_string(
+        mm_hugepages_dir
+            .join("hugepages-1048576kB")
+            .join("nr_hugepages"),
+    )
+    .ok()
+    .and_then(|s| s.trim().parse::<u64>().ok())
+    .unwrap_or(0);
+    Ok((
+        pages_two_mib.saturating_mul(2 * 1024 * 1024),
+        pages_one_gib.saturating_mul(1024 * 1024 * 1024),
+    ))
 }
 
 #[cfg(test)]
@@ -1015,16 +1273,70 @@ MemFree: 1024 kB
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn test_cpu_probes_from_host() {
         // Verify live from_host() constructors and HostSystemProbe across all 5 OS CPU probes
+        assert!(run_host_probe_command("echo", &["probe_ok"]).contains("probe_ok"));
+        assert!(run_host_probe_command("/dev/null/nonexistent_probe_bin", &[]).is_empty());
         assert!(LinuxSysfsProbe::from_host().probe_system().is_ok());
         assert!(FreeBsdSysctlProbe::from_host().probe_system().is_ok());
+        assert!(
+            FreeBsdSysctlProbe::from_sysctl_runner(|_, _| {
+                Ok("hw.ncpu: 8\nvm.ndomains: 2\nhw.physmem: 17179869184\n".to_owned())
+            })
+            .is_ok()
+        );
+        assert!(FreeBsdSysctlProbe::from_sysctl_runner(|_, _| Ok(String::new())).is_err());
+        assert!(
+            FreeBsdSysctlProbe::from_sysctl_runner(|_, _| {
+                Err(ArbiterError::ProbeFailed {
+                    probe_name: "fbsd".to_owned(),
+                    reason: "err".to_owned(),
+                })
+            })
+            .is_err()
+        );
+
         assert!(IllumosKstatProbe::from_host().probe_system().is_ok());
+        assert!(
+            IllumosKstatProbe::from_kstat_runner(|_, _| {
+                Ok("ncpus=8\nlgrps=2\nclock_MHz=2800\nphysmem_bytes=17179869184\n".to_owned())
+            })
+            .is_ok()
+        );
+        assert!(IllumosKstatProbe::from_kstat_runner(|_, _| Ok(String::new())).is_err());
+        assert!(
+            IllumosKstatProbe::from_kstat_runner(|_, _| {
+                Err(ArbiterError::ProbeFailed {
+                    probe_name: "kstat".to_owned(),
+                    reason: "err".to_owned(),
+                })
+            })
+            .is_err()
+        );
+
         assert!(
             WindowsProcessorInfoProbe::from_host()
                 .probe_system()
                 .is_ok()
         );
+        assert!(
+            WindowsProcessorInfoProbe::from_cim_runner(|_, _| {
+                Ok("P_CORES=8\nE_CORES=4\nNUMA_NODES=1\nTOTAL_RAM=17179869184\n".to_owned())
+            })
+            .is_ok()
+        );
+        assert!(WindowsProcessorInfoProbe::from_cim_runner(|_, _| Ok(String::new())).is_err());
+        assert!(
+            WindowsProcessorInfoProbe::from_cim_runner(|_, _| {
+                Err(ArbiterError::ProbeFailed {
+                    probe_name: "cim".to_owned(),
+                    reason: "err".to_owned(),
+                })
+            })
+            .is_err()
+        );
+
         assert!(MacOsSysctlProbe::from_host().probe_system().is_ok());
         assert!(HostSystemProbe::discover_live_host().is_ok());
         assert!(
@@ -1041,7 +1353,11 @@ MemFree: 1024 kB
         ] {
             assert!(HostSystemProbe { os_kind: os }.probe_system().is_ok());
         }
+    }
 
+    #[test]
+    #[allow(clippy::cognitive_complexity)]
+    fn test_cpu_topology_parsers_and_sysfs_dirs() {
         assert_eq!(
             parse_linux_slit_distance_row("10 21 31"),
             Ok(vec![10, 21, 31])
@@ -1052,9 +1368,61 @@ MemFree: 1024 kB
         let exts = parse_proc_cpuinfo_extensions("flags : fpu avx2 avx512f amx_bf16 asimd sve\n");
         assert_eq!(exts.len(), 5);
         assert!(parse_proc_cpuinfo_extensions("flags : fpu").is_empty());
-        let exts_alt = parse_proc_cpuinfo_extensions("flags : avx512 amx_tile neon sve2");
-        assert_eq!(exts_alt.len(), 4);
-        let exts_amx = parse_proc_cpuinfo_extensions("flags : amx");
-        assert_eq!(exts_amx.len(), 1);
+        let exts_alt = parse_proc_cpuinfo_extensions("flags : avx512 amx_tile neon sve2 rvv");
+        assert_eq!(exts_alt.len(), 5);
+        let exts_amx = parse_proc_cpuinfo_extensions("flags : amx rvv1.0");
+        assert_eq!(exts_amx.len(), 2);
+
+        assert!(
+            discover_linux_numa_sysfs_dir(std::path::Path::new("/dev/null/missing_node_dir"))
+                .is_err()
+        );
+        let node_dir = std::env::temp_dir().join("arbiter_linux_numa_sysfs_test");
+        let _ = std::fs::remove_dir_all(&node_dir);
+        let _ = std::fs::create_dir_all(node_dir.join("online"));
+        let _ = std::fs::create_dir_all(node_dir.join("node_bad"));
+        let n0 = node_dir.join("node0");
+        let _ = std::fs::create_dir_all(&n0);
+        let _ = std::fs::write(n0.join("cpulist"), "0-3\n");
+        let _ = std::fs::write(
+            n0.join("meminfo"),
+            "Node 0 MemTotal:       16777216 kB\nNode 0 MemFree: 1024 kB\n",
+        );
+        let n1 = node_dir.join("node1");
+        let _ = std::fs::create_dir_all(&n1);
+        let _ = std::fs::write(n1.join("cpulist"), "4-7\n");
+        let _ = std::fs::write(n1.join("meminfo"), "Node 1 MemTotal:       16777216 kB\n");
+        let discovered_nodes = discover_linux_numa_sysfs_dir(&node_dir).unwrap_or_default();
+        assert_eq!(discovered_nodes.len(), 2);
+        let _ = std::fs::remove_dir_all(&node_dir);
+
+        assert_eq!(
+            parse_freebsd_topology_spec_xml(
+                "<groups>\n  <cpus count=\"4\" mask=\"0xf\"/>\n  <cpus count=\"4\" mask=\"0xf0\"/>\n</groups>"
+            ),
+            Ok((2, 8))
+        );
+        assert!(parse_freebsd_topology_spec_xml("<groups></groups>").is_err());
+        assert!(parse_freebsd_topology_spec_xml("<cpus count=\"0\"/>").is_err());
+        assert!(parse_freebsd_topology_spec_xml("<cpus count=\"bad\"/>").is_err());
+
+        assert!(
+            discover_linux_mm_hugepages_dir(std::path::Path::new("/dev/null/missing_hp")).is_err()
+        );
+        let hp_dir = std::env::temp_dir().join("arbiter_linux_mm_hp_test");
+        let _ = std::fs::remove_dir_all(&hp_dir);
+        let _ = std::fs::create_dir_all(hp_dir.join("hugepages-2048kB"));
+        let _ = std::fs::create_dir_all(hp_dir.join("hugepages-1048576kB"));
+        let _ = std::fs::write(hp_dir.join("hugepages-2048kB").join("nr_hugepages"), "64\n");
+        let _ = std::fs::write(
+            hp_dir.join("hugepages-1048576kB").join("nr_hugepages"),
+            "2\n",
+        );
+        assert_eq!(
+            discover_linux_mm_hugepages_dir(&hp_dir),
+            Ok((64 * 2 * 1024 * 1024, 2 * 1024 * 1024 * 1024))
+        );
+        let _ = std::fs::remove_dir_all(&hp_dir);
+        assert!(discover_host_cpu_topology().is_ok());
     }
 }

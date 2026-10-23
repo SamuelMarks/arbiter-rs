@@ -15,7 +15,7 @@ use arbiter_core::workload::{HealthCheckProtocol, HealthCheckSpec};
 use serde::{Deserialize, Serialize};
 
 /// Registered service endpoint record (`A` + `SRV` equivalent).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ServiceEndpointRecord {
     /// Internal DNS name (`<task>.<service>.<role>.arbiter.internal`).
     pub dns_name: String,
@@ -32,6 +32,9 @@ pub struct ServiceEndpointRecord {
 pub struct ServiceDiscoveryRegistry {
     /// Registered records keyed by `dns_name`.
     records: BTreeMap<String, ServiceEndpointRecord>,
+    /// Highest [`arbiter_core::ids::FencingToken`] observed per `<group>.primary.<role>.arbiter.internal` record.
+    #[serde(default)]
+    caas_primary_tokens: BTreeMap<String, arbiter_core::ids::FencingToken>,
 }
 
 impl ServiceDiscoveryRegistry {
@@ -43,6 +46,91 @@ impl ServiceDiscoveryRegistry {
     pub const fn new() -> Self {
         Self {
             records: BTreeMap::new(),
+            caas_primary_tokens: BTreeMap::new(),
+        }
+    }
+
+    /// Registers or updates the `<group>.primary.<role>.arbiter.internal` DNS endpoint pointing
+    /// exclusively to the `CaaS` primary with the highest [`arbiter_core::ids::FencingToken`].
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - Stateful [`arbiter_core::ids::ElectionGroupId`].
+    /// * `role` - Scheduling [`RoleName`].
+    /// * `primary_task_id` - Promoted primary [`TaskId`].
+    /// * `fencing_token` - Monotonic [`arbiter_core::ids::FencingToken`] granted to the primary.
+    /// * `ip_address` - Primary task IPv4/IPv6 address.
+    /// * `port` - Service [`PortNumber`].
+    ///
+    /// # Returns
+    ///
+    /// Registered [`ServiceEndpointRecord`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::FencingTokenStale`] if `fencing_token` is lower than the currently
+    /// registered primary token for `<group>.primary.<role>.arbiter.internal`.
+    pub fn register_caas_primary_endpoint(
+        &mut self,
+        group_id: &arbiter_core::ids::ElectionGroupId,
+        role: &RoleName,
+        primary_task_id: &TaskId,
+        fencing_token: arbiter_core::ids::FencingToken,
+        ip_address: String,
+        port: PortNumber,
+    ) -> ArbiterResult<ServiceEndpointRecord> {
+        let dns_name = format!("{group_id}.primary.{role}.arbiter.internal");
+        if let Some(&current_tok) = self.caas_primary_tokens.get(&dns_name) {
+            fencing_token.validate_against(current_tok)?;
+        }
+        self.caas_primary_tokens
+            .insert(dns_name.clone(), fencing_token);
+        let rec = ServiceEndpointRecord {
+            dns_name: dns_name.clone(),
+            task_id: primary_task_id.clone(),
+            ip_address,
+            port,
+        };
+        self.records.insert(dns_name, rec.clone());
+        Ok(rec)
+    }
+
+    /// Executes an active readiness/liveness probe against the endpoint registered at `dns_name`,
+    /// automatically removing `dns_name` from the DNS registry when `tracker` reaches `unhealthy_threshold`.
+    ///
+    /// # Arguments
+    ///
+    /// * `dns_name` - Registered internal DNS name.
+    /// * `tracker` - [`HealthProbeTracker`] tracking consecutive failures for the task.
+    /// * `prober` - [`ActiveNetworkProber`] executing the TCP, HTTP `GET`, or QUIC `PING` check.
+    ///
+    /// # Returns
+    ///
+    /// Updated [`TaskHealthStatus`] (`Healthy` or `Degraded`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::DnsProtocolError`] if `dns_name` is not registered, or
+    /// [`ArbiterError::HealthCheckFailed`] after automatically deregistering the unhealthy endpoint.
+    pub fn probe_and_evict_unhealthy_endpoint(
+        &mut self,
+        dns_name: &str,
+        tracker: &mut HealthProbeTracker,
+        prober: &dyn ActiveNetworkProber,
+    ) -> ArbiterResult<TaskHealthStatus> {
+        let Some(rec) = self.records.get(dns_name).cloned() else {
+            return Err(ArbiterError::DnsProtocolError {
+                query_name: dns_name.to_owned(),
+                reason: "DNS endpoint not registered for active health probe".to_owned(),
+            });
+        };
+        let (ok, diag) = prober.execute_probe(&rec.ip_address, &tracker.spec);
+        match tracker.record_probe_outcome(ok, &diag) {
+            Ok(status) => Ok(status),
+            Err(err) => {
+                self.records.remove(dns_name);
+                Err(err)
+            }
         }
     }
 
@@ -573,7 +661,8 @@ impl ServiceDiscoveryRegistry {
         Ok(out)
     }
 
-    /// Decodes an RFC 1035 §3.1 label-encoded domain name starting at `offset` in `packet`.
+    /// Decodes an RFC 1035 §3.1 / §4.1.4 label-encoded or pointer-compressed (`0xC0`) domain name
+    /// starting at `offset` in `packet`.
     ///
     /// # Arguments
     ///
@@ -586,13 +675,16 @@ impl ServiceDiscoveryRegistry {
     ///
     /// # Errors
     ///
-    /// Returns [`ArbiterError::DnsProtocolError`] if the label sequence is truncated or invalid.
+    /// Returns [`ArbiterError::DnsProtocolError`] if the label sequence or compression pointer is
+    /// truncated, out of bounds, or forms a pointer loop.
     pub fn decode_rfc1035_domain_labels(
         packet: &[u8],
         offset: usize,
     ) -> ArbiterResult<(String, usize)> {
         let mut cursor = offset;
+        let mut next_offset: Option<usize> = None;
         let mut labels = Vec::new();
+        let mut hops = 0_u8;
         loop {
             let Some(&len_byte) = packet.get(cursor) else {
                 return Err(ArbiterError::DnsProtocolError {
@@ -600,6 +692,28 @@ impl ServiceDiscoveryRegistry {
                     reason: "truncated RFC 1035 label length byte".to_owned(),
                 });
             };
+            if (len_byte & 0xC0) == 0xC0 {
+                let Some(&low_byte) = packet.get(cursor.saturating_add(1)) else {
+                    return Err(ArbiterError::DnsProtocolError {
+                        query_name: "<pointer>".to_owned(),
+                        reason: "truncated RFC 1035 compression pointer second byte".to_owned(),
+                    });
+                };
+                if next_offset.is_none() {
+                    next_offset = Some(cursor.saturating_add(2));
+                }
+                let ptr_target = usize::from(u16::from_be_bytes([len_byte & 0x3F, low_byte]));
+                hops = hops.saturating_add(1);
+                if ptr_target >= packet.len() || hops > 16 {
+                    return Err(ArbiterError::DnsProtocolError {
+                        query_name: "<pointer>".to_owned(),
+                        reason: "RFC 1035 compression pointer out of bounds or loop detected"
+                            .to_owned(),
+                    });
+                }
+                cursor = ptr_target;
+                continue;
+            }
             cursor = cursor.saturating_add(1);
             if len_byte == 0 {
                 break;
@@ -614,7 +728,7 @@ impl ServiceDiscoveryRegistry {
             labels.push(String::from_utf8_lossy(label_slice).into_owned());
             cursor = cursor.saturating_add(label_len);
         }
-        Ok((labels.join("."), cursor))
+        Ok((labels.join("."), next_offset.unwrap_or(cursor)))
     }
 
     /// Encodes a standard-compliant RFC 1035 12-byte header + Question + binary Answer Resource Record
@@ -893,6 +1007,68 @@ impl LiveHealthProber {
             }
         }
     }
+
+    /// Connects as an external health-probe client to a remote `(target_host, spec.port)` endpoint
+    /// (`TcpStream::connect_timeout`, HTTP `GET`, or UDP QUIC ping) without binding the target port locally.
+    ///
+    /// # Arguments
+    ///
+    /// * `target_host` - Target task IP or hostname (e.g., `"127.0.0.1"`).
+    /// * `spec` - [`HealthCheckSpec`] specifying protocol, port, and `timeout_ms`.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(probe_succeeded, diagnostic_message)`.
+    pub fn probe_remote_endpoint(target_host: &str, spec: &HealthCheckSpec) -> (bool, String) {
+        use std::io::{Read, Write};
+
+        let endpoint = format!("{target_host}:{}", spec.port.get());
+        let timeout = std::time::Duration::from_millis(spec.timeout_ms.max(10));
+        match &spec.protocol {
+            HealthCheckProtocol::Tcp => {
+                let Ok(sock_addr) = endpoint.parse::<std::net::SocketAddr>() else {
+                    return (false, format!("invalid socket address {endpoint}"));
+                };
+                match std::net::TcpStream::connect_timeout(&sock_addr, timeout) {
+                    Ok(_) => (true, format!("TCP connected to {endpoint}")),
+                    Err(e) => (false, e.to_string()),
+                }
+            }
+            HealthCheckProtocol::HttpGet(path) => {
+                let Ok(sock_addr) = endpoint.parse::<std::net::SocketAddr>() else {
+                    return (false, format!("invalid socket address {endpoint}"));
+                };
+                let Ok(mut stream) = std::net::TcpStream::connect_timeout(&sock_addr, timeout)
+                else {
+                    return (false, format!("HTTP connect timeout to {endpoint}"));
+                };
+                let _ = stream.set_read_timeout(Some(timeout));
+                let req =
+                    format!("GET {path} HTTP/1.1\r\nHost: {endpoint}\r\nConnection: close\r\n\r\n");
+                let _ = stream.write_all(req.as_bytes());
+                let mut rx = [0_u8; 64];
+                let _ = stream.read(&mut rx);
+                let status_line = String::from_utf8_lossy(&rx);
+                let ok = status_line.contains("200 OK") || status_line.contains("204 No Content");
+                (ok, status_line.trim().to_owned())
+            }
+            HealthCheckProtocol::QuicPing => {
+                let mut rx = [0_u8; 4];
+                let ok_recv = std::net::UdpSocket::bind("127.0.0.1:0")
+                    .and_then(|sock| {
+                        let _ = sock.set_read_timeout(Some(timeout));
+                        sock.send_to(b"PING", &endpoint)?;
+                        sock.recv_from(&mut rx)
+                    })
+                    .is_ok();
+                if ok_recv {
+                    (&rx == b"PONG" || &rx == b"PING", "QUIC PONG".to_owned())
+                } else {
+                    (false, format!("QUIC ping failed to {endpoint}"))
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -990,11 +1166,96 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_federated_dns_and_command_health_check() {
         let mut dns = ServiceDiscoveryRegistry::new();
         let role = RoleName::new("prod").unwrap_or_default();
 
         // Federated DNS registration, health-gated resolution, and UDP DNS roundtrip
+        let gid = arbiter_core::ids::ElectionGroupId::new("pg-ha").unwrap_or_default();
+        let tok10 = arbiter_core::ids::FencingToken::new(10).unwrap_or_default();
+        let tok5 = arbiter_core::ids::FencingToken::new(5).unwrap_or_default();
+        let tok12 = arbiter_core::ids::FencingToken::new(12).unwrap_or_default();
+        let p_port = PortNumber::new(5432).unwrap_or_default();
+        let p_rec = dns
+            .register_caas_primary_endpoint(
+                &gid,
+                &role,
+                &TaskId::new("pg-0").unwrap_or_default(),
+                tok10,
+                "10.1.0.10".to_owned(),
+                p_port,
+            )
+            .unwrap_or_default();
+        assert_eq!(p_rec.dns_name, "pg-ha.primary.prod.arbiter.internal");
+        assert!(
+            dns.register_caas_primary_endpoint(
+                &gid,
+                &role,
+                &TaskId::new("pg-stale").unwrap_or_default(),
+                tok5,
+                "10.1.0.11".to_owned(),
+                p_port,
+            )
+            .is_err()
+        );
+        assert!(
+            dns.register_caas_primary_endpoint(
+                &gid,
+                &role,
+                &TaskId::new("pg-1").unwrap_or_default(),
+                tok12,
+                "10.1.0.12".to_owned(),
+                p_port,
+            )
+            .is_ok()
+        );
+        let mut evict_tracker = HealthProbeTracker::new(
+            TaskId::new("pg-1").unwrap_or_default(),
+            HealthCheckSpec {
+                protocol: HealthCheckProtocol::Tcp,
+                port: p_port,
+                interval_ms: 50,
+                timeout_ms: 20,
+                unhealthy_threshold: 2,
+            },
+        );
+        assert_eq!(
+            dns.probe_and_evict_unhealthy_endpoint(
+                &p_rec.dns_name,
+                &mut evict_tracker,
+                &SimulatedNetworkProber { healthy: true },
+            ),
+            Ok(TaskHealthStatus::Healthy)
+        );
+        assert_eq!(
+            dns.probe_and_evict_unhealthy_endpoint(
+                &p_rec.dns_name,
+                &mut evict_tracker,
+                &SimulatedNetworkProber { healthy: false },
+            ),
+            Ok(TaskHealthStatus::Degraded {
+                consecutive_failures: 1
+            })
+        );
+        assert!(
+            dns.probe_and_evict_unhealthy_endpoint(
+                &p_rec.dns_name,
+                &mut evict_tracker,
+                &SimulatedNetworkProber { healthy: false },
+            )
+            .is_err()
+        );
+        assert!(dns.resolve(&p_rec.dns_name).is_none());
+        assert!(
+            dns.probe_and_evict_unhealthy_endpoint(
+                &p_rec.dns_name,
+                &mut evict_tracker,
+                &SimulatedNetworkProber { healthy: true },
+            )
+            .is_err()
+        );
+
         let fed_rec = dns.register_federated_endpoint(
             &TaskId::new("db-0").unwrap_or_default(),
             "pg",
@@ -1198,6 +1459,18 @@ mod tests {
         assert!(
             ServiceDiscoveryRegistry::decode_rfc1035_domain_labels(&[5, b'a', b'b'], 0).is_err()
         );
+        // RFC 1035 §4.1.4 compression pointer (0xC0) valid resolution, truncated pointer, and pointer loop
+        let mut ptr_pkt = Vec::new();
+        ptr_pkt.extend_from_slice(&[7, b'a', b'r', b'b', b'i', b't', b'e', b'r', 0]); // offset 0..9: "arbiter"
+        let alias_off = ptr_pkt.len();
+        ptr_pkt.extend_from_slice(&[3, b'w', b'e', b'b', 0xC0, 0x00]); // "web" + pointer to offset 0
+        assert_eq!(
+            ServiceDiscoveryRegistry::decode_rfc1035_domain_labels(&ptr_pkt, alias_off),
+            Ok(("web.arbiter".to_owned(), alias_off + 6))
+        );
+        assert!(ServiceDiscoveryRegistry::decode_rfc1035_domain_labels(&[0xC0], 0).is_err());
+        assert!(ServiceDiscoveryRegistry::decode_rfc1035_domain_labels(&[0xC0, 0x50], 0).is_err());
+        assert!(ServiceDiscoveryRegistry::decode_rfc1035_domain_labels(&[0xC0, 0x00], 0).is_err());
         assert!(
             ServiceDiscoveryRegistry::decode_standard_rfc1035_response_packet(&[0; 8]).is_err()
         );
@@ -1213,5 +1486,105 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_probe_remote_endpoint_tcp_http_and_quic() {
+        use std::io::{Read, Write};
+
+        let p_unreach = PortNumber::new(1).unwrap_or_default();
+        for proto in [
+            HealthCheckProtocol::Tcp,
+            HealthCheckProtocol::HttpGet("/healthz".to_owned()),
+            HealthCheckProtocol::QuicPing,
+        ] {
+            let spec_bad_host = HealthCheckSpec {
+                protocol: proto.clone(),
+                port: p_unreach,
+                interval_ms: 50,
+                timeout_ms: 15,
+                unhealthy_threshold: 2,
+            };
+            assert!(!LiveHealthProber::probe_remote_endpoint("invalid_host", &spec_bad_host).0);
+            assert!(!LiveHealthProber::probe_remote_endpoint("127.0.0.1", &spec_bad_host).0);
+        }
+
+        // 1. Live remote TCP listener
+        let _ = std::net::TcpListener::bind("127.0.0.1:0").map(|listener| {
+            let _ = listener.local_addr().map(|addr| {
+                let port = PortNumber::new(addr.port()).unwrap_or_default();
+                let handle = std::thread::spawn(move || {
+                    let _ = listener.accept();
+                });
+                let spec = HealthCheckSpec {
+                    protocol: HealthCheckProtocol::Tcp,
+                    port,
+                    interval_ms: 50,
+                    timeout_ms: 100,
+                    unhealthy_threshold: 2,
+                };
+                assert!(LiveHealthProber::probe_remote_endpoint("127.0.0.1", &spec).0);
+                let _ = handle.join();
+            });
+        });
+
+        // 2. Live remote HTTP GET listener (200 OK, 204 No Content, and 500 error)
+        for (resp_bytes, expected_ok) in [
+            (&b"HTTP/1.1 200 OK\r\n\r\n"[..], true),
+            (&b"HTTP/1.1 204 No Content\r\n\r\n"[..], true),
+            (&b"HTTP/1.1 503 Unavailable\r\n\r\n"[..], false),
+        ] {
+            let _ = std::net::TcpListener::bind("127.0.0.1:0").map(|listener| {
+                let _ = listener.local_addr().map(|addr| {
+                    let port = PortNumber::new(addr.port()).unwrap_or_default();
+                    let handle = std::thread::spawn(move || {
+                        let _ = listener.accept().map(|(mut srv, _)| {
+                            let mut req = [0_u8; 128];
+                            let _ = srv.read(&mut req);
+                            let _ = srv.write_all(resp_bytes);
+                        });
+                    });
+                    let spec = HealthCheckSpec {
+                        protocol: HealthCheckProtocol::HttpGet("/ready".to_owned()),
+                        port,
+                        interval_ms: 50,
+                        timeout_ms: 100,
+                        unhealthy_threshold: 2,
+                    };
+                    assert_eq!(
+                        LiveHealthProber::probe_remote_endpoint("127.0.0.1", &spec).0,
+                        expected_ok
+                    );
+                    let _ = handle.join();
+                });
+            });
+        }
+
+        // 3. Live remote UDP QUIC ping responder (PONG, PING, and BAD!)
+        for (reply, expected_ok) in [(b"PONG", true), (b"PING", true), (b"BAD!", false)] {
+            let _ = std::net::UdpSocket::bind("127.0.0.1:0").map(|srv_sock| {
+                let _ = srv_sock.local_addr().map(|addr| {
+                    let port = PortNumber::new(addr.port()).unwrap_or_default();
+                    let handle = std::thread::spawn(move || {
+                        let mut buf = [0_u8; 16];
+                        let _ = srv_sock.recv_from(&mut buf).map(|(_, peer)| {
+                            let _ = srv_sock.send_to(reply, peer);
+                        });
+                    });
+                    let spec = HealthCheckSpec {
+                        protocol: HealthCheckProtocol::QuicPing,
+                        port,
+                        interval_ms: 50,
+                        timeout_ms: 100,
+                        unhealthy_threshold: 2,
+                    };
+                    assert_eq!(
+                        LiveHealthProber::probe_remote_endpoint("127.0.0.1", &spec).0,
+                        expected_ok
+                    );
+                    let _ = handle.join();
+                });
+            });
+        }
     }
 }

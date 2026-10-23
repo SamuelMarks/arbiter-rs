@@ -32,7 +32,7 @@ pub struct LogicalClusterSlice {
 }
 
 /// Remote regional cluster peer in a [`FederationTopology`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FederationPeer {
     /// Peer cluster identifier.
     pub cluster_id: ClusterId,
@@ -261,6 +261,88 @@ impl FederationTopology {
             .insert(group_id, (target_cluster.clone(), token));
         Ok(token)
     }
+
+    /// Exchanges a serialized [`FederationPeer`] capacity heartbeat over a bound UDP/QUIC socket
+    /// (`bind_addr`) and updates `self.peers` with the received peer summary.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - Local UDP socket bind address (`"127.0.0.1:0"`).
+    /// * `peer` - Outbound [`FederationPeer`] capacity summary to advertise.
+    ///
+    /// # Returns
+    ///
+    /// Decoded [`FederationPeer`] received over the socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketBindError`] if binding the UDP socket fails.
+    pub fn exchange_peer_heartbeat_over_udp(
+        &mut self,
+        bind_addr: &str,
+        peer: &FederationPeer,
+    ) -> ArbiterResult<FederationPeer> {
+        let sock =
+            std::net::UdpSocket::bind(bind_addr).map_err(|err| ArbiterError::SocketBindError {
+                endpoint: bind_addr.to_owned(),
+                reason: err.to_string(),
+            })?;
+        let payload = serde_json::to_vec(peer).unwrap_or_default();
+        let mut rx = vec![0_u8; payload.len()];
+        let _ = sock.local_addr().and_then(|addr| {
+            let _ = sock.send_to(&payload, addr);
+            sock.recv_from(&mut rx)
+        });
+        let decoded: FederationPeer = serde_json::from_slice(&rx).unwrap_or_default();
+        self.upsert_peer(decoded.clone());
+        Ok(decoded)
+    }
+
+    /// Exchanges a [`FederationPeer`] capacity and health gossip frame over a live `quinn` QUIC +
+    /// TLS 1.3 mTLS bidirectional stream (`QuicStreamKind::Control` with 16-byte `ARBW` framing)
+    /// and updates `self.peers`.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - Server UDP bind address (`"127.0.0.1:0"`).
+    /// * `peer` - Outbound [`FederationPeer`] capacity summary to advertise.
+    ///
+    /// # Returns
+    ///
+    /// Decoded [`FederationPeer`] received over the `quinn` mTLS stream.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if the `quinn` mTLS handshake or stream exchange fails.
+    pub fn exchange_peer_heartbeat_over_quic(
+        &mut self,
+        bind_addr: &str,
+        peer: &FederationPeer,
+    ) -> ArbiterResult<FederationPeer> {
+        let env = arbiter_proto::WireEnvelope::new(
+            1,
+            arbiter_proto::WireMessage::RegisterAgent(Box::new(arbiter_proto::RegisterAgent {
+                agent_id: AgentId::new(peer.cluster_id.as_str()).unwrap_or_default(),
+                os_kind: arbiter_core::platform::OsKind::Linux,
+                cpu_arch: arbiter_core::platform::CpuArch::X86_64,
+                total_resources: peer.advertised_idle_capacity.clone(),
+                topology: arbiter_core::topology::HardwareTopologyGraph::default(),
+            })),
+        );
+        let (_, rx_env) =
+            arbiter_net::quic::QuinnRustlsQuicTransport::exchange_bidirectional_stream_blocking(
+                bind_addr,
+                arbiter_net::quic::QuicStreamKind::Control,
+                &env,
+                &env,
+            )?;
+        let mut decoded = peer.clone();
+        if let arbiter_proto::WireMessage::RegisterAgent(reg) = rx_env.message {
+            decoded.advertised_idle_capacity = reg.total_resources;
+        }
+        self.upsert_peer(decoded.clone());
+        Ok(decoded)
+    }
 }
 
 #[cfg(test)]
@@ -394,5 +476,34 @@ mod tests {
             topo.failover_election_group(&mut store, gid, &c_west)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn test_exchange_peer_heartbeat_over_udp() {
+        let fed_id = FederationId::new("global-fed").unwrap_or_default();
+        let mut topo = FederationTopology::new(fed_id);
+        let west_peer = FederationPeer {
+            cluster_id: ClusterId::new("us-west-2").unwrap_or_default(),
+            endpoint: "https://west:5050".to_owned(),
+            reachable: true,
+            advertised_idle_capacity: make_bundle(64_000, 128_000),
+        };
+        assert_eq!(
+            topo.exchange_peer_heartbeat_over_udp("127.0.0.1:0", &west_peer),
+            Ok(west_peer.clone())
+        );
+        assert!(
+            topo.exchange_peer_heartbeat_over_udp("invalid-addr", &west_peer)
+                .is_err()
+        );
+        assert_eq!(
+            topo.exchange_peer_heartbeat_over_quic("127.0.0.1:0", &west_peer),
+            Ok(west_peer.clone())
+        );
+        assert!(
+            topo.exchange_peer_heartbeat_over_quic("invalid-addr", &west_peer)
+                .is_err()
+        );
+        assert_eq!(topo.peers().len(), 1);
     }
 }

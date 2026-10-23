@@ -34,8 +34,24 @@ impl MulticallTarget {
     /// Execution summary string.
     pub fn execute_target(&self) -> String {
         match self {
-            Self::Master(cfg) => cfg.run_master_daemon_tick(),
-            Self::Agent(cfg) => cfg.run_agent_daemon_tick(),
+            Self::Master(cfg) => {
+                if cfg.signal_mode == arbiter_master_bin::SignalSourceMode::ContinuousDaemon {
+                    cfg.run_async_tokio_daemon()
+                        .map(|(_, s)| s)
+                        .unwrap_or_default()
+                } else {
+                    cfg.run_master_daemon_tick()
+                }
+            }
+            Self::Agent(cfg) => {
+                if cfg.daemon_mode {
+                    cfg.run_async_tokio_supervisor_daemon(cfg.max_ticks.max(1))
+                        .map(|(_, _, s)| s)
+                        .unwrap_or_default()
+                } else {
+                    cfg.run_agent_daemon_tick()
+                }
+            }
             Self::Executor(cfg) => cfg.run_executor_daemon_tick(),
             Self::Cli(sub) => sub.execute_report(),
         }
@@ -152,7 +168,21 @@ mod tests {
     fn test_multicall_subcommand_dispatch() {
         for args in [
             &["arbiter", "master"][..],
+            &[
+                "arbiter",
+                "master",
+                "--bind-addr",
+                "127.0.0.1:0",
+                "--http-addr",
+                "127.0.0.1:0",
+                "--dns-addr",
+                "127.0.0.1:0",
+                "--max-ticks",
+                "1",
+                "--daemon",
+            ][..],
             &["arbiter", "agent"][..],
+            &["arbiter", "agent", "--max-ticks", "1", "--daemon"][..],
             &["arbiter", "executor"][..],
             &["arbiter", "cli", "tui"][..],
             &["arbiter"][..],
@@ -169,5 +199,66 @@ mod tests {
         assert!(dispatch_multicall(&["arbiter", "cli"]).is_err());
         assert!(dispatch_multicall(&["arbiter", "bogus"]).is_err());
         assert!(dispatch_multicall(&["unknown-binary"]).is_err());
+    }
+
+    #[test]
+    fn test_end_to_end_multi_persona_cluster_roundtrip() {
+        let e2e_dir = std::env::temp_dir().join("arbiter_e2e_multicall_test");
+        let wal_dir = e2e_dir.join("wal");
+        let ckpt_dir = e2e_dir.join("ckpt");
+        let sbox_dir = e2e_dir.join("sbox");
+        let _ = std::fs::create_dir_all(&wal_dir);
+        let _ = std::fs::create_dir_all(&ckpt_dir);
+        let _ = std::fs::create_dir_all(&sbox_dir);
+
+        let master_cfg = MasterCliConfig::parse_from_slice(&[
+            "--bind-addr",
+            "127.0.0.1:0",
+            "--http-addr",
+            "127.0.0.1:0",
+            "--state-store",
+            "raft",
+            "--wal-dir",
+            wal_dir.to_str().unwrap_or("/tmp"),
+        ])
+        .unwrap_or_default();
+        assert_eq!(
+            master_cfg.run_live_network_daemon_once("agent-e2e-1"),
+            Ok(2)
+        );
+
+        let agent_cfg = AgentCliConfig::parse_from_slice(&[
+            "--agent-id",
+            "agent-e2e-1",
+            "--work-dir",
+            sbox_dir.to_str().unwrap_or("/tmp"),
+            "--checkpoint-dir",
+            ckpt_dir.to_str().unwrap_or("/tmp"),
+        ])
+        .unwrap_or_default();
+        assert_eq!(
+            agent_cfg.run_live_network_daemon_once("127.0.0.1:0"),
+            Ok("MASTER_ACK:agent-e2e-1".to_owned())
+        );
+
+        let exec_cfg = ExecutorCliConfig::parse_from_slice(&[
+            "--executor-id",
+            "exec-e2e-1",
+            "--task-id",
+            "task-e2e-1",
+            "--sandbox-dir",
+            sbox_dir.to_str().unwrap_or("/tmp"),
+        ])
+        .unwrap_or_default();
+        assert_eq!(exec_cfg.run_daemon_loop(2).map(|(t, _)| t), Ok(2));
+
+        let cli_sub = CliSubcommand::parse_from_slice(&["status"]).unwrap_or(CliSubcommand::Status);
+        assert!(
+            cli_sub
+                .execute_remote_http_operator_call("127.0.0.1:0")
+                .is_ok()
+        );
+
+        let _ = std::fs::remove_dir_all(&e2e_dir);
     }
 }

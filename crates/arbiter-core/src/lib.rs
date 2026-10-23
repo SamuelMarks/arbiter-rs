@@ -13,7 +13,11 @@ pub mod topology;
 pub mod units;
 pub mod workload;
 
-pub use error::{ArbiterError, ArbiterResult, IoOperationError, JsonCodecError, RkyvCodecError};
+pub use error::{
+    ArbiterError, ArbiterResult, CniPluginError, CriuCheckpointError, FuseMountError,
+    IoOperationError, JsonCodecError, RkyvCodecError, SignalDeliveryError, TerminalRawModeError,
+    ZfsCommandError,
+};
 
 /// Returns the crate identifier for verification.
 ///

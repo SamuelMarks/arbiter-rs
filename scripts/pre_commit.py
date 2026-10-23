@@ -71,10 +71,11 @@ def run_command(
     )
 
 
-def hook_fmt(repo_root: Path) -> int:
-    """First runs auto-formatting fix, then verifies formatting check."""
-    print("==> [fmt] Auto-fixing code formatting with cargo fmt...")
-    run_command(["cargo", "fmt", "--all"], cwd=repo_root)
+def hook_fmt(repo_root: Path, check_only: bool = False) -> int:
+    """First runs auto-formatting fix (unless check_only is set), then verifies formatting check."""
+    if not check_only:
+        print("==> [fmt] Auto-fixing code formatting with cargo fmt...")
+        run_command(["cargo", "fmt", "--all"], cwd=repo_root)
 
     print("==> [fmt] Verifying code formatting (cargo fmt --all -- --check)...")
     run_command(["cargo", "fmt", "--all", "--", "--check"], cwd=repo_root)
@@ -83,16 +84,18 @@ def hook_fmt(repo_root: Path) -> int:
     return 0
 
 
-def hook_build(repo_root: Path) -> int:
+def hook_build(repo_root: Path, check_only: bool = False) -> int:
     """Builds all packages and targets in the workspace."""
+    _ = check_only
     print("==> [build] Compiling workspace packages and targets (cargo build)...")
     run_command(["cargo", "build", "--workspace", "--all-targets"], cwd=repo_root)
     print("==> [build] Workspace compiled successfully.")
     return 0
 
 
-def hook_clippy(repo_root: Path) -> int:
+def hook_clippy(repo_root: Path, check_only: bool = False) -> int:
     """Runs clippy across all targets and features with strictest workspace lints."""
+    _ = check_only
     print("==> [clippy] Running clippy linter with workspace checks...")
     run_command(
         [
@@ -111,7 +114,7 @@ def hook_clippy(repo_root: Path) -> int:
     env = get_augmented_env()
     env["RUSTDOCFLAGS"] = "-D warnings"
     run_command(
-        ["cargo", "doc", "--workspace", "--no-deps"],
+        ["cargo", "doc", "--workspace", "--no-deps", "--document-private-items"],
         cwd=repo_root,
         env=env,
     )
@@ -119,8 +122,9 @@ def hook_clippy(repo_root: Path) -> int:
     return 0
 
 
-def hook_test(repo_root: Path) -> int:
+def hook_test(repo_root: Path, check_only: bool = False) -> int:
     """Runs all workspace unit, property, and simulation tests."""
+    _ = check_only
     print("==> [test] Running test suite (cargo test)...")
     run_command(["cargo", "test", "--workspace", "--all-targets"], cwd=repo_root)
     print("==> [test] All tests passed.")
@@ -213,14 +217,13 @@ def calculate_test_coverage(repo_root: Path, force_run: bool = True) -> float:
     if force_run or not cov_path.exists():
         print("==> [shields] Generating test coverage report via cargo llvm-cov...")
         cov_path.parent.mkdir(parents=True, exist_ok=True)
+        run_command(["cargo", "llvm-cov", "clean", "--workspace"], cwd=repo_root)
         run_command(
             [
                 "cargo",
-                "+nightly",
                 "llvm-cov",
                 "--workspace",
                 "--all-targets",
-                "--branch",
                 "--summary-only",
                 "--json",
                 "--output-path",
@@ -256,7 +259,9 @@ def calculate_test_coverage(repo_root: Path, force_run: bool = True) -> float:
     return pct
 
 
-def update_readme_shields(repo_root: Path, doc_pct: float, test_pct: float) -> bool:
+def update_readme_shields(
+    repo_root: Path, doc_pct: float, test_pct: float, check_only: bool = False
+) -> bool:
     """Updates '% doc coverage' and '% test coverage' shields in README.md."""
     readme_path = repo_root / "README.md"
     if not readme_path.exists():
@@ -330,6 +335,12 @@ def update_readme_shields(repo_root: Path, doc_pct: float, test_pct: float) -> b
         new_content = test_pattern.sub(both_shields, new_content, count=1)
 
     if new_content != content:
+        if check_only:
+            print(
+                f"Error: README.md shields are out of date. Expected:{nl}    {doc_shield}{nl}    {test_shield}",
+                file=sys.stderr,
+            )
+            return True
         with open(readme_path, "w", encoding="utf-8") as f:
             f.write(new_content)
         print(
@@ -341,24 +352,35 @@ def update_readme_shields(repo_root: Path, doc_pct: float, test_pct: float) -> b
     return False
 
 
-def hook_shields(repo_root: Path, force_run: bool = True) -> int:
-    """Collects doc and test coverage and updates shields in README.md."""
+def hook_shields(
+    repo_root: Path, check_only: bool = False, force_run: bool = True
+) -> int:
+    """Collects doc and test coverage and updates/verifies shields in README.md."""
     doc_pct = calculate_doc_coverage(repo_root, force_run=force_run)
     test_pct = calculate_test_coverage(repo_root, force_run=force_run)
-    update_readme_shields(repo_root, doc_pct, test_pct)
+    changed = update_readme_shields(
+        repo_root, doc_pct, test_pct, check_only=check_only
+    )
+    if doc_pct < 100.0 or test_pct < 100.0:
+        print(
+            f"Error: Coverage below 100% threshold (doc={doc_pct:.2f}%, test={test_pct:.2f}%)",
+            file=sys.stderr,
+        )
+        return 1
+    if check_only and changed:
+        return 1
     return 0
 
 
-def hook_all(repo_root: Path) -> int:
+def hook_all(repo_root: Path, check_only: bool = False) -> int:
     """Executes the complete pre-commit validation pipeline in sequence."""
     print("========================================================")
     print(" Running arbiter-rs Pre-commit Hook Pipeline (Python)")
     print("========================================================")
-    hook_fmt(repo_root)
-    hook_build(repo_root)
-    hook_clippy(repo_root)
-    hook_test(repo_root)
-    hook_shields(repo_root, force_run=True)
+    for fn in (hook_fmt, hook_build, hook_clippy, hook_test, hook_shields):
+        rc = fn(repo_root, check_only=check_only)
+        if rc != 0:
+            return rc
     print("========================================================")
     print(" All pre-commit checks passed successfully!")
     print("========================================================")
@@ -377,6 +399,11 @@ def main() -> int:
         default="all",
         help="Pipeline stage to execute (default: all)",
     )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="Run in strict CI verification mode without modifying tracked files",
+    )
     args = parser.parse_args()
     repo_root = get_repo_root()
 
@@ -390,7 +417,7 @@ def main() -> int:
     }
 
     try:
-        return stage_handlers[args.stage](repo_root)
+        return stage_handlers[args.stage](repo_root, check_only=args.check)
     except subprocess.CalledProcessError as err:
         cmd_str = " ".join(err.cmd) if isinstance(err.cmd, list) else err.cmd
         print(

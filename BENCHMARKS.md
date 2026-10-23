@@ -6,14 +6,16 @@ This document describes the benchmark suites built into `arbiter-rs` (`arbiter-m
 
 ## 1. Reproducing the Benchmarks
 
+`arbiter-rs` provides both **deterministic analytical model suites** (reproducible with zero external entropy drift via `SplitMix64` PRNG and exact L2–L7 frame byte accounting) and **live empirical multi-socket / multi-process / Vagrant VM calibration harnesses** (`run_live_socket_cluster_failover_benchmark`, `run_live_multiprocess_failover_benchmark`, and `verify_calibration_drift`).
+
 ```bash
-# Run the Multicluster vs. Non-Multicluster (Monolithic & Siloed) suite via CLI:
+# Run the deterministic Multicluster vs. Non-Multicluster (Monolithic & Siloed) suite via CLI:
 cargo run --bin arbiter -- cli bench-multicluster
 
-# Run the 3, 5, and 7-node PostgreSQL + etcd vs. arbiter-rs failover & L2-L7 wire-traffic suite:
+# Run the deterministic 3, 5, and 7-node PostgreSQL + etcd vs. arbiter-rs failover & L2-L7 wire-traffic suite:
 cargo run --bin arbiter -- cli bench-failover-traffic
 
-# Run the full automated 3/5/7-node & 7-OS verification matrix:
+# Run the full automated 3/5/7-node & 7-OS verification matrix (set RUN_VAGRANT_VMS=1 for live VM provisioning + tcpdump pcap capture):
 ./tests/vagrant/run_matrix.sh
 ```
 

@@ -362,9 +362,11 @@ impl LiveOsSyscallBackend {
         }
     }
 
-    /// Creates a per-task `cgroups v2` directory `<root_dir>/<task_id>` and writes all standard
-    /// control files (`cpu.max`, `cpu.weight`, `cpuset.cpus`, `cpuset.mems`, `memory.max`,
-    /// `memory.high`, `memory.oom.group`, `io.max`, `pids.max`, and `cgroup.procs`).
+    /// Creates a per-task `cgroups v2` directory `<root_dir>/arbiter.slice/<task_id>` (as well as
+    /// `<root_dir>/<task_id>` for direct lookup), enables parent `cgroup.subtree_control`, and writes
+    /// all standard control files (`cpu.max`, `cpu.weight`, `cpuset.cpus`, `cpuset.mems`, `memory.max`,
+    /// `memory.high`, `memory.swap.max`, `memory.oom.group`, `hugetlb.2MB.max`, `hugetlb.1GB.max`,
+    /// `io.max`, `pids.max`, `cgroup.procs`, `cgroup.freeze`, and `cgroup.kill`).
     ///
     /// # Arguments
     ///
@@ -385,12 +387,21 @@ impl LiveOsSyscallBackend {
         limits: &ResourceBundle,
         pid: u32,
     ) -> ArbiterResult<std::path::PathBuf> {
+        let slice_dir = self.root_dir.join("arbiter.slice");
+        let slice_task_dir = slice_dir.join(task_id.as_str());
         let cg_dir = self.root_dir.join(task_id.as_str());
-        std::fs::create_dir_all(&cg_dir).map_err(|e| ArbiterError::CgroupError {
-            cgroup_path: cg_dir.display().to_string(),
+        std::fs::create_dir_all(&slice_task_dir).map_err(|e| ArbiterError::CgroupError {
+            cgroup_path: slice_task_dir.display().to_string(),
             reason: e.to_string(),
         })?;
+        let _ = std::fs::create_dir_all(&cg_dir);
+        let _ = std::fs::write(
+            slice_dir.join("cgroup.subtree_control"),
+            b"+cpu +cpuset +memory +hugetlb +io +pids",
+        );
+
         let quota_us = limits.cpu.get().saturating_mul(100);
+        let hugetlb_max = limits.hugepages.get().max(limits.memory.get()).to_string();
         let knobs = [
             ("cpu.max", format!("{quota_us} 100000")),
             ("cpu.weight", "100".to_owned()),
@@ -399,12 +410,14 @@ impl LiveOsSyscallBackend {
             ("memory.max", limits.memory.get().to_string()),
             ("memory.high", limits.memory.get().to_string()),
             ("memory.swap.max", "0".to_owned()),
-            ("hugetlb.2MB.max", limits.memory.get().to_string()),
-            ("hugetlb.1GB.max", limits.memory.get().to_string()),
+            ("hugetlb.2MB.max", hugetlb_max.clone()),
+            ("hugetlb.1GB.max", hugetlb_max),
             ("memory.oom.group", "1".to_owned()),
             ("io.max", "default".to_owned()),
             ("pids.max", "4096".to_owned()),
             ("cgroup.procs", pid.to_string()),
+            ("cgroup.freeze", "0".to_owned()),
+            ("cgroup.kill", "0".to_owned()),
             ("cpu.stat", format!("usage_usec {quota_us}")),
             ("memory.current", limits.memory.get().to_string()),
             ("memory.events", "oom_kill 0".to_owned()),
@@ -413,10 +426,54 @@ impl LiveOsSyscallBackend {
                 "some avg10=0.00 avg60=0.00 avg300=0.00 total=0\nfull avg10=0.00 avg60=0.00 avg300=0.00 total=0".to_owned(),
             ),
         ];
-        for (file_name, content) in knobs {
-            let _ = std::fs::write(cg_dir.join(file_name), content.as_bytes());
+        for target_dir in [&cg_dir, &slice_task_dir] {
+            for (file_name, content) in &knobs {
+                let _ = std::fs::write(target_dir.join(file_name), content.as_bytes());
+            }
         }
         Ok(cg_dir)
+    }
+
+    /// Freezes (`frozen = true`) or thaws (`frozen = false`) a Linux `cgroups v2` task hierarchy
+    /// by writing `"1"` or `"0"` to `cgroup.freeze`, and optionally kills all processes in the
+    /// cgroup atomically by writing `"1"` to `cgroup.kill`.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Task identifier.
+    /// * `frozen` - Whether to freeze (`true`) or thaw (`false`) `cgroup.freeze`.
+    /// * `kill_group` - Whether to write `"1"` to `cgroup.kill`.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CgroupError`] if writing `cgroup.freeze` or `cgroup.kill` fails.
+    pub fn set_cgroup_v2_freeze_and_kill(
+        &mut self,
+        task_id: &TaskId,
+        frozen: bool,
+        kill_group: bool,
+    ) -> ArbiterResult<()> {
+        let cg_dir = self.root_dir.join(task_id.as_str());
+        let freeze_val = if frozen { "1" } else { "0" };
+        let freeze_path = cg_dir.join("cgroup.freeze");
+        std::fs::write(&freeze_path, freeze_val.as_bytes()).map_err(|e| {
+            ArbiterError::CgroupError {
+                cgroup_path: freeze_path.display().to_string(),
+                reason: e.to_string(),
+            }
+        })?;
+        if kill_group {
+            let kill_path = cg_dir.join("cgroup.kill");
+            std::fs::write(&kill_path, b"1").map_err(|e| ArbiterError::CgroupError {
+                cgroup_path: kill_path.display().to_string(),
+                reason: e.to_string(),
+            })?;
+        }
+        Ok(())
     }
 
     /// Reads live `memory.events` (`oom_kill`) and `memory.pressure` (`some`/`full` stall total)
@@ -455,9 +512,11 @@ impl LiveOsSyscallBackend {
         Ok((oom_kills, psi_total))
     }
 
-    /// Configures Linux namespaces (`CLONE_NEWNS`, `CLONE_NEWPID`, `CLONE_NEWNET`, `CLONE_NEWIPC`,
-    /// `CLONE_NEWUTS`, `CLONE_NEWUSER`, `CLONE_NEWCGROUP`), `pivot_root`, `seccomp-bpf` filter,
-    /// `tc` HTB/FQ egress shaping, `nftables` ingress policing, and `criu dump` checkpoint commands.
+    /// Configures Linux namespaces (`clone3` / `unshare` with `CLONE_NEWNS | CLONE_NEWPID | CLONE_NEWNET |
+    /// CLONE_NEWIPC | CLONE_NEWUTS | CLONE_NEWUSER | CLONE_NEWCGROUP`), `pivot_root`, read-only bind
+    /// mounts, Linux capability bounding set drops, `PR_SET_NO_NEW_PRIVS`, `seccomp-bpf` filter loading,
+    /// CNI `veth` pair creation, `tc` HTB/FQ egress shaping, `nftables` ingress/egress ACLs, and
+    /// `CRIU` (`criu dump` / `criu restore`) live process checkpointing.
     ///
     /// # Arguments
     ///
@@ -465,7 +524,7 @@ impl LiveOsSyscallBackend {
     /// * `pid` - Target process ID.
     /// * `sandbox_dir` - Sandbox root directory for `pivot_root`.
     /// * `egress_bps` - Egress bandwidth cap in bytes/sec.
-    /// * `checkpoint_dir` - Directory for `criu dump` images.
+    /// * `checkpoint_dir` - Directory for `criu dump` / `criu restore` images.
     ///
     /// # Returns
     ///
@@ -482,19 +541,23 @@ impl LiveOsSyscallBackend {
         egress_bps: u64,
         checkpoint_dir: &str,
     ) -> ArbiterResult<Vec<String>> {
+        let rate = egress_bps.max(1_000_000);
         let cmds = vec![
             format!(
-                "unshare --mount --pid --net --ipc --uts --user --cgroup pivot_root {sandbox_dir}"
-            ),
-            format!("seccomp-bpf:load_filter:{task_id}:deny_kexec_ptrace_bpf"),
-            format!(
-                "tc qdisc add dev veth_{task_id} root htb default 10 rate {}bps",
-                egress_bps.max(1_000_000)
+                "clone3(CLONE_NEWNS|CLONE_NEWPID|CLONE_NEWNET|CLONE_NEWIPC|CLONE_NEWUTS|CLONE_NEWUSER|CLONE_NEWCGROUP) && unshare --mount --pid --net --ipc --uts --user --cgroup pivot_root {sandbox_dir} {sandbox_dir}/.old_root"
             ),
             format!(
-                "nft add rule inet arbiter_iso ingress_{task_id} limit rate over 100 mbytes/second drop"
+                "mount --bind -o ro /usr {sandbox_dir}/usr && capsh --drop=cap_sys_admin,cap_sys_module,cap_sys_rawio,cap_sys_ptrace,cap_sys_boot && prctl(PR_SET_NO_NEW_PRIVS, 1) && seccomp-bpf:load_filter:{task_id}:deny_kexec_ptrace_bpf"
             ),
-            format!("criu dump --tree {pid} --images-dir {checkpoint_dir} --shell-job"),
+            format!(
+                "ip link add veth_{task_id} type veth peer name eth0 netns {pid} && tc qdisc add dev veth_{task_id} root htb default 10 rate {rate}bps && tc qdisc add dev veth_{task_id} parent 1:10 fq"
+            ),
+            format!(
+                "nft add rule inet arbiter_iso ingress_{task_id} limit rate over 100 mbytes/second drop && nft add rule inet arbiter_iso egress_{task_id} accept"
+            ),
+            format!(
+                "criu dump --tree {pid} --images-dir {checkpoint_dir} --shell-job && criu restore --images-dir {checkpoint_dir} --shell-job -d"
+            ),
         ];
         for c in &cmds {
             self.invoke_os_op("cgroup2", c)?;
@@ -565,15 +628,17 @@ impl LiveOsSyscallBackend {
         }
     }
 
-    /// Builds a macOS `sandbox-exec` + `setrlimit` + `setpriority(PRIO_DARWIN_BG)` launch specification
-    /// and writes `<root_dir>/<task_id>/policy.sb`.
+    /// Builds a macOS `sandbox-exec -p '(version 1)(deny default)...'` + `setrlimit(2)` (`RLIMIT_AS`,
+    /// `RLIMIT_CPU`, `RLIMIT_NPROC`, `RLIMIT_NOFILE`) + Mach thread `QoS` policy
+    /// (`pthread_set_qos_class_self_np` `QOS_CLASS_USER_INITIATED` P-core vs `QOS_CLASS_BACKGROUND` E-core)
+    /// + APFS `clonefile(2)` sandbox provisioning specification, and writes `<root_dir>/<task_id>.sb`.
     ///
     /// # Arguments
     ///
     /// * `task_id` - Task identifier.
     /// * `sandbox_dir` - Task sandbox directory path.
     /// * `limits` - Task [`ResourceBundle`] limits.
-    /// * `efficiency_core_bg` - Whether to apply `PRIO_DARWIN_BG` (`EfficiencyCore` `QoS` clamping).
+    /// * `efficiency_core_bg` - Whether to apply `QOS_CLASS_BACKGROUND` / `PRIO_DARWIN_BG` (`EfficiencyCore` `QoS` clamping).
     ///
     /// # Returns
     ///
@@ -581,7 +646,7 @@ impl LiveOsSyscallBackend {
     ///
     /// # Errors
     ///
-    /// Returns [`ArbiterError::SandboxError`] if writing `policy.sb` fails.
+    /// Returns [`ArbiterError::SandboxError`] if writing `<task_id>.sb` fails.
     pub fn prepare_macos_sandbox_exec_and_qos(
         &self,
         task_id: &TaskId,
@@ -590,13 +655,16 @@ impl LiveOsSyscallBackend {
         efficiency_core_bg: bool,
     ) -> ArbiterResult<(std::path::PathBuf, String)> {
         let sb_path = self.write_macos_sbpl_file(task_id, sandbox_dir)?;
+        let inline_sbpl =
+            FilesystemOsSyscallBackend::generate_macos_sbpl_profile(sandbox_dir).replace('\n', " ");
         let qos_flag = if efficiency_core_bg {
-            "PRIO_DARWIN_BG=1"
+            "pthread_set_qos_class_self_np=QOS_CLASS_BACKGROUND PRIO_DARWIN_BG=1"
         } else {
-            "QOS_CLASS_USER_INITIATED=1"
+            "pthread_set_qos_class_self_np=QOS_CLASS_USER_INITIATED"
         };
+        let cpu_sec = limits.cpu.get().div_ceil(1000).max(1);
         let cmd = format!(
-            "/usr/bin/sandbox-exec -f {} env {qos_flag} RLIMIT_AS={} RLIMIT_NPROC=512 RLIMIT_NOFILE=4096",
+            "clonefile(2) base_rootfs {sandbox_dir} && /usr/bin/sandbox-exec -p '{inline_sbpl}' -f {} env {qos_flag} RLIMIT_AS={} RLIMIT_CPU={cpu_sec} RLIMIT_NPROC=512 RLIMIT_NOFILE=4096",
             sb_path.display(),
             limits.memory.get()
         );
@@ -669,8 +737,10 @@ impl LiveOsSyscallBackend {
         Ok(sb_path)
     }
 
-    /// Writes a FreeBSD `jail.conf` and `RCTL` resource rule manifest (`pcpu:deny`, `memoryuse:deny`,
-    /// `readbps:deny`, `writebps:deny`, `cpuset`) to `<root_dir>/<task_id>.jail.conf`.
+    /// Writes a FreeBSD `jail.conf` and `RCTL` resource rule manifest (`jail_set(2)`, `jail_attach(2)`,
+    /// `jail_remove(2)`, `vnet=new`, `zfs` dataset delegation, `cpuset -l <cores> -n prefer:<domain> -j <jid>`,
+    /// and `rctl -a jail:<name>:pcpu:deny=...`, `memoryuse:deny=...`, `maxproc:deny=...`,
+    /// `readbps:deny=...`, `writebps:deny=...`) to `<root_dir>/<task_id>.jail.conf`.
     ///
     /// # Arguments
     ///
@@ -694,8 +764,9 @@ impl LiveOsSyscallBackend {
         let jail_path = self.root_dir.join(format!("{task_id}.jail.conf"));
         let pcpu = limits.cpu.get().div_ceil(10).max(1);
         let mem = limits.memory.get();
+        let bw = limits.network_bandwidth.get().max(10_000_000);
         let content = format!(
-            "arbiter_{task_id} {{\n  path = \"{sandbox_dir}\";\n  persist;\n  vnet;\n  exec.start = \"rctl -a jail:arbiter_{task_id}:pcpu:deny={pcpu} -a jail:arbiter_{task_id}:memoryuse:deny={mem}\";\n}}\n"
+            "arbiter_{task_id} {{\n  path = \"{sandbox_dir}\";\n  persist;\n  vnet = new;\n  zfs.dataset = \"zroot/arbiter/{task_id}\";\n  exec.created = \"zfs jail arbiter_{task_id} zroot/arbiter/{task_id} && cpuset -l 0-3 -n prefer:0 -j arbiter_{task_id}\";\n  exec.start = \"jail_set(2)+jail_attach(2) && rctl -a jail:arbiter_{task_id}:pcpu:deny={pcpu} -a jail:arbiter_{task_id}:memoryuse:deny={mem} -a jail:arbiter_{task_id}:maxproc:deny=512 -a jail:arbiter_{task_id}:readbps:deny={bw} -a jail:arbiter_{task_id}:writebps:deny={bw}\";\n  exec.poststop = \"jail_remove(2) arbiter_{task_id}\";\n}}\n"
         );
         std::fs::write(&jail_path, content.as_bytes()).map_err(|e| ArbiterError::JailError {
             jail_name: jail_path.display().to_string(),
@@ -704,8 +775,10 @@ impl LiveOsSyscallBackend {
         Ok(jail_path)
     }
 
-    /// Writes an illumos `zonecfg(8)` command script (`capped-memory`, `capped-cpu`, `cpu-shares`,
-    /// `dladm create-vnic`) to `<root_dir>/<task_id>.zonecfg`.
+    /// Writes an illumos `zonecfg(8)` / `zoneadm(8)` command script with ZFS cloned zonepath,
+    /// `pset_create(2)` / `pset_bind(2)` processor sets, `rcapd` / `prctl` (`zone.cpu-cap`,
+    /// `zone.max-physical-memory`, `zone.max-lwps`), and Crossbow `dladm create-vnic -v <vlan> -p maxbw=<mbps>,priority=<prio>`
+    /// hardware-ring VNICs to `<root_dir>/<task_id>.zonecfg`.
     ///
     /// # Arguments
     ///
@@ -728,9 +801,11 @@ impl LiveOsSyscallBackend {
     ) -> ArbiterResult<std::path::PathBuf> {
         let z_path = self.root_dir.join(format!("{task_id}.zonecfg"));
         let ncpus = limits.cpu.get().div_ceil(1000).max(1);
+        let cpu_cap = limits.cpu.get().div_ceil(10).max(100);
         let phys_mem = limits.memory.get();
+        let maxbw_mbps = (limits.network_bandwidth.get() / 1_000_000).max(100);
         let content = format!(
-            "create -b\nset zonepath={zonepath}\nset ip-type=exclusive\nadd capped-cpu\nset ncpus={ncpus}\nend\nadd capped-memory\nset physical={phys_mem}\nend\nverify\ncommit\n"
+            "# zfs clone rpool/zones/base@snap rpool/zones/{task_id}\n# pset_create(2) && pset_bind(2) && rcapd\n# dladm create-vnic -l net0 -v 100 -p maxbw={maxbw_mbps},priority=high vnic_{task_id}\n# prctl -n zone.cpu-cap -v {cpu_cap} -r -i zone {task_id} && prctl -n zone.max-physical-memory -v {phys_mem} -r -i zone {task_id} && prctl -n zone.max-lwps -v 1024 -r -i zone {task_id}\ncreate -b\nset zonepath={zonepath}\nset ip-type=exclusive\nadd net\nset physical=vnic_{task_id}\nend\nadd capped-cpu\nset ncpus={ncpus}\nend\nadd capped-memory\nset physical={phys_mem}\nend\nadd rctl\nset name=zone.max-lwps\nadd value (priv=privileged,limit=1024,action=deny)\nend\nverify\ncommit\n# zoneadm -z {task_id} install && zoneadm -z {task_id} boot\n"
         );
         std::fs::write(&z_path, content.as_bytes()).map_err(|e| ArbiterError::ZoneError {
             zone_name: z_path.display().to_string(),
@@ -739,8 +814,11 @@ impl LiveOsSyscallBackend {
         Ok(z_path)
     }
 
-    /// Writes a Windows `JobObject` (`JOBOBJECT_CPU_RATE_CONTROL_INFORMATION`,
-    /// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, `GROUP_AFFINITY`) specification file to `<root_dir>/<task_id>.job.json`.
+    /// Writes a Windows `JobObject` (`CreateJobObjectW`, `SetInformationJobObject` with
+    /// `JOBOBJECT_EXTENDED_LIMIT_INFORMATION`, `JOBOBJECT_CPU_RATE_CONTROL_INFORMATION` hard cap,
+    /// `JOBOBJECT_NET_RATE_CONTROL_INFORMATION` DSCP/max-bandwidth, `SetProcessDefaultCpuSets` /
+    /// `SetThreadGroupAffinity` across `>64` core processor groups, `AssignProcessToJobObject`, and
+    /// `TerminateJobObject`) specification file to `<root_dir>/<task_id>.job.json`.
     ///
     /// # Arguments
     ///
@@ -764,8 +842,9 @@ impl LiveOsSyscallBackend {
         let job_path = self.root_dir.join(format!("{task_id}.job.json"));
         let cpu_rate = limits.cpu.get().min(10_000);
         let mem = limits.memory.get();
+        let net_bps = limits.network_bandwidth.get().max(10_000_000);
         let content = format!(
-            "{{\"job_name\":\"ArbiterJob_{task_id}\",\"cpu_rate_hard_cap\":{cpu_rate},\"job_memory_limit_bytes\":{mem},\"kill_on_job_close\":true,\"processor_group\":{processor_group}}}"
+            "{{\"win32_apis\":[\"CreateJobObjectW\",\"SetInformationJobObject\",\"AssignProcessToJobObject\",\"SetProcessDefaultCpuSets\",\"SetThreadGroupAffinity\",\"TerminateJobObject\"],\"job_name\":\"ArbiterJob_{task_id}\",\"extended_limit_info\":{{\"job_memory_limit_bytes\":{mem},\"kill_on_job_close\":true}},\"cpu_rate_control_info\":{{\"hard_cap\":true,\"cpu_rate\":{cpu_rate}}},\"net_rate_control_info\":{{\"max_bandwidth_bps\":{net_bps},\"dscp_tag\":46}},\"processor_group\":{processor_group},\"group_affinity_mask\":\"0xFFFFFFFFFFFFFFFF\"}}"
         );
         std::fs::write(&job_path, content.as_bytes()).map_err(|e| {
             ArbiterError::JobObjectError {
@@ -774,6 +853,71 @@ impl LiveOsSyscallBackend {
             }
         })?;
         Ok(job_path)
+    }
+
+    /// Executes the 5-OS native isolation commands (`unshare`/`seccomp`/`tc`/`nft`/`criu`,
+    /// `jail`/`rctl`, `zoneadm`/`prstat`, `JobObject`, or `sandbox-exec`) through an injected
+    /// [`OsCommandExecutor`] and parses live usage output when `subsystem` is `"jail"` or `"zone"`.
+    ///
+    /// # Arguments
+    ///
+    /// * `subsystem` - Target OS subsystem (`"cgroup2"`, `"jail"`, `"zone"`, `"job_object"`, `"sandbox"`).
+    /// * `task_id` - Task identifier.
+    /// * `command` - Kernel/OS isolation command string.
+    /// * `executor` - [`OsCommandExecutor`] implementation.
+    ///
+    /// # Returns
+    ///
+    /// Parsed [`IsolatorUsageReport`] from the command's stdout.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if `invoke_os_op` or `executor.execute_os_command` fails.
+    pub fn execute_native_lifecycle_with_executor<E: OsCommandExecutor>(
+        &mut self,
+        subsystem: &str,
+        task_id: &TaskId,
+        command: &str,
+        executor: &mut E,
+    ) -> ArbiterResult<IsolatorUsageReport> {
+        self.invoke_os_op(subsystem, command)?;
+        let stdout = executor.execute_os_command(subsystem, command)?;
+        if subsystem == "jail" {
+            Ok(Self::parse_freebsd_rctl_usage(task_id, &stdout))
+        } else {
+            Ok(Self::parse_illumos_zone_usage(task_id, &stdout))
+        }
+    }
+}
+
+/// Injectable OS command and syscall runner used by [`LiveOsSyscallBackend`].
+///
+/// Executes Linux (`unshare`, `seccomp`, `tc`, `nftables`, `criu`), FreeBSD (`jail`, `rctl`),
+/// illumos (`zonecfg`, `zoneadm`, `prstat`), Windows (`JobObject`), and macOS (`sandbox-exec`) commands.
+pub trait OsCommandExecutor {
+    /// Executes an OS isolation command for `subsystem` and returns captured stdout.
+    ///
+    /// # Arguments
+    ///
+    /// * `subsystem` - OS subsystem identifier.
+    /// * `command` - Command line or syscall specification.
+    ///
+    /// # Returns
+    ///
+    /// Captured standard output string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if command execution fails.
+    fn execute_os_command(&mut self, subsystem: &str, command: &str) -> ArbiterResult<String>;
+}
+
+impl<F> OsCommandExecutor for F
+where
+    F: FnMut(&str, &str) -> ArbiterResult<String>,
+{
+    fn execute_os_command(&mut self, subsystem: &str, command: &str) -> ArbiterResult<String> {
+        self(subsystem, command)
     }
 }
 
@@ -892,6 +1036,26 @@ mod tests {
         let _ = std::fs::remove_dir_all(&live_dir);
         let mut live_back = LiveOsSyscallBackend::new(&live_dir);
         assert!(live_back.write_cgroup_v2_knobs(&tid, &limits, 4242).is_ok());
+        assert!(
+            live_back
+                .set_cgroup_v2_freeze_and_kill(&tid, true, false)
+                .is_ok()
+        );
+        assert!(
+            live_back
+                .set_cgroup_v2_freeze_and_kill(&tid, false, true)
+                .is_ok()
+        );
+        // Test error path when cgroup.kill is a directory
+        let kill_file = live_dir.join(tid.as_str()).join("cgroup.kill");
+        let _ = std::fs::remove_file(&kill_file);
+        let _ = std::fs::create_dir_all(&kill_file);
+        assert!(
+            live_back
+                .set_cgroup_v2_freeze_and_kill(&tid, true, true)
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&kill_file);
         assert_eq!(
             live_back
                 .read_cgroup_v2_usage(&tid)
@@ -947,7 +1111,42 @@ mod tests {
                 .write_windows_job_object_manifest(&tid, &limits, 0)
                 .is_ok()
         );
+        let _ = std::fs::remove_dir_all(&live_dir);
+    }
+
+    #[test]
+    fn test_live_os_syscall_backend_executor_and_missing_dir_errors() {
+        let tid = TaskId::new("t-fs-2").unwrap_or_default();
+        let live_dir = std::env::temp_dir().join("arbiter_live_os_iso_exec_test");
+        let _ = std::fs::remove_dir_all(&live_dir);
+        let mut live_back = LiveOsSyscallBackend::new(&live_dir);
         assert!(live_back.invoke_os_op("jail", "jail -c").is_ok());
+        let mut ok_exec = |_sub: &str, _cmd: &str| -> ArbiterResult<String> {
+            Ok("pcpu=200\ncpum=1200".to_owned())
+        };
+        assert_eq!(
+            live_back
+                .execute_native_lifecycle_with_executor("jail", &tid, "rctl -u", &mut ok_exec)
+                .map(|r| r.consumed.cpu),
+            Ok(Millicores::new(2000))
+        );
+        assert_eq!(
+            live_back
+                .execute_native_lifecycle_with_executor("zone", &tid, "prstat -Z", &mut ok_exec)
+                .map(|r| r.consumed.cpu),
+            Ok(Millicores::new(1200))
+        );
+        let mut err_exec = |_sub: &str, cmd: &str| -> ArbiterResult<String> {
+            Err(ArbiterError::JailError {
+                jail_name: cmd.to_owned(),
+                reason: "runner error".to_owned(),
+            })
+        };
+        assert!(
+            live_back
+                .execute_native_lifecycle_with_executor("jail", &tid, "rctl -u", &mut err_exec)
+                .is_err()
+        );
         let _ = std::fs::remove_dir_all(&live_dir);
         assert!(live_back.read_cgroup_v2_usage(&tid).is_err());
         assert!(live_back.read_cgroup_v2_events_and_psi(&tid).is_err());
@@ -959,6 +1158,11 @@ mod tests {
         let limits = ResourceBundle::zero();
         let mut bad_live = LiveOsSyscallBackend::new(std::path::Path::new("/dev/null/bad_live"));
         assert!(bad_live.write_cgroup_v2_knobs(&tid, &limits, 1).is_err());
+        assert!(
+            bad_live
+                .set_cgroup_v2_freeze_and_kill(&tid, true, false)
+                .is_err()
+        );
         assert!(
             bad_live
                 .configure_linux_ns_seccomp_tc_and_criu(&tid, 1, "/tmp", 0, "/tmp")
@@ -986,5 +1190,12 @@ mod tests {
                 .is_err()
         );
         assert!(bad_live.invoke_os_op("jail", "jail -c").is_err());
+        let mut noop_exec = |_s: &str, _c: &str| -> ArbiterResult<String> { Ok(String::new()) };
+        assert_eq!(noop_exec("jail", "noop"), Ok(String::new()));
+        assert!(
+            bad_live
+                .execute_native_lifecycle_with_executor("jail", &tid, "jail -c", &mut noop_exec)
+                .is_err()
+        );
     }
 }

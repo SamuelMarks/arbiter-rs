@@ -14,6 +14,12 @@ categories.workspace = true
 [dependencies]
 arbiter-core = { workspace = true }
 arbiter-agent = { workspace = true }
+arbiter-iso = { workspace = true }
+arbiter-net = { workspace = true }
+arbiter-probe = { workspace = true }
+arbiter-proto = { workspace = true }
+arbiter-telemetry = { workspace = true }
+tokio = { workspace = true }
 
 [lints]
 workspace = true

@@ -80,6 +80,24 @@ impl TpuProbe for GoogleTpuProbe {
 }
 
 impl GoogleTpuProbe {
+    /// Discovers Google Cloud TPU (`accel*`) and Coral Edge TPU (`apex_*`) devices strictly from
+    /// `sysfs_accel_dir` (`/sys/class/accel`) without fabricating fake TPUs when no hardware is present.
+    ///
+    /// # Arguments
+    ///
+    /// * `sysfs_accel_dir` - Path to `/sys/class/accel`.
+    /// * `slice_id` - TPU slice identifier string.
+    ///
+    /// # Returns
+    ///
+    /// [`GoogleTpuProbe`] with `records.is_empty()` when no TPU devices exist on the host.
+    pub fn from_host_strict_with_dir(sysfs_accel_dir: &std::path::Path, slice_id: &str) -> Self {
+        Self::discover_tpus_from_sysfs_dir(sysfs_accel_dir, slice_id).unwrap_or(Self {
+            driver_ready: true,
+            records: Vec::new(),
+        })
+    }
+
     /// Discovers Google Cloud TPU or Coral Edge TPU devices on the host from `TPU_CHIPS_PER_HOST_BOUNDS`
     /// and `/dev/accel*` (with baseline fallback).
     ///
@@ -218,6 +236,39 @@ impl GoogleTpuProbe {
             records,
         })
     }
+
+    /// Scans a `/sys/class/accel` or `/dev` directory on disk to discover Cloud TPU (`accel*`)
+    /// and Coral Edge TPU (`apex_*`) device nodes.
+    ///
+    /// # Arguments
+    ///
+    /// * `sysfs_accel_dir` - Path to `/sys/class/accel` or a synthetic test directory.
+    /// * `slice_id` - TPU slice identifier string.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`GoogleTpuProbe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::TpuDriverError`] if `sysfs_accel_dir` cannot be read or contains no TPU nodes.
+    pub fn discover_tpus_from_sysfs_dir(
+        sysfs_accel_dir: &std::path::Path,
+        slice_id: &str,
+    ) -> ArbiterResult<Self> {
+        let entries =
+            std::fs::read_dir(sysfs_accel_dir).map_err(|e| ArbiterError::TpuDriverError {
+                device: sysfs_accel_dir.display().to_string(),
+                reason: e.to_string(),
+            })?;
+        let mut names: Vec<String> = entries
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        let refs: Vec<&str> = names.iter().map(String::as_str).collect();
+        Self::from_sysfs_accel_entries(&refs, slice_id)
+    }
 }
 
 #[cfg(test)]
@@ -285,6 +336,11 @@ mod tests {
             GoogleTpuProbe::from_tpu_env_bounds("2,2,0", "s1", TpuGeneration::CloudTpuV5p).is_err()
         );
         assert!(GoogleTpuProbe::from_host().probe_tpus().is_ok());
+        let strict_empty_tpu = GoogleTpuProbe::from_host_strict_with_dir(
+            std::path::Path::new("/dev/null/missing_accel"),
+            "s1",
+        );
+        assert!(strict_empty_tpu.records.is_empty());
 
         let sysfs_tpu = GoogleTpuProbe::from_sysfs_accel_entries(
             &["accel0", "apex_0", "ignored"],
@@ -292,5 +348,21 @@ mod tests {
         );
         assert!(sysfs_tpu.is_ok());
         assert!(GoogleTpuProbe::from_sysfs_accel_entries(&["ignored"], "s").is_err());
+
+        assert!(
+            GoogleTpuProbe::discover_tpus_from_sysfs_dir(
+                std::path::Path::new("/dev/null/missing_accel"),
+                "s1"
+            )
+            .is_err()
+        );
+        let accel_dir = std::env::temp_dir().join("arbiter_tpu_accel_dir_test");
+        let _ = std::fs::remove_dir_all(&accel_dir);
+        let _ = std::fs::create_dir_all(accel_dir.join("accel0"));
+        let _ = std::fs::create_dir_all(accel_dir.join("apex_0"));
+        let disc_tpu = GoogleTpuProbe::discover_tpus_from_sysfs_dir(&accel_dir, "slice-dir")
+            .unwrap_or_default();
+        assert_eq!(disc_tpu.records.len(), 2);
+        let _ = std::fs::remove_dir_all(&accel_dir);
     }
 }

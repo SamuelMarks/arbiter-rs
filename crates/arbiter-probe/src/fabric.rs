@@ -80,6 +80,27 @@ impl FabricProbe for HighSpeedFabricProbe {
 }
 
 impl HighSpeedFabricProbe {
+    /// Discovers high-speed RDMA (`InfiniBand`/`RoCEv2`) NICs strictly from `sysfs_ib_dir`
+    /// (`/sys/class/infiniband`) without fabricating synthetic `mlx5_0` devices when absent.
+    ///
+    /// # Arguments
+    ///
+    /// * `sysfs_ib_dir` - Path to `/sys/class/infiniband`.
+    /// * `fabric_kind` - Default [`RdmaFabricKind`] for discovered HCAs.
+    ///
+    /// # Returns
+    ///
+    /// [`HighSpeedFabricProbe`] with `nics.is_empty()` when no InfiniBand/RoCE NICs exist on the host.
+    pub fn from_host_strict_with_dir(
+        sysfs_ib_dir: &std::path::Path,
+        fabric_kind: RdmaFabricKind,
+    ) -> Self {
+        Self::discover_infiniband_from_sysfs_dir(sysfs_ib_dir, fabric_kind).unwrap_or(Self {
+            probe_healthy: true,
+            nics: Vec::new(),
+        })
+    }
+
     /// Discovers high-speed RDMA (`InfiniBand`/`RoCEv2`), FreeBSD `epair`/`VNET`, and illumos
     /// `dladm` fabric interfaces on the host.
     ///
@@ -205,6 +226,65 @@ impl HighSpeedFabricProbe {
             });
         }
         Ok(edges)
+    }
+
+    /// Scans a Linux `/sys/class/infiniband` directory (`<hca>/ports/1/rate`, `<hca>/device/numa_node`,
+    /// `<hca>/device/sriov_numvfs`) to discover `InfiniBand` and `RoCEv2` RDMA NICs on disk.
+    ///
+    /// # Arguments
+    ///
+    /// * `sysfs_ib_dir` - Path to `/sys/class/infiniband` or a synthetic test directory.
+    /// * `fabric_kind` - [`RdmaFabricKind`] for discovered HCAs.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`HighSpeedFabricProbe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ProbeFailed`] if `sysfs_ib_dir` cannot be read.
+    pub fn discover_infiniband_from_sysfs_dir(
+        sysfs_ib_dir: &std::path::Path,
+        fabric_kind: RdmaFabricKind,
+    ) -> ArbiterResult<Self> {
+        let entries = std::fs::read_dir(sysfs_ib_dir).map_err(|e| ArbiterError::ProbeFailed {
+            probe_name: "HighSpeedFabricProbe".to_owned(),
+            reason: e.to_string(),
+        })?;
+        let mut nics = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rate_raw =
+                std::fs::read_to_string(entry.path().join("ports").join("1").join("rate"))
+                    .unwrap_or_default();
+            let speed_gbps = rate_raw
+                .split_whitespace()
+                .next()
+                .and_then(|s| s.parse::<u64>().ok())
+                .unwrap_or(200);
+            let numa_node_id =
+                std::fs::read_to_string(entry.path().join("device").join("numa_node"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+            let sriov_vfs =
+                std::fs::read_to_string(entry.path().join("device").join("sriov_numvfs"))
+                    .ok()
+                    .and_then(|s| s.trim().parse::<u32>().ok())
+                    .unwrap_or(0);
+            nics.push(FabricNicRecord {
+                name,
+                fabric_kind,
+                numa_node_id,
+                speed_gbps,
+                sriov_vfs,
+            });
+        }
+        nics.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(Self {
+            probe_healthy: true,
+            nics,
+        })
     }
 }
 
@@ -337,6 +417,7 @@ mod tests {
     use crate::traits::{GpuProbe, SystemProbe, TpuProbe};
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_fabric_probe_and_full_topology_assembly() {
         let sys = MacOsSysctlProbe {
             perf_cores: 2,
@@ -438,6 +519,11 @@ mod tests {
             .is_err()
         );
         assert!(HighSpeedFabricProbe::from_host().probe_fabric().is_ok());
+        let strict_empty_ib = HighSpeedFabricProbe::from_host_strict_with_dir(
+            std::path::Path::new("/dev/null/missing_ib"),
+            RdmaFabricKind::InfiniBand,
+        );
+        assert!(strict_empty_ib.nics.is_empty());
 
         let pcie_edges = HighSpeedFabricProbe::parse_pcie_sysfs_symlink_bridges(
             "\ngpu-0=/sys/devices/pci0000:00/0000:00:01.0/0000:01:00.0\nmlx5_0=/sys/devices/pci0000:00/0000:00:01.0/0000:02:00.0\n",
@@ -447,5 +533,36 @@ mod tests {
         assert!(HighSpeedFabricProbe::parse_pcie_sysfs_symlink_bridges("no_equals").is_err());
         assert!(HighSpeedFabricProbe::parse_pcie_sysfs_symlink_bridges("gpu-0=/single").is_err());
         assert!(HighSpeedFabricProbe::parse_pcie_sysfs_symlink_bridges(" =/a/b").is_err());
+
+        assert!(
+            HighSpeedFabricProbe::discover_infiniband_from_sysfs_dir(
+                std::path::Path::new("/dev/null/missing_ib"),
+                RdmaFabricKind::InfiniBand
+            )
+            .is_err()
+        );
+        let ib_dir = std::env::temp_dir().join("arbiter_ib_sysfs_test");
+        let _ = std::fs::remove_dir_all(&ib_dir);
+        let hca = ib_dir.join("mlx5_0");
+        let _ = std::fs::create_dir_all(hca.join("ports").join("1"));
+        let _ = std::fs::create_dir_all(hca.join("device"));
+        let _ = std::fs::write(
+            hca.join("ports").join("1").join("rate"),
+            "400 Gb/sec (4X NDR)\n",
+        );
+        let _ = std::fs::write(hca.join("device").join("numa_node"), "1\n");
+        let _ = std::fs::write(hca.join("device").join("sriov_numvfs"), "8\n");
+        let hca1 = ib_dir.join("mlx5_1");
+        let _ = std::fs::create_dir_all(hca1.join("ports").join("1"));
+        let disc_ib = HighSpeedFabricProbe::discover_infiniband_from_sysfs_dir(
+            &ib_dir,
+            RdmaFabricKind::InfiniBand,
+        )
+        .unwrap_or(HighSpeedFabricProbe {
+            probe_healthy: false,
+            nics: Vec::new(),
+        });
+        assert_eq!(disc_ib.nics.len(), 2);
+        let _ = std::fs::remove_dir_all(&ib_dir);
     }
 }

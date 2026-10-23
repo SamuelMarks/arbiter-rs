@@ -252,6 +252,9 @@ define_u64_unit!(
     "Millicores"
 );
 
+/// Canonical alias for [`Millicores`] when distinguishing CPU compute millicores from [`GpuMillicores`].
+pub type CpuMillicores = Millicores;
+
 define_u64_unit!(
     /// GPU compute slice measured in millicores (`1000gm = 1 whole GPU compute engine`).
     GpuMillicores,
@@ -409,6 +412,123 @@ define_u64_unit!(
     "FileReadLength"
 );
 
+define_u64_unit!(
+    /// Wall-clock or timeout duration measured in milliseconds (`ms`).
+    MillisecondDuration,
+    "ms",
+    "MillisecondDuration"
+);
+
+define_u64_unit!(
+    /// Wall-clock timestamp in milliseconds since the Unix epoch (`1970-01-01T00:00:00Z`).
+    WallClockUnixMillis,
+    "unix_ms",
+    "WallClockUnixMillis"
+);
+
+/// Alias for [`BandwidthBps`] when describing hardware interconnect link bandwidth.
+pub type InterconnectBandwidthBps = BandwidthBps;
+
+/// Canonical alias for [`BandwidthBps`] (`BitsPerSecond`).
+pub type BitsPerSecond = BandwidthBps;
+
+/// Canonical alias for [`LatencyMicros`] (`Microseconds`).
+pub type Microseconds = LatencyMicros;
+
+/// Alias for [`RaftTerm`] when referring to generic consensus term numbers.
+pub type TermNumber = RaftTerm;
+
+/// Alias for [`RaftLogIndex`] when referring to generic write-ahead log entry indices.
+pub type LogIndex = RaftLogIndex;
+
+/// Strongly-typed 32-bit cyclic redundancy check (`CRC32`) checksum for WAL, snapshot, and `ARBW` frames.
+#[must_use]
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct Crc32Checksum(u32);
+
+impl Crc32Checksum {
+    /// Wraps a raw `u32` CRC32 checksum value.
+    ///
+    /// # Arguments
+    ///
+    /// * `value` - Raw 32-bit CRC32 value.
+    ///
+    /// # Returns
+    ///
+    /// Wrapped [`Crc32Checksum`].
+    pub const fn new(value: u32) -> Self {
+        Self(value)
+    }
+
+    /// Returns the underlying `u32` checksum value.
+    ///
+    /// # Returns
+    ///
+    /// Raw 32-bit CRC32 integer.
+    pub const fn get(self) -> u32 {
+        self.0
+    }
+
+    /// Verifies that `self` matches `expected`, returning an error on mismatch.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected` - Expected [`Crc32Checksum`].
+    /// * `context` - Frame or segment identifier for diagnostics.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when the checksums match.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidResourceQuantity`] if `self != expected`.
+    pub fn verify(self, expected: Self, context: &str) -> ArbiterResult<()> {
+        if self == expected {
+            Ok(())
+        } else {
+            Err(ArbiterError::InvalidResourceQuantity {
+                resource: format!("Crc32Checksum({context})"),
+                quantity: u64::from(self.0),
+                reason: format!(
+                    "CRC32 mismatch: expected 0x{:08x}, found 0x{:08x}",
+                    expected.0, self.0
+                ),
+            })
+        }
+    }
+}
+
+impl fmt::Display for Crc32Checksum {
+    /// Formats the CRC32 checksum in lowercase hexadecimal (`crc32:0x...`).
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "crc32:0x{:08x}", self.0)
+    }
+}
+
 /// Strongly-typed control-plane and agent logging verbosity level (`SET_LOGGING_LEVEL` / `GET_LOGGING_LEVEL`).
 #[must_use]
 #[derive(
@@ -555,6 +675,8 @@ impl HttpStatusCode {
     pub const ACCEPTED: Self = Self(202);
     /// HTTP `204 No Content`.
     pub const NO_CONTENT: Self = Self(204);
+    /// HTTP `307 Temporary Redirect` (Master leader redirect).
+    pub const TEMPORARY_REDIRECT: Self = Self(307);
     /// HTTP `400 Bad Request`.
     pub const BAD_REQUEST: Self = Self(400);
     /// HTTP `401 Unauthorized`.
@@ -1843,6 +1965,29 @@ mod tests {
     test_unit_type!(test_offer_ttl_ticks, OfferTtlTicks, "ticks");
     test_unit_type!(test_file_read_offset, FileReadOffset, "B");
     test_unit_type!(test_file_read_length, FileReadLength, "B");
+    test_unit_type!(test_millisecond_duration, MillisecondDuration, "ms");
+    test_unit_type!(test_wall_clock_unix_millis, WallClockUnixMillis, "unix_ms");
+
+    #[test]
+    fn test_crc32_checksum_and_type_aliases() {
+        let crc = Crc32Checksum::new(0xDEAD_BEEF);
+        assert_eq!(crc.get(), 0xDEAD_BEEF);
+        assert_eq!(crc.to_string(), "crc32:0xdeadbeef");
+        assert!(crc.verify(Crc32Checksum::new(0xDEAD_BEEF), "wal").is_ok());
+        assert!(crc.verify(Crc32Checksum::default(), "wal").is_err());
+
+        let term: TermNumber = RaftTerm::new(3);
+        let idx: LogIndex = RaftLogIndex::new(9);
+        let bw: InterconnectBandwidthBps = BandwidthBps::new(100_000);
+        let bps: BitsPerSecond = BandwidthBps::new(50_000);
+        let us: Microseconds = LatencyMicros::new(180);
+        assert_eq!(term.get(), 3);
+        assert_eq!(idx.get(), 9);
+        assert_eq!(bw.get(), 100_000);
+        assert_eq!(bps.get(), 50_000);
+        assert_eq!(us.get(), 180);
+        let _ = rkyv::to_bytes::<rkyv::rancor::Error>(&crc);
+    }
 
     #[test]
     fn test_logging_level_conversions() {

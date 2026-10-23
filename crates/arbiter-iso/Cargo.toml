@@ -16,5 +16,8 @@ arbiter-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
+
 [lints]
 workspace = true

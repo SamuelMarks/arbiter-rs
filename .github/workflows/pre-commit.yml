@@ -1,0 +1,303 @@
+name: Pre-commit & CI Quality Gates
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    tags:
+      - "v*"
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: "0"
+  RUST_BACKTRACE: "1"
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # Hook 1: cargo-fmt (python3 scripts/pre_commit.py fmt --check)
+  # ---------------------------------------------------------------------------
+  hook-cargo-fmt:
+    name: "Hook [1/5]: cargo-fmt"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain with rustfmt
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run cargo-fmt pre-commit hook (--check)
+        run: python3 scripts/pre_commit.py fmt --check
+
+      - name: Verify clean working tree after formatting check
+        run: git diff --exit-code
+
+  # ---------------------------------------------------------------------------
+  # Hook 2: cargo-build across Linux, macOS, and Windows
+  # ---------------------------------------------------------------------------
+  hook-cargo-build:
+    name: "Hook [2/5]: cargo-build (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run cargo-build pre-commit hook
+        run: python3 scripts/pre_commit.py build --check
+
+      - name: Verify release binary compilation (--workspace --bins --release)
+        run: cargo build --workspace --bins --release --locked
+
+  # ---------------------------------------------------------------------------
+  # Hook 3: cargo-clippy & rustdoc across Linux, macOS, and Windows
+  # ---------------------------------------------------------------------------
+  hook-cargo-clippy:
+    name: "Hook [3/5]: cargo-clippy & rustdoc (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain with clippy
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rust-docs
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run cargo-clippy & rustdoc pre-commit hook
+        run: python3 scripts/pre_commit.py clippy --check
+
+  # ---------------------------------------------------------------------------
+  # Hook 4: cargo-test across Linux, macOS, and Windows
+  # ---------------------------------------------------------------------------
+  hook-cargo-test:
+    name: "Hook [4/5]: cargo-test (${{ matrix.os }})"
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - macos-latest
+          - windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run cargo-test pre-commit hook
+        run: python3 scripts/pre_commit.py test --check
+
+      - name: Run workspace documentation tests
+        run: cargo test --workspace --doc
+
+  # ---------------------------------------------------------------------------
+  # Hook 5: update-shields (100% doc coverage & 100% llvm-cov branch/line/fn)
+  # ---------------------------------------------------------------------------
+  hook-update-shields:
+    name: "Hook [5/5]: update-shields (100% Doc & Test Coverage)"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Rust nightly toolchain with llvm-tools-preview
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview, rust-docs
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python 3
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Run update-shields pre-commit hook (--check)
+        run: python3 scripts/pre_commit.py shields --check
+
+      - name: Verify README.md shields are clean and unmodified
+        run: git diff --exit-code README.md
+
+  # ---------------------------------------------------------------------------
+  # Full .pre-commit-config.yaml Pipeline Execution
+  # ---------------------------------------------------------------------------
+  pre-commit-all:
+    name: "Full .pre-commit-config.yaml Suite"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy, rust-docs
+
+      - name: Install Rust nightly toolchain with llvm-tools-preview
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview, rust-docs
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python 3 and pre-commit
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install pre-commit framework
+        run: python3 -m pip install --upgrade pip pre-commit
+
+      - name: Execute all hooks in .pre-commit-config.yaml
+        run: pre-commit run --all-files --verbose --show-diff-on-failure
+
+      - name: Verify working tree is completely clean
+        run: git diff --exit-code
+
+  # ---------------------------------------------------------------------------
+  # Cross-Architecture & Multi-OS Target Compilation Matrix
+  # ---------------------------------------------------------------------------
+  cross-target-matrix:
+    name: "Cross-Target Check (${{ matrix.target }})"
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-gnu
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-gnu
+          - aarch64-unknown-linux-musl
+          - riscv64gc-unknown-linux-gnu
+          - x86_64-unknown-freebsd
+          - x86_64-unknown-illumos
+          - x86_64-pc-windows-gnu
+          - x86_64-apple-darwin
+          - aarch64-apple-darwin
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain with target ${{ matrix.target }}
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: check-${{ matrix.target }}
+
+      - name: Verify workspace check & clippy for ${{ matrix.target }}
+        run: cargo check --workspace --bins --lib --target ${{ matrix.target }} --locked
+
+  # ---------------------------------------------------------------------------
+  # 3/5/7-Node Failover Matrix & Multicall Binary Smoke Verification
+  # ---------------------------------------------------------------------------
+  matrix-and-smoke:
+    name: "3/5/7-Node Failover Matrix & Binary Smoke Tests"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        run: |
+          cargo build --workspace --bins --release --locked
+          cp target/release/arbiter-master-bin target/release/arbiter-master
+          cp target/release/arbiter-agent-bin target/release/arbiter-agent
+          cp target/release/arbiter-executor-bin target/release/arbiter-executor
+
+      - name: Verify multicall and standalone binary dispatch
+        run: |
+          ./target/release/arbiter master --raft-node-id 1
+          ./target/release/arbiter agent --agent-id node-01
+          ./target/release/arbiter executor --task-id task-01
+          ./target/release/arbiter cli status
+          ./target/release/arbiter cli tui
+          ./target/release/arbiter cli bench-multicluster
+          ./target/release/arbiter cli bench-failover-traffic
+          ./target/release/arbiter-master --raft-node-id 1
+          ./target/release/arbiter-agent --agent-id node-01
+          ./target/release/arbiter-executor --task-id task-01
+          ./target/release/arbiter-cli status
+
+      - name: Run 3/5/7-node PostgreSQL+etcd vs. arbiter-rs matrix script
+        run: bash ./tests/vagrant/run_matrix.sh

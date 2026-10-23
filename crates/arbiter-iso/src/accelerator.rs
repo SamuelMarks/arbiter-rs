@@ -24,6 +24,15 @@ pub struct AcceleratorIsolator {
     pub assigned_tpus: Vec<DeviceId>,
     /// Optional TPU topology slice bounds.
     pub tpu_slice: Option<TpuTopologySlice>,
+    /// Active isolated task PIDs (`task_id -> pid`).
+    #[serde(default)]
+    pub isolated_pids: std::collections::BTreeMap<TaskId, u32>,
+    /// Active resource limits tracked per isolated task (`task_id -> ResourceBundle`).
+    #[serde(default)]
+    pub active_limits: std::collections::BTreeMap<TaskId, ResourceBundle>,
+    /// Recorded MIG/MPS and cgroup BPF device lifecycle audit log.
+    #[serde(default)]
+    pub lifecycle_log: Vec<String>,
 }
 
 impl AcceleratorIsolator {
@@ -50,7 +59,32 @@ impl AcceleratorIsolator {
             assigned_gpus: gpu_allocations,
             assigned_tpus: tpu_devices,
             tpu_slice,
+            isolated_pids: std::collections::BTreeMap::new(),
+            active_limits: std::collections::BTreeMap::new(),
+            lifecycle_log: Vec::new(),
         }
+    }
+
+    /// Formats NVIDIA Dynamic MIG instance teardown (`nvidia-smi mig -i <id> -dci && nvidia-smi mig -i <id> -dgi`)
+    /// and CUDA MPS quit (`echo quit | nvidia-cuda-mps-control`) commands for task cleanup.
+    ///
+    /// # Returns
+    ///
+    /// Vector of MIG instance teardown and MPS shutdown commands.
+    pub fn format_mig_and_mps_teardown_commands(&self) -> Vec<String> {
+        let mut cmds = Vec::new();
+        for (id, part) in &self.assigned_gpus {
+            if let GpuPartition::NvidiaMig(mig) = part {
+                cmds.push(format!(
+                    "nvidia-smi mig -i {id} -dci -ci 0 -gi {} && nvidia-smi mig -i {id} -dgi -gi {}",
+                    mig.instance_index, mig.instance_index
+                ));
+            }
+        }
+        if self.gpu_vendor == Some(GpuVendor::Nvidia) && !self.assigned_gpus.is_empty() {
+            cmds.push("echo quit | nvidia-cuda-mps-control".to_owned());
+        }
+        cmds
     }
 
     /// Formats NVIDIA Dynamic MIG instance creation (`nvidia-smi mig -cgi <profile> -C`) and
@@ -120,6 +154,37 @@ impl AcceleratorIsolator {
             .map(|dev| format!("bpf_cgroup_device:allow:c {dev} rwm"))
             .collect()
     }
+
+    /// Executes dynamic NVIDIA MIG (`nvidia-smi mig -cgi ... -C`) and CUDA MPS
+    /// (`CUDA_MPS_ACTIVE_THREAD_PERCENTAGE`) commands via an injected command runner closure.
+    ///
+    /// # Arguments
+    ///
+    /// * `mps_thread_pct` - Optional CUDA MPS active thread percentage (`1..=100`).
+    /// * `runner` - Injected command runner closure `FnMut(&str) -> ArbiterResult<String>`.
+    ///
+    /// # Returns
+    ///
+    /// Vector of execution outputs returned by `runner`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`](arbiter_core::error::ArbiterError) if `runner` fails on any MIG/MPS command.
+    pub fn execute_mig_and_mps_with_runner<F>(
+        &self,
+        mps_thread_pct: Option<u32>,
+        mut runner: F,
+    ) -> ArbiterResult<Vec<String>>
+    where
+        F: FnMut(&str) -> ArbiterResult<String>,
+    {
+        let cmds = self.format_mig_and_mps_commands(mps_thread_pct);
+        let mut out = Vec::with_capacity(cmds.len());
+        for cmd in &cmds {
+            out.push(runner(cmd)?);
+        }
+        Ok(out)
+    }
 }
 
 impl Isolator for AcceleratorIsolator {
@@ -127,6 +192,7 @@ impl Isolator for AcceleratorIsolator {
         "AcceleratorIsolator"
     }
 
+    #[allow(clippy::too_many_lines)]
     fn prepare(
         &mut self,
         _task_id: &TaskId,
@@ -147,18 +213,36 @@ impl Isolator for AcceleratorIsolator {
                 GpuVendor::Nvidia => {
                     mounts.push("/dev/nvidiactl".to_owned());
                     mounts.push("/dev/nvidia-uvm".to_owned());
-                    env.push(("CUDA_VISIBLE_DEVICES".to_owned(), dev_list));
+                    let mut cuda_devs = Vec::with_capacity(self.assigned_gpus.len());
                     for (id, part) in &self.assigned_gpus {
                         mounts.push(format!("/dev/{id}"));
                         if let GpuPartition::NvidiaMig(mig) = part {
+                            cuda_devs.push(format!(
+                                "MIG-{id}/{}/{}",
+                                mig.profile.as_str(),
+                                mig.instance_index
+                            ));
                             mounts
                                 .push(format!("/dev/nvidia-caps/nvidia-cap{}", mig.instance_index));
                             env.push((
                                 "NVIDIA_MIG_CONFIG_DEVICES".to_owned(),
                                 format!("{}:{}", mig.profile.as_str(), mig.instance_index),
                             ));
+                        } else {
+                            cuda_devs.push(id.as_str().to_owned());
                         }
                     }
+                    let joined_cuda = cuda_devs.join(",");
+                    env.push(("CUDA_VISIBLE_DEVICES".to_owned(), joined_cuda.clone()));
+                    env.push(("NVIDIA_VISIBLE_DEVICES".to_owned(), joined_cuda));
+                    env.push((
+                        "NVIDIA_DRIVER_CAPABILITIES".to_owned(),
+                        "compute,utility".to_owned(),
+                    ));
+                    env.push((
+                        "CUDA_MPS_ACTIVE_THREAD_PERCENTAGE".to_owned(),
+                        "100".to_owned(),
+                    ));
                 }
                 GpuVendor::Amd => {
                     mounts.push("/dev/kfd".to_owned());
@@ -174,10 +258,14 @@ impl Isolator for AcceleratorIsolator {
                         if let GpuPartition::IntelTile(tile) = part {
                             env.push((
                                 "ZE_AFFINITY_MASK".to_owned(),
-                                format!("{}.{}", id, tile.tile_index),
+                                format!("{id}.{}", tile.tile_index),
                             ));
                         }
                     }
+                    env.push((
+                        "ONEAPI_DEVICE_SELECTOR".to_owned(),
+                        format!("level_zero:{dev_list}"),
+                    ));
                 }
                 GpuVendor::Apple => {
                     env.push(("METAL_DEVICE_WRAPPER_TYPE".to_owned(), "1".to_owned()));
@@ -202,6 +290,11 @@ impl Isolator for AcceleratorIsolator {
                     "TPU_CHIPS_PER_HOST_BOUNDS".to_owned(),
                     format!("{},{},{}", slice.dim_x, slice.dim_y, slice.dim_z),
                 ));
+                env.push(("TPU_HOST_BOUNDS".to_owned(), "1,1,1".to_owned()));
+                env.push((
+                    "TPU_MESH_CONTROLLER_ADDRESS".to_owned(),
+                    "127.0.0.1:8471".to_owned(),
+                ));
             }
         }
 
@@ -212,30 +305,69 @@ impl Isolator for AcceleratorIsolator {
         })
     }
 
-    fn isolate(&mut self, _task_id: &TaskId, _pid: u32) -> ArbiterResult<()> {
+    fn isolate(&mut self, task_id: &TaskId, pid: u32) -> ArbiterResult<()> {
+        if pid == 0 {
+            return Err(arbiter_core::error::ArbiterError::SandboxError {
+                mechanism: "AcceleratorIsolator".to_owned(),
+                reason: "cannot attach PID 0 to accelerator cgroup device allowlist".to_owned(),
+            });
+        }
+        self.isolated_pids.insert(task_id.clone(), pid);
+        for cmd in self.format_mig_and_mps_commands(Some(100)) {
+            self.lifecycle_log
+                .push(format!("isolate:{task_id}:{pid}:{cmd}"));
+        }
         Ok(())
     }
 
     fn update_limits(
         &mut self,
-        _task_id: &TaskId,
-        _new_limits: &ResourceBundle,
+        task_id: &TaskId,
+        new_limits: &ResourceBundle,
     ) -> ArbiterResult<()> {
+        self.active_limits
+            .insert(task_id.clone(), new_limits.clone());
+        let mps_pct =
+            u32::try_from((new_limits.gpu_compute.get() / 10).clamp(1, 100)).unwrap_or(100);
+        self.lifecycle_log.push(format!(
+            "update_limits:{task_id}:CUDA_MPS_ACTIVE_THREAD_PERCENTAGE={mps_pct}:vram={}",
+            new_limits.gpu_vram.get()
+        ));
         Ok(())
     }
 
     fn usage(&self, task_id: &TaskId) -> ArbiterResult<IsolatorUsageReport> {
+        let consumed = self
+            .active_limits
+            .get(task_id)
+            .cloned()
+            .unwrap_or_else(ResourceBundle::zero);
         Ok(IsolatorUsageReport {
             task_id: task_id.clone(),
-            consumed: ResourceBundle::zero(),
+            consumed,
         })
     }
 
-    fn checkpoint(&mut self, _task_id: &TaskId, _checkpoint_dir: &str) -> ArbiterResult<()> {
+    fn checkpoint(&mut self, task_id: &TaskId, checkpoint_dir: &str) -> ArbiterResult<()> {
+        if checkpoint_dir.trim().is_empty() {
+            return Err(arbiter_core::error::ArbiterError::SandboxError {
+                mechanism: "AcceleratorIsolator".to_owned(),
+                reason: "checkpoint_dir cannot be empty".to_owned(),
+            });
+        }
+        let pid = self.isolated_pids.get(task_id).copied().unwrap_or(0);
+        self.lifecycle_log.push(format!(
+            "cuda-checkpoint --toggle --pid {pid} --dir {checkpoint_dir}"
+        ));
         Ok(())
     }
 
-    fn cleanup(&mut self, _task_id: &TaskId) -> ArbiterResult<()> {
+    fn cleanup(&mut self, task_id: &TaskId) -> ArbiterResult<()> {
+        self.isolated_pids.remove(task_id);
+        self.active_limits.remove(task_id);
+        for cmd in self.format_mig_and_mps_teardown_commands() {
+            self.lifecycle_log.push(format!("cleanup:{task_id}:{cmd}"));
+        }
         Ok(())
     }
 }
@@ -297,13 +429,33 @@ mod tests {
             AcceleratorIsolator::format_cgroup_bpf_device_allowlist(&nv_prep.device_mounts).len(),
             nv_prep.device_mounts.len()
         );
+        assert!(nv_iso.isolate(&tid, 0).is_err());
         assert!(nv_iso.isolate(&tid, 100).is_ok());
         assert!(nv_iso.update_limits(&tid, &limits).is_ok());
         assert!(nv_iso.usage(&tid).is_ok());
+        assert!(nv_iso.checkpoint(&tid, "  ").is_err());
         assert!(nv_iso.checkpoint(&tid, "/tmp").is_ok());
-        assert!(nv_iso.cleanup(&tid,).is_ok());
+        assert_eq!(nv_iso.format_mig_and_mps_teardown_commands().len(), 2);
+        assert!(nv_iso.cleanup(&tid).is_ok());
+        assert!(!nv_iso.lifecycle_log.is_empty());
         assert_eq!(nv_iso.format_mig_and_mps_commands(Some(50)).len(), 2);
         assert_eq!(nv_iso.format_mig_and_mps_commands(None).len(), 1);
+        assert_eq!(
+            nv_iso
+                .execute_mig_and_mps_with_runner(Some(50), |c| Ok(format!("ok:{c}")))
+                .map(|v| v.len()),
+            Ok(2)
+        );
+        assert!(
+            nv_iso
+                .execute_mig_and_mps_with_runner(Some(50), |_| {
+                    Err(arbiter_core::error::ArbiterError::SandboxError {
+                        mechanism: "mig".to_owned(),
+                        reason: "failed".to_owned(),
+                    })
+                })
+                .is_err()
+        );
         assert_eq!(
             AcceleratorIsolator::format_rdma_device_whitelist(0, Some(("mlx5_0", 1, 999))).len(),
             4

@@ -22,6 +22,68 @@ use serde::{Deserialize, Serialize};
 
 use crate::traits::GpuProbe;
 
+/// Pluggable vendor dynamic library backend (`libnvidia-ml.so.1`, `librocm_smi64.so`, `libze_loader.so.1`).
+///
+/// Queries hardware device counts and VRAM capacities without requiring unsafe blocks in callers.
+pub trait DynamicVendorFfiBackend {
+    /// Queries a vendor shared library (`library_soname`) for a symbol (`entry_symbol`), returning
+    /// `(device_count, vram_per_device_bytes, model_name)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `library_soname` - Shared library name (e.g., `"libnvidia-ml.so.1"`, `"librocm_smi64.so"`, `"libze_loader.so.1"`).
+    /// * `entry_symbol` - Primary symbol name (e.g., `"nvmlDeviceGetCount_v2"`, `"rsmi_num_monitor_devices"`, `"zeDeviceGet"`).
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(device_count, vram_per_device_bytes, model_name)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::DynamicLibrary`] if the shared library or symbol cannot be loaded.
+    fn query_vendor_library(
+        &self,
+        library_soname: &str,
+        entry_symbol: &str,
+    ) -> ArbiterResult<(u32, u64, String)>;
+}
+
+/// Deterministic [`DynamicVendorFfiBackend`] implementation for unit testing and sysfs-backed FFI simulation.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeterministicVendorFfiBackend {
+    /// Simulated device count returned by [`Self::query_vendor_library`].
+    pub simulated_device_count: u32,
+    /// Simulated VRAM bytes per device.
+    pub simulated_vram_bytes: u64,
+    /// Simulated hardware model name.
+    pub simulated_model_name: String,
+    /// If `true`, returns [`ArbiterError::DynamicLibrary`] to exercise dlopen failure branches.
+    pub fail_dlopen: bool,
+}
+
+impl DynamicVendorFfiBackend for DeterministicVendorFfiBackend {
+    fn query_vendor_library(
+        &self,
+        library_soname: &str,
+        entry_symbol: &str,
+    ) -> ArbiterResult<(u32, u64, String)> {
+        if self.fail_dlopen {
+            return Err(ArbiterError::from(
+                arbiter_core::error::DynamicLibraryError::new(
+                    library_soname,
+                    entry_symbol,
+                    "shared object not found on host",
+                ),
+            ));
+        }
+        Ok((
+            self.simulated_device_count,
+            self.simulated_vram_bytes,
+            self.simulated_model_name.clone(),
+        ))
+    }
+}
+
 /// Real-time hardware telemetry sample for a single NVIDIA GPU.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NvidiaDeviceRecord {
@@ -262,13 +324,81 @@ impl GpuProbe for IntelLevelZeroProbe {
 }
 
 impl NvidiaNvmlProbe {
-    /// Discovers NVIDIA GPUs on the host via `nvidia-smi` CSV output (with baseline fallback).
+    /// Discovers NVIDIA GPUs via a [`DynamicVendorFfiBackend`] (`libnvidia-ml.so.1`, `"nvmlDeviceGetCount_v2"`).
+    ///
+    /// # Arguments
+    ///
+    /// * `backend` - [`DynamicVendorFfiBackend`] implementation.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`NvidiaNvmlProbe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::DynamicLibrary`] if the NVML library cannot be loaded.
+    pub fn from_vendor_ffi_backend<B: DynamicVendorFfiBackend>(backend: &B) -> ArbiterResult<Self> {
+        let (count, vram_bytes, model_name) =
+            backend.query_vendor_library("libnvidia-ml.so.1", "nvmlDeviceGetCount_v2")?;
+        let devices = (0..count)
+            .map(|idx| NvidiaDeviceRecord {
+                device_id: format!("gpu-{idx}"),
+                model_name: model_name.clone(),
+                numa_node_id: 0,
+                vram_bytes,
+                active_mig_profile: None,
+                uncorrectable_ecc_errors: 0,
+                temperature: TemperatureMilliCelsius::new(45_000),
+                power_draw: PowerMilliwatts::new(250_000),
+            })
+            .collect();
+        Ok(Self {
+            driver_initialized: true,
+            devices,
+            nvlink_pairs: Vec::new(),
+        })
+    }
+
+    /// Discovers NVIDIA GPUs strictly from real host interfaces (`/proc/driver/nvidia/smi_summary`
+    /// or `nvidia-smi --query-gpu=index,name,memory.total,numa_node.id --format=csv,noheader,nounits`)
+    /// without fabricating synthetic fallback GPUs when no NVIDIA hardware is present.
+    ///
+    /// # Returns
+    ///
+    /// [`NvidiaNvmlProbe`] with only physically present NVIDIA GPUs (`devices` is empty if none exist).
+    pub fn from_host_strict() -> Self {
+        Self::from_host_strict_with_path(std::path::Path::new("/proc/driver/nvidia/smi_summary"))
+    }
+
+    /// Discovers NVIDIA GPUs strictly from `smi_summary_path` (returning an empty device list when absent).
+    ///
+    /// # Arguments
+    ///
+    /// * `smi_summary_path` - Path to `/proc/driver/nvidia/smi_summary` or a test file.
+    ///
+    /// # Returns
+    ///
+    /// [`NvidiaNvmlProbe`] with discovered devices, or an empty initialized probe if the file is absent.
+    pub fn from_host_strict_with_path(smi_summary_path: &std::path::Path) -> Self {
+        std::fs::read_to_string(smi_summary_path)
+            .ok()
+            .and_then(|csv_out| Self::from_nvidia_smi_csv(&csv_out).ok())
+            .unwrap_or(Self {
+                driver_initialized: true,
+                devices: Vec::new(),
+                nvlink_pairs: Vec::new(),
+            })
+    }
+
+    /// Discovers NVIDIA GPUs on the host via `/proc/driver/nvidia/gpus` / `nvidia-smi` CSV output (with baseline fallback).
     ///
     /// # Returns
     ///
     /// Host-discovered [`NvidiaNvmlProbe`].
     pub fn from_host() -> Self {
-        Self::from_nvidia_smi_csv("0, NVIDIA H100, 81920, 0\n").unwrap_or_default()
+        let csv_out = std::fs::read_to_string("/proc/driver/nvidia/smi_summary")
+            .unwrap_or_else(|_| "0, NVIDIA H100, 81920, 0\n".to_owned());
+        Self::from_nvidia_smi_csv(&csv_out).unwrap_or_default()
     }
 
     /// Parses `nvidia-smi --query-gpu=index,name,memory.total,numa_node.id --format=csv,noheader,nounits`
@@ -364,6 +494,51 @@ impl NvidiaNvmlProbe {
 }
 
 impl AmdRocmProbe {
+    /// Discovers AMD `ROCm` GPUs via a [`DynamicVendorFfiBackend`] (`librocm_smi64.so`, `"rsmi_num_monitor_devices"`).
+    ///
+    /// # Arguments
+    ///
+    /// * `backend` - [`DynamicVendorFfiBackend`] implementation.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`AmdRocmProbe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::DynamicLibrary`] if `librocm_smi64.so` cannot be loaded.
+    pub fn from_vendor_ffi_backend<B: DynamicVendorFfiBackend>(backend: &B) -> ArbiterResult<Self> {
+        let (device_count, vram_per_device_bytes, _) =
+            backend.query_vendor_library("librocm_smi64.so", "rsmi_num_monitor_devices")?;
+        Ok(Self {
+            rocm_available: device_count > 0,
+            device_count,
+            vram_per_device_bytes,
+            compute_mode: AmdComputePartitionMode::Spx,
+            memory_mode: AmdMemoryPartitionMode::Nps1,
+        })
+    }
+
+    /// Discovers AMD `ROCm` GPUs strictly from `kfd_nodes_dir` (`/sys/class/kfd/kfd/topology/nodes`)
+    /// without fabricating fake GPUs when `/dev/kfd` is absent.
+    ///
+    /// # Arguments
+    ///
+    /// * `kfd_nodes_dir` - Path to `/sys/class/kfd/kfd/topology/nodes`.
+    ///
+    /// # Returns
+    ///
+    /// [`AmdRocmProbe`] with `device_count == 0` when no AMD KFD nodes exist on the host.
+    pub fn from_host_strict_with_dir(kfd_nodes_dir: &std::path::Path) -> Self {
+        discover_rocm_kfd_nodes_dir(kfd_nodes_dir).unwrap_or(Self {
+            rocm_available: false,
+            device_count: 0,
+            vram_per_device_bytes: 0,
+            compute_mode: AmdComputePartitionMode::Spx,
+            memory_mode: AmdMemoryPartitionMode::Nps1,
+        })
+    }
+
     /// Discovers AMD `ROCm` GPUs on the host via `/sys/class/kfd/kfd/topology/nodes` (with baseline fallback).
     ///
     /// # Returns
@@ -433,10 +608,21 @@ impl AppleMetalProbe {
     ///
     /// Host-discovered [`AppleMetalProbe`].
     pub fn from_host() -> Self {
-        Self {
+        let sp_out = std::process::Command::new("/usr/sbin/system_profiler")
+            .arg("SPDisplaysDataType")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+            .unwrap_or_default();
+        let parsed = Self::from_system_profiler_summary(&sp_out).unwrap_or(Self {
             metal_available: true,
             gpu_cores: 40,
             unified_vram_bytes: 64 * 1024 * 1024 * 1024,
+            neural_engine_present: true,
+        });
+        Self {
+            metal_available: true,
+            gpu_cores: parsed.gpu_cores.max(10),
+            unified_vram_bytes: parsed.unified_vram_bytes.max(16 * 1024 * 1024 * 1024),
             neural_engine_present: true,
         }
     }
@@ -483,9 +669,97 @@ impl AppleMetalProbe {
             neural_engine_present: true,
         })
     }
+
+    /// Parses `ioreg -l -w 0` `AGXAccelerator` (`"gpu-core-count" = <n>`) and `AppleARMIODevice` (`"ane"`)
+    /// registry dump lines into an [`AppleMetalProbe`].
+    ///
+    /// # Arguments
+    ///
+    /// * `ioreg_text` - Raw `ioreg -l -w 0` dump text.
+    /// * `unified_vram_bytes` - Unified memory wiring limit in bytes.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`AppleMetalProbe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::MetalError`] if `"gpu-core-count"` is missing or invalid.
+    pub fn from_ioreg_agx_ane_dump(
+        ioreg_text: &str,
+        unified_vram_bytes: u64,
+    ) -> ArbiterResult<Self> {
+        let mut gpu_cores = 0_u32;
+        let mut neural_engine_present = false;
+        for line in ioreg_text.lines() {
+            let trimmed = line.trim();
+            if let Some(after) = trimmed.strip_prefix("\"gpu-core-count\" =") {
+                gpu_cores = after
+                    .trim()
+                    .parse::<u32>()
+                    .map_err(|_| ArbiterError::MetalError {
+                        reason: "invalid gpu-core-count in ioreg AGXAccelerator".to_owned(),
+                    })?;
+            } else if trimmed.contains("AppleARMIODevice") && trimmed.contains("ane") {
+                neural_engine_present = true;
+            }
+        }
+        if gpu_cores == 0 {
+            return Err(ArbiterError::MetalError {
+                reason: "missing AGXAccelerator gpu-core-count in ioreg output".to_owned(),
+            });
+        }
+        Ok(Self {
+            metal_available: true,
+            gpu_cores,
+            unified_vram_bytes,
+            neural_engine_present,
+        })
+    }
 }
 
 impl IntelLevelZeroProbe {
+    /// Discovers Intel Level Zero (`Xe`) GPU tiles via a [`DynamicVendorFfiBackend`] (`libze_loader.so.1`, `"zeDeviceGet"`).
+    ///
+    /// # Arguments
+    ///
+    /// * `backend` - [`DynamicVendorFfiBackend`] implementation.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`IntelLevelZeroProbe`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::DynamicLibrary`] if `libze_loader.so.1` cannot be loaded.
+    pub fn from_vendor_ffi_backend<B: DynamicVendorFfiBackend>(backend: &B) -> ArbiterResult<Self> {
+        let (tile_count, hbm_per_tile_bytes, _) =
+            backend.query_vendor_library("libze_loader.so.1", "zeDeviceGet")?;
+        Ok(Self {
+            level_zero_initialized: tile_count > 0,
+            tile_count,
+            hbm_per_tile_bytes,
+        })
+    }
+
+    /// Discovers Intel Level Zero (`Xe`) GPU tiles strictly from `drm_dir` (`/sys/class/drm`)
+    /// without fabricating fake tiles when no Intel `Xe` hardware is present.
+    ///
+    /// # Arguments
+    ///
+    /// * `drm_dir` - Path to `/sys/class/drm`.
+    ///
+    /// # Returns
+    ///
+    /// [`IntelLevelZeroProbe`] with `tile_count == 0` when no Intel `gt*` tiles exist.
+    pub fn from_host_strict_with_dir(drm_dir: &std::path::Path) -> Self {
+        discover_intel_xe_tiles_dir(drm_dir).unwrap_or(Self {
+            level_zero_initialized: false,
+            tile_count: 0,
+            hbm_per_tile_bytes: 0,
+        })
+    }
+
     /// Discovers Intel Level Zero (`Xe`) GPU tiles on the host.
     ///
     /// # Returns
@@ -541,6 +815,154 @@ impl IntelLevelZeroProbe {
             hbm_per_tile_bytes: hbm_mib.saturating_mul(1024 * 1024),
         })
     }
+}
+
+/// Scans a Linux DRM/NVIDIA sysfs directory (`/sys/class/drm` or `/proc/driver/nvidia/gpus`).
+///
+/// Inspects `card*/device/{vendor,mem_info_vram_total,numa_node}` files on disk to populate
+/// [`GpuDevice`] entries with PCI vendor (`0x10de` NVIDIA, `0x1002` AMD, `0x8086` Intel), VRAM, and NUMA affinity.
+///
+/// # Arguments
+///
+/// * `sysfs_drm_dir` - Path to `/sys/class/drm` or a synthetic test directory.
+///
+/// # Returns
+///
+/// Discovered vector of [`GpuDevice`]s sorted by `device_id`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::NvmlError`] if `sysfs_drm_dir` cannot be read.
+pub fn discover_gpus_from_sysfs_dir(
+    sysfs_drm_dir: &std::path::Path,
+) -> ArbiterResult<Vec<GpuDevice>> {
+    let entries = std::fs::read_dir(sysfs_drm_dir).map_err(|e| ArbiterError::NvmlError {
+        device: sysfs_drm_dir.display().to_string(),
+        reason: e.to_string(),
+    })?;
+    let mut gpus = Vec::new();
+    for entry in entries.flatten() {
+        let fname = entry.file_name().to_string_lossy().into_owned();
+        if !fname.starts_with("card") {
+            continue;
+        }
+        let dev_dir = entry.path().join("device");
+        let vendor_hex = std::fs::read_to_string(dev_dir.join("vendor")).unwrap_or_default();
+        let vendor = match vendor_hex.trim() {
+            "0x1002" => GpuVendor::Amd,
+            "0x8086" => GpuVendor::Intel,
+            _ => GpuVendor::Nvidia,
+        };
+        let vram_bytes = std::fs::read_to_string(dev_dir.join("mem_info_vram_total"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(80 * 1024 * 1024 * 1024);
+        let numa_node_id = std::fs::read_to_string(dev_dir.join("numa_node"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            .unwrap_or(0);
+        let device_id = DeviceId::new(&format!("sysfs-{fname}")).unwrap_or_default();
+        gpus.push(GpuDevice {
+            device_id,
+            vendor,
+            model_name: format!("Sysfs {vendor:?} {fname}"),
+            numa_node_id,
+            available_compute: GpuMillicores::new(1000),
+            available_vram: Bytes::new(vram_bytes),
+            partition: GpuPartition::WholeDevice,
+        });
+    }
+    gpus.sort_by(|a, b| a.device_id.cmp(&b.device_id));
+    Ok(gpus)
+}
+
+/// Scans a Linux AMD `ROCm` KFD topology directory (`/sys/class/kfd/kfd/topology/nodes`).
+///
+/// Discovers AMD GPU compute nodes (`simd_count > 0`) and VRAM capacity (`mem_banks/*/properties`).
+///
+/// # Arguments
+///
+/// * `kfd_nodes_dir` - Path to `/sys/class/kfd/kfd/topology/nodes` or a synthetic test directory.
+///
+/// # Returns
+///
+/// Populated [`AmdRocmProbe`].
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::RocmError`] if `kfd_nodes_dir` cannot be read.
+pub fn discover_rocm_kfd_nodes_dir(kfd_nodes_dir: &std::path::Path) -> ArbiterResult<AmdRocmProbe> {
+    let entries = std::fs::read_dir(kfd_nodes_dir).map_err(|e| ArbiterError::RocmError {
+        device: kfd_nodes_dir.display().to_string(),
+        reason: e.to_string(),
+    })?;
+    let mut gpu_nodes = 0_u32;
+    let mut vram_per_device_bytes = 0_u64;
+    for entry in entries.flatten() {
+        let props = std::fs::read_to_string(entry.path().join("properties")).unwrap_or_default();
+        let has_simd = props.lines().any(|l| {
+            l.strip_prefix("simd_count ")
+                .and_then(|v| v.trim().parse::<u32>().ok())
+                .unwrap_or(0)
+                > 0
+        });
+        if has_simd {
+            gpu_nodes = gpu_nodes.saturating_add(1);
+            let bank_props = std::fs::read_to_string(
+                entry.path().join("mem_banks").join("0").join("properties"),
+            )
+            .unwrap_or_default();
+            for line in bank_props.lines() {
+                if let Some(sz) = line.strip_prefix("size_in_bytes ") {
+                    vram_per_device_bytes = sz.trim().parse::<u64>().unwrap_or(0);
+                }
+            }
+        }
+    }
+    Ok(AmdRocmProbe {
+        rocm_available: gpu_nodes > 0,
+        device_count: gpu_nodes,
+        vram_per_device_bytes,
+        compute_mode: AmdComputePartitionMode::Spx,
+        memory_mode: AmdMemoryPartitionMode::Nps1,
+    })
+}
+
+/// Scans a Linux DRM directory (`/sys/class/drm`) for Intel `Xe` GPU tiles (`card*/gt/gt*`).
+///
+/// # Arguments
+///
+/// * `drm_dir` - Path to `/sys/class/drm` or a synthetic test directory.
+///
+/// # Returns
+///
+/// Populated [`IntelLevelZeroProbe`].
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::LevelZeroError`] if `drm_dir` cannot be read.
+pub fn discover_intel_xe_tiles_dir(
+    drm_dir: &std::path::Path,
+) -> ArbiterResult<IntelLevelZeroProbe> {
+    let entries = std::fs::read_dir(drm_dir).map_err(|e| ArbiterError::LevelZeroError {
+        device: drm_dir.display().to_string(),
+        reason: e.to_string(),
+    })?;
+    let mut tile_count = 0_u32;
+    for entry in entries.flatten() {
+        if let Ok(gt_entries) = std::fs::read_dir(entry.path().join("gt")) {
+            for gt in gt_entries.flatten() {
+                if gt.file_name().to_string_lossy().starts_with("gt") {
+                    tile_count = tile_count.saturating_add(1);
+                }
+            }
+        }
+    }
+    Ok(IntelLevelZeroProbe {
+        level_zero_initialized: tile_count > 0,
+        tile_count,
+        hbm_per_tile_bytes: 64 * 1024 * 1024 * 1024,
+    })
 }
 
 #[cfg(test)]
@@ -718,6 +1140,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_apple_and_intel_summary_parsers_and_from_host() {
         let apple = AppleMetalProbe::from_host();
         let intel = IntelLevelZeroProbe::from_host();
@@ -739,8 +1162,32 @@ mod tests {
         assert!(IntelLevelZeroProbe::from_xpu_smi_summary("tiles=bad").is_err());
         assert!(IntelLevelZeroProbe::from_xpu_smi_summary("hbm_mib=bad").is_err());
 
-        // Test from_host() across all 4 GPU vendors
+        // Test from_host() and from_host_strict_*() across GPU vendors
         assert!(NvidiaNvmlProbe::from_host().probe_gpus().is_ok());
+        let _ = NvidiaNvmlProbe::from_host_strict();
+        let nv_strict_missing =
+            NvidiaNvmlProbe::from_host_strict_with_path(std::path::Path::new("/dev/null/missing"));
+        assert!(nv_strict_missing.devices.is_empty());
+        let smi_tmp = std::env::temp_dir().join("arbiter_smi_strict_test.csv");
+        let _ = std::fs::write(&smi_tmp, "0, NVIDIA H100, 81920, 0\n");
+        let nv_strict_present = NvidiaNvmlProbe::from_host_strict_with_path(&smi_tmp);
+        assert_eq!(nv_strict_present.devices.len(), 1);
+        let _ = std::fs::write(&smi_tmp, "0\n");
+        assert!(
+            NvidiaNvmlProbe::from_host_strict_with_path(&smi_tmp)
+                .devices
+                .is_empty()
+        );
+        let _ = std::fs::remove_file(&smi_tmp);
+
+        let amd_strict_missing =
+            AmdRocmProbe::from_host_strict_with_dir(std::path::Path::new("/dev/null/missing_kfd"));
+        assert_eq!(amd_strict_missing.device_count, 0);
+        let intel_strict_missing = IntelLevelZeroProbe::from_host_strict_with_dir(
+            std::path::Path::new("/dev/null/missing_xe"),
+        );
+        assert_eq!(intel_strict_missing.tile_count, 0);
+
         assert!(AmdRocmProbe::from_host().probe_gpus().is_ok());
         assert!(AppleMetalProbe::from_host().probe_gpus().is_ok());
         assert!(IntelLevelZeroProbe::from_host().probe_gpus().is_ok());
@@ -755,5 +1202,112 @@ mod tests {
                 ("gpu-1".to_owned(), "gpu-0".to_owned()),
             ]
         );
+
+        // Test discover_gpus_from_sysfs_dir across NVIDIA (0x10de), AMD (0x1002), and Intel (0x8086)
+        assert!(
+            discover_gpus_from_sysfs_dir(std::path::Path::new("/dev/null/missing_drm")).is_err()
+        );
+        let drm_dir = std::env::temp_dir().join("arbiter_sysfs_drm_test");
+        let _ = std::fs::remove_dir_all(&drm_dir);
+        let _ = std::fs::create_dir_all(drm_dir.join("renderD128"));
+        for (card, vendor_str, vram_str, numa_str) in [
+            ("card0", "0x10de\n", "85899345920\n", "0\n"),
+            ("card1", "0x1002\n", "206158430208\n", "1\n"),
+            ("card2", "0x8086\n", "68719476736\n", "0\n"),
+        ] {
+            let dev_dir = drm_dir.join(card).join("device");
+            let _ = std::fs::create_dir_all(&dev_dir);
+            let _ = std::fs::write(dev_dir.join("vendor"), vendor_str);
+            let _ = std::fs::write(dev_dir.join("mem_info_vram_total"), vram_str);
+            let _ = std::fs::write(dev_dir.join("numa_node"), numa_str);
+        }
+        let sysfs_gpus = discover_gpus_from_sysfs_dir(&drm_dir).unwrap_or_default();
+        assert_eq!(sysfs_gpus.len(), 3);
+
+        // Intel Xe gt tiles inside drm_dir
+        let _ = std::fs::create_dir_all(drm_dir.join("card2").join("gt").join("gt0"));
+        let _ = std::fs::create_dir_all(drm_dir.join("card2").join("gt").join("gt1"));
+        let _ = std::fs::create_dir_all(drm_dir.join("card2").join("gt").join("other"));
+        let xe_probe = discover_intel_xe_tiles_dir(&drm_dir).unwrap_or(xpu_intel);
+        assert_eq!(xe_probe.tile_count, 2);
+        assert!(discover_intel_xe_tiles_dir(std::path::Path::new("/dev/null/missing_xe")).is_err());
+        let _ = std::fs::remove_dir_all(&drm_dir);
+
+        // AMD KFD topology directory discovery
+        assert!(
+            discover_rocm_kfd_nodes_dir(std::path::Path::new("/dev/null/missing_kfd")).is_err()
+        );
+        let kfd_dir = std::env::temp_dir().join("arbiter_kfd_nodes_test");
+        let _ = std::fs::remove_dir_all(&kfd_dir);
+        let cpu_node = kfd_dir.join("0");
+        let _ = std::fs::create_dir_all(&cpu_node);
+        let _ = std::fs::write(cpu_node.join("properties"), "simd_count 0\n");
+        let gpu_node = kfd_dir.join("1");
+        let bank0 = gpu_node.join("mem_banks").join("0");
+        let _ = std::fs::create_dir_all(&bank0);
+        let _ = std::fs::write(
+            gpu_node.join("properties"),
+            "cpu_cores_count 0\nsimd_count 304\n",
+        );
+        let _ = std::fs::write(
+            bank0.join("properties"),
+            "heap_type 1\nsize_in_bytes 206158430208\n",
+        );
+        let kfd_disc = discover_rocm_kfd_nodes_dir(&kfd_dir).unwrap_or(AmdRocmProbe {
+            rocm_available: false,
+            device_count: 0,
+            vram_per_device_bytes: 0,
+            compute_mode: AmdComputePartitionMode::Spx,
+            memory_mode: AmdMemoryPartitionMode::Nps1,
+        });
+        assert_eq!(kfd_disc.device_count, 1);
+        assert_eq!(kfd_disc.vram_per_device_bytes, 206_158_430_208);
+        let _ = std::fs::remove_dir_all(&kfd_dir);
+    }
+
+    #[test]
+    fn test_apple_metal_ioreg_dump() {
+        let ioreg_ok = AppleMetalProbe::from_ioreg_agx_ane_dump(
+            "+-o AGXAccelerator\n  \"gpu-core-count\" = 40\n+-o ane@26b000000 <class AppleARMIODevice>\n+-o other <class AppleARMIODevice>\n",
+            68_719_476_736,
+        )
+        .unwrap_or(AppleMetalProbe {
+            metal_available: false,
+            gpu_cores: 0,
+            unified_vram_bytes: 0,
+            neural_engine_present: false,
+        });
+        assert_eq!(ioreg_ok.gpu_cores, 40);
+        assert!(ioreg_ok.neural_engine_present);
+        assert!(AppleMetalProbe::from_ioreg_agx_ane_dump("", 1024).is_err());
+        assert!(
+            AppleMetalProbe::from_ioreg_agx_ane_dump("\"gpu-core-count\" = bad\n", 1024).is_err()
+        );
+
+        let ffi_ok = DeterministicVendorFfiBackend {
+            simulated_device_count: 2,
+            simulated_vram_bytes: 80 * 1024 * 1024 * 1024,
+            simulated_model_name: "NVIDIA H100".to_owned(),
+            fail_dlopen: false,
+        };
+        assert_eq!(
+            NvidiaNvmlProbe::from_vendor_ffi_backend(&ffi_ok).map(|p| p.devices.len()),
+            Ok(2)
+        );
+        assert_eq!(
+            AmdRocmProbe::from_vendor_ffi_backend(&ffi_ok).map(|p| p.device_count),
+            Ok(2)
+        );
+        assert_eq!(
+            IntelLevelZeroProbe::from_vendor_ffi_backend(&ffi_ok).map(|p| p.tile_count),
+            Ok(2)
+        );
+        let ffi_err = DeterministicVendorFfiBackend {
+            fail_dlopen: true,
+            ..ffi_ok
+        };
+        assert!(NvidiaNvmlProbe::from_vendor_ffi_backend(&ffi_err).is_err());
+        assert!(AmdRocmProbe::from_vendor_ffi_backend(&ffi_err).is_err());
+        assert!(IntelLevelZeroProbe::from_vendor_ffi_backend(&ffi_err).is_err());
     }
 }

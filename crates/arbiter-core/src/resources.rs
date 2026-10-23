@@ -8,11 +8,12 @@ use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ArbiterError, ArbiterResult};
-use crate::ids::{DeviceId, SliceId};
+use crate::ids::{DeviceId, PrincipalName, RoleName, SliceId, VolumeId};
 use crate::units::{
     BandwidthBps, Bytes, FrequencyMegahertz, GpuMillicores, Millicores, PortSet, TpuChips,
     WeightBasisPoints,
 };
+use crate::workload::DiskSource;
 
 /// Heterogeneous CPU core microarchitecture classification.
 #[derive(
@@ -66,6 +67,8 @@ pub enum CpuInstructionExtension {
     Neon,
     /// ARM Scalable Vector Extension (`SVE` / `SVE2`).
     Sve,
+    /// RISC-V Vector Extension v1.0 (`RVV-1.0`).
+    Rvv10,
 }
 
 /// Hardware topology and capability descriptor for an individual CPU core/thread.
@@ -928,6 +931,213 @@ pub struct NetworkResource {
     pub rdma_vfs: u32,
 }
 
+/// Mesos v1 resource value algebra (`Value::Type`: `SCALAR`, `RANGES`, `SET`).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum MesosValueType {
+    /// Fixed-point scalar quantity (`Value::Scalar`, e.g., millicores or bytes).
+    Scalar(u64),
+    /// Disjoint or mergeable inclusive integer intervals (`Value::Ranges`, e.g., `[(31000, 32000)]`).
+    Ranges(PortSet),
+    /// Discrete set of unique string identifiers (`Value::Set`, e.g., device IDs or capabilities).
+    Set(Vec<String>),
+}
+
+impl MesosValueType {
+    /// Returns `true` if this [`MesosValueType`] represents a zero scalar or empty range/set.
+    ///
+    /// # Returns
+    ///
+    /// `true` when empty or zero.
+    pub fn is_empty(&self) -> bool {
+        match self {
+            Self::Scalar(v) => *v == 0,
+            Self::Ranges(ports) => ports.total_ports() == 0,
+            Self::Set(items) => items.is_empty(),
+        }
+    }
+}
+
+/// Origin classification of a Mesos v1 resource reservation (`ReservationInfo::Type`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum ReservationKind {
+    /// Statically reserved at Agent startup (`STATIC`).
+    #[default]
+    Static,
+    /// Dynamically reserved at runtime by a Framework or Operator (`DYNAMIC`).
+    Dynamic,
+}
+
+/// Hierarchical reservation refinement stack entry (`ReservationInfo`).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct ReservationEntry {
+    /// Whether this reservation level is `Static` or `Dynamic`.
+    pub kind: ReservationKind,
+    /// Hierarchical role to which the resources are reserved (e.g., `"prod"` or `"prod.ml"`).
+    pub role: RoleName,
+    /// Optional authenticated principal that created this reservation.
+    pub principal: Option<PrincipalName>,
+    /// Key-value metadata labels attached to the reservation.
+    pub labels: Vec<(String, String)>,
+}
+
+impl ReservationEntry {
+    /// Validates that `child` is a valid hierarchical refinement of `self` (`child.role` starts with `"{self.role}."`).
+    ///
+    /// # Arguments
+    ///
+    /// * `child` - Candidate child [`ReservationEntry`] to push onto the refinement stack.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if `child.role` is a strict sub-role of `self.role` and `child.kind == ReservationKind::Dynamic`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidQuotaBounds`] if `child` is not a valid dynamic sub-role refinement.
+    pub fn validate_refinement(&self, child: &Self) -> ArbiterResult<()> {
+        if child.kind != ReservationKind::Dynamic {
+            return Err(ArbiterError::InvalidQuotaBounds {
+                role: child.role.to_string(),
+                reason: "refined child reservation must be ReservationKind::Dynamic".to_owned(),
+            });
+        }
+        let expected_prefix = format!("{}.", self.role.as_str());
+        if !child.role.as_str().starts_with(&expected_prefix) {
+            return Err(ArbiterError::InvalidQuotaBounds {
+                role: child.role.to_string(),
+                reason: format!(
+                    "child role '{}' must be a hierarchical sub-role of '{}'",
+                    child.role, self.role
+                ),
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Container filesystem mount access mode for a persistent volume (`Volume::Mode`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum VolumeMountMode {
+    /// Read-write mount (`RW`, default).
+    #[default]
+    ReadWrite,
+    /// Read-only mount (`RO`).
+    ReadOnly,
+}
+
+/// Persistent volume metadata inside a Mesos [`DiskInfo`] (`DiskInfo::Persistence`).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct DiskPersistenceInfo {
+    /// Unique persistent volume identifier on the Agent.
+    pub volume_id: VolumeId,
+    /// Optional principal authorized to destroy or modify the volume.
+    pub principal: Option<PrincipalName>,
+}
+
+/// Mesos v1 `Resource::DiskInfo` descriptor combining backing [`DiskSource`], [`DiskPersistenceInfo`],
+/// and container mount configuration.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct DiskInfo {
+    /// Backing storage provider source (`RootFilesystem`, `Path`, `Mount`, `Block`, `Raw`, `ZfsDataset`, `CsiVolume`).
+    pub source: DiskSource,
+    /// Optional persistence descriptor (`Some` once `CREATE` volume has been applied).
+    pub persistence: Option<DiskPersistenceInfo>,
+    /// Container sandbox mount path (e.g., `"/var/lib/postgresql/data"`).
+    pub container_path: String,
+    /// Mount mode (`ReadWrite` or `ReadOnly`).
+    pub mode: VolumeMountMode,
+}
+
+/// Oversubscribed revocable slack resource marker (`Resource::RevocableInfo`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct RevocableInfo {
+    /// Whether this resource may be throttled or evicted when guaranteed tasks contend for `QoS` (`true`).
+    pub qos_evictable: bool,
+}
+
 /// Aggregate multi-dimensional resource bundle supporting exact checked resource algebra.
 ///
 /// Tracks CPU millicores, RAM, `HugePages`, GPU compute millicores, GPU VRAM, TPU chips,
@@ -1173,6 +1383,111 @@ mod tests {
         }
 
         assert!(NvidiaMigProfile::parse("invalid.profile").is_err());
+    }
+
+    #[test]
+    fn test_mesos_value_type_reservation_and_disk_info() {
+        let v_scalar_zero = MesosValueType::Scalar(0);
+        let v_scalar_nonzero = MesosValueType::Scalar(100);
+        let v_ranges_empty = MesosValueType::Ranges(PortSet::empty());
+        let v_ranges_nonempty = MesosValueType::Ranges(PortSet::from_ranges(vec![PortRange {
+            start: PortNumber(80),
+            end: PortNumber(81),
+        }]));
+        let v_set_empty = MesosValueType::Set(Vec::new());
+        let v_set_nonempty = MesosValueType::Set(vec!["gpu0".to_owned()]);
+        assert!(v_scalar_zero.is_empty());
+        assert!(!v_scalar_nonzero.is_empty());
+        assert!(v_ranges_empty.is_empty());
+        assert!(!v_ranges_nonempty.is_empty());
+        assert!(v_set_empty.is_empty());
+        assert!(!v_set_nonempty.is_empty());
+
+        let base_res = ReservationEntry {
+            kind: ReservationKind::Static,
+            role: RoleName::new("prod").unwrap_or_default(),
+            principal: PrincipalName::new("ops").ok(),
+            labels: vec![("env".to_owned(), "prod".to_owned())],
+        };
+        let valid_child = ReservationEntry {
+            kind: ReservationKind::Dynamic,
+            role: RoleName::new("prod.ml").unwrap_or_default(),
+            principal: PrincipalName::new("ml-fw").ok(),
+            labels: Vec::new(),
+        };
+        let static_child = ReservationEntry {
+            kind: ReservationKind::Static,
+            role: RoleName::new("prod.ml").unwrap_or_default(),
+            principal: None,
+            labels: Vec::new(),
+        };
+        let unrelated_child = ReservationEntry {
+            kind: ReservationKind::Dynamic,
+            role: RoleName::new("staging.ml").unwrap_or_default(),
+            principal: None,
+            labels: Vec::new(),
+        };
+        assert!(base_res.validate_refinement(&valid_child).is_ok());
+        assert!(base_res.validate_refinement(&static_child).is_err());
+        assert!(base_res.validate_refinement(&unrelated_child).is_err());
+
+        let disk_info = DiskInfo {
+            source: DiskSource::Mount("/mnt/nvme0".to_owned()),
+            persistence: Some(DiskPersistenceInfo {
+                volume_id: VolumeId::new("vol-pg-0").unwrap_or_default(),
+                principal: PrincipalName::new("pg-operator").ok(),
+            }),
+            container_path: "/var/lib/postgresql/data".to_owned(),
+            mode: VolumeMountMode::default(),
+        };
+        assert_eq!(disk_info.mode, VolumeMountMode::ReadWrite);
+        let rev = RevocableInfo {
+            qos_evictable: true,
+        };
+        assert!(rev.qos_evictable);
+        let rkyv_extra = (
+            v_scalar_nonzero,
+            v_ranges_nonempty,
+            v_set_nonempty,
+            valid_child,
+            disk_info,
+            VolumeMountMode::ReadOnly,
+            rev,
+        );
+        let extra_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&rkyv_extra).unwrap_or_default();
+        for i in 0..extra_bytes.len() {
+            let mut corrupted = extra_bytes.clone();
+            for (j, b) in corrupted.iter_mut().enumerate() {
+                if i == j {
+                    *b ^= 0xFF;
+                }
+            }
+            let _: Result<
+                (
+                    MesosValueType,
+                    MesosValueType,
+                    MesosValueType,
+                    ReservationEntry,
+                    DiskInfo,
+                    VolumeMountMode,
+                    RevocableInfo,
+                ),
+                rkyv::rancor::Error,
+            > = rkyv::from_bytes(&corrupted);
+        }
+        let decoded_extra: Result<
+            (
+                MesosValueType,
+                MesosValueType,
+                MesosValueType,
+                ReservationEntry,
+                DiskInfo,
+                VolumeMountMode,
+                RevocableInfo,
+            ),
+            rkyv::rancor::Error,
+        > = rkyv::from_bytes(&extra_bytes);
+        assert_eq!(decoded_extra.ok(), Some(rkyv_extra));
     }
 
     #[test]

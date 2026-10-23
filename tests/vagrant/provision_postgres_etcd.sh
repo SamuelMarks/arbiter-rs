@@ -26,6 +26,21 @@ if command -v etcd >/dev/null 2>&1; then
     echo $! > "${WORK_DIR}/etcd.pid"
 fi
 
+if command -v initdb >/dev/null 2>&1 && [ "${INIT_POSTGRES_CLUSTER:-0}" = "1" ]; then
+    PGDATA="${WORK_DIR}/pgdata"
+    rm -rf "${PGDATA}"
+    initdb -D "${PGDATA}" --no-locale --encoding=UTF8 >/dev/null 2>&1
+    cat >> "${PGDATA}/postgresql.conf" <<EOF
+wal_level = replica
+max_wal_senders = 10
+hot_standby = on
+EOF
+    if [ "${NODE_INDEX}" != "1" ]; then
+        touch "${PGDATA}/standby.signal"
+        echo "primary_conninfo = 'host=127.0.0.1 port=5432 application_name=standby_${NODE_INDEX}'" >> "${PGDATA}/postgresql.conf"
+    fi
+fi
+
 if command -v tcpdump >/dev/null 2>&1 && [ "${CAPTURE_PCAP:-0}" = "1" ]; then
     tcpdump -i lo0 -w "${WORK_DIR}/stack1_failover.pcap" port 2379 or port 2380 or port 5432 >/dev/null 2>&1 &
     echo $! > "${WORK_DIR}/tcpdump.pid"

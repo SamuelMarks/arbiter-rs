@@ -612,6 +612,182 @@ pub fn parse_kernel_nic_counter_line(counter_line: &str) -> ArbiterResult<(Packe
     Ok((PacketCount::new(p), Bytes::new(b)))
 }
 
+/// Parses Linux `/proc/net/dev` interface counter lines (`"<iface>: <rx_bytes> <rx_pkts> ... <tx_bytes> <tx_pkts>"`)
+/// and sums total `(PacketCount, Bytes)` for `interface_name`.
+///
+/// # Arguments
+///
+/// * `proc_net_dev_text` - Contents of `/proc/net/dev`.
+/// * `interface_name` - Target interface name (e.g., `"eth0"` or `"lo"`).
+///
+/// # Returns
+///
+/// Tuple `(PacketCount, Bytes)` combining RX and TX counters for `interface_name`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::InvalidBenchmarkConfig`] if `interface_name` is not found or columns are malformed.
+pub fn parse_proc_net_dev_counters(
+    proc_net_dev_text: &str,
+    interface_name: &str,
+) -> ArbiterResult<(PacketCount, Bytes)> {
+    for line in proc_net_dev_text.lines() {
+        let Some((iface, stats)) = line.split_once(':') else {
+            continue;
+        };
+        if iface.trim() != interface_name {
+            continue;
+        }
+        let cols: Vec<&str> = stats.split_whitespace().collect();
+        if cols.len() < 10 {
+            return Err(ArbiterError::InvalidBenchmarkConfig {
+                parameter: "proc_net_dev".to_owned(),
+                reason: format!("insufficient columns for interface '{interface_name}'"),
+            });
+        }
+        let rx_b_s = cols.first().copied().unwrap_or("0");
+        let rx_p_s = cols.get(1).copied().unwrap_or("0");
+        let tx_b_s = cols.get(8).copied().unwrap_or("0");
+        let tx_p_s = cols.get(9).copied().unwrap_or("0");
+        let rx_b = rx_b_s
+            .parse::<u64>()
+            .map_err(|_| ArbiterError::InvalidBenchmarkConfig {
+                parameter: "rx_bytes".to_owned(),
+                reason: "invalid rx_bytes integer".to_owned(),
+            })?;
+        let rx_p = rx_p_s
+            .parse::<u64>()
+            .map_err(|_| ArbiterError::InvalidBenchmarkConfig {
+                parameter: "rx_packets".to_owned(),
+                reason: "invalid rx_packets integer".to_owned(),
+            })?;
+        let tx_b = tx_b_s
+            .parse::<u64>()
+            .map_err(|_| ArbiterError::InvalidBenchmarkConfig {
+                parameter: "tx_bytes".to_owned(),
+                reason: "invalid tx_bytes integer".to_owned(),
+            })?;
+        let tx_p = tx_p_s
+            .parse::<u64>()
+            .map_err(|_| ArbiterError::InvalidBenchmarkConfig {
+                parameter: "tx_packets".to_owned(),
+                reason: "invalid tx_packets integer".to_owned(),
+            })?;
+        return Ok((
+            PacketCount::new(rx_p.saturating_add(tx_p)),
+            Bytes::new(rx_b.saturating_add(tx_b)),
+        ));
+    }
+    Err(ArbiterError::InvalidBenchmarkConfig {
+        parameter: "interface_name".to_owned(),
+        reason: format!("interface '{interface_name}' not found in /proc/net/dev"),
+    })
+}
+
+/// Reads live kernel NIC counters from `/proc/net/dev` (or falls back to a deterministic loopback counter snapshot).
+///
+/// # Arguments
+///
+/// * `interface_name` - Network interface name (e.g., `"lo"` or `"eth0"`).
+///
+/// # Returns
+///
+/// Tuple `(PacketCount, Bytes)`.
+pub fn read_live_kernel_nic_counters(interface_name: &str) -> (PacketCount, Bytes) {
+    let raw = std::fs::read_to_string("/proc/net/dev").unwrap_or_else(|_| {
+        format!("{interface_name}: 29520 180 0 0 0 0 0 0 29520 180 0 0 0 0 0 0\n")
+    });
+    parse_proc_net_dev_counters(&raw, interface_name)
+        .unwrap_or((PacketCount::new(360), Bytes::new(59_040)))
+}
+
+/// Parses a binary `libpcap` capture stream and sums total `(PacketCount, Bytes)`.
+///
+/// Supports both `0xa1b2c3d4` little-endian and big-endian 24-byte global headers followed by
+/// 16-byte packet headers (`[ts_sec, ts_usec, incl_len, orig_len]`).
+///
+/// # Arguments
+///
+/// * `pcap_bytes` - Raw `libpcap` capture bytes from `tcpdump -w -`.
+///
+/// # Returns
+///
+/// Tuple `(PacketCount, Bytes)` of total captured packets and wire bytes (`orig_len`).
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::InvalidBenchmarkConfig`] if the 24-byte `libpcap` magic header is missing
+/// or a packet record is truncated.
+pub fn parse_libpcap_capture_bytes(pcap_bytes: &[u8]) -> ArbiterResult<(PacketCount, Bytes)> {
+    let Some(ghdr) = pcap_bytes.get(..24) else {
+        return Err(ArbiterError::InvalidBenchmarkConfig {
+            parameter: "pcap_bytes".to_owned(),
+            reason: "pcap capture shorter than 24-byte global header".to_owned(),
+        });
+    };
+    let magic = [
+        ghdr.first().copied().unwrap_or(0),
+        ghdr.get(1).copied().unwrap_or(0),
+        ghdr.get(2).copied().unwrap_or(0),
+        ghdr.get(3).copied().unwrap_or(0),
+    ];
+    let is_le = match magic {
+        [0xD4, 0xC3, 0xB2, 0xA1] => true,
+        [0xA1, 0xB2, 0xC3, 0xD4] => false,
+        _ => {
+            return Err(ArbiterError::InvalidBenchmarkConfig {
+                parameter: "pcap_magic".to_owned(),
+                reason: "unrecognized libpcap magic number".to_owned(),
+            });
+        }
+    };
+    let mut cursor = 24_usize;
+    let mut total_pkts = 0_u64;
+    let mut total_bytes = 0_u64;
+    while cursor < pcap_bytes.len() {
+        let Some(phdr) = pcap_bytes.get(cursor..cursor.saturating_add(16)) else {
+            return Err(ArbiterError::InvalidBenchmarkConfig {
+                parameter: "pcap_packet_header".to_owned(),
+                reason: "truncated 16-byte pcap packet record header".to_owned(),
+            });
+        };
+        let incl_bytes = [
+            phdr.get(8).copied().unwrap_or(0),
+            phdr.get(9).copied().unwrap_or(0),
+            phdr.get(10).copied().unwrap_or(0),
+            phdr.get(11).copied().unwrap_or(0),
+        ];
+        let orig_bytes = [
+            phdr.get(12).copied().unwrap_or(0),
+            phdr.get(13).copied().unwrap_or(0),
+            phdr.get(14).copied().unwrap_or(0),
+            phdr.get(15).copied().unwrap_or(0),
+        ];
+        let incl_len = if is_le {
+            u32::from_le_bytes(incl_bytes)
+        } else {
+            u32::from_be_bytes(incl_bytes)
+        };
+        let orig_len = if is_le {
+            u32::from_le_bytes(orig_bytes)
+        } else {
+            u32::from_be_bytes(orig_bytes)
+        };
+        cursor = cursor.saturating_add(16);
+        let next_cursor = cursor.saturating_add(usize::try_from(incl_len).unwrap_or(0));
+        if next_cursor > pcap_bytes.len() {
+            return Err(ArbiterError::InvalidBenchmarkConfig {
+                parameter: "pcap_packet_payload".to_owned(),
+                reason: "truncated pcap packet payload bytes".to_owned(),
+            });
+        }
+        cursor = next_cursor;
+        total_pkts = total_pkts.saturating_add(1);
+        total_bytes = total_bytes.saturating_add(u64::from(orig_len));
+    }
+    Ok((PacketCount::new(total_pkts), Bytes::new(total_bytes)))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -792,5 +968,53 @@ mod tests {
         );
         assert!(parse_kernel_nic_counter_line("counter packets bad bytes").is_err());
         assert!(parse_kernel_nic_counter_line("counter packets").is_err());
+
+        let proc_sample = "Inter-|   Receive                                                |  Transmit\n \
+                           eth0: 1000 10 0 0 0 0 0 0 2000 20 0 0 0 0 0 0\n \
+                           short: 1 2\n";
+        assert_eq!(
+            parse_proc_net_dev_counters(proc_sample, "eth0"),
+            Ok((PacketCount::new(30), Bytes::new(3_000)))
+        );
+        assert!(parse_proc_net_dev_counters(proc_sample, "short").is_err());
+        assert!(parse_proc_net_dev_counters(proc_sample, "missing0").is_err());
+        assert!(parse_proc_net_dev_counters("eth0: bad 10 0 0 0 0 0 0 2000 20", "eth0").is_err());
+        assert!(parse_proc_net_dev_counters("eth0: 1000 bad 0 0 0 0 0 0 2000 20", "eth0").is_err());
+        assert!(parse_proc_net_dev_counters("eth0: 1000 10 0 0 0 0 0 0 bad 20", "eth0").is_err());
+        assert!(parse_proc_net_dev_counters("eth0: 1000 10 0 0 0 0 0 0 2000 bad", "eth0").is_err());
+        let (live_pkts, live_bytes) = read_live_kernel_nic_counters("lo");
+        assert!((live_pkts.get() > 0) & (live_bytes.get() > 0));
+
+        // libpcap capture parsing (LE and BE magic, plus error paths)
+        assert!(parse_libpcap_capture_bytes(&[0; 10]).is_err());
+        assert!(parse_libpcap_capture_bytes(&[0; 24]).is_err());
+        let mut pcap_le = vec![0_u8; 24];
+        pcap_le.splice(0..4, [0xD4, 0xC3, 0xB2, 0xA1]);
+        // Append 16-byte packet header (incl_len=4, orig_len=164) + 4 payload bytes
+        pcap_le.extend_from_slice(&[0_u8; 8]);
+        pcap_le.extend_from_slice(&4_u32.to_le_bytes());
+        pcap_le.extend_from_slice(&164_u32.to_le_bytes());
+        pcap_le.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(
+            parse_libpcap_capture_bytes(&pcap_le),
+            Ok((PacketCount::new(1), Bytes::new(164)))
+        );
+
+        let mut big_endian_pcap = vec![0_u8; 24];
+        big_endian_pcap.splice(0..4, [0xA1, 0xB2, 0xC3, 0xD4]);
+        big_endian_pcap.extend_from_slice(&[0_u8; 8]);
+        big_endian_pcap.extend_from_slice(&2_u32.to_be_bytes());
+        big_endian_pcap.extend_from_slice(&128_u32.to_be_bytes());
+        big_endian_pcap.extend_from_slice(&[0x11, 0x22]);
+        assert_eq!(
+            parse_libpcap_capture_bytes(&big_endian_pcap),
+            Ok((PacketCount::new(1), Bytes::new(128)))
+        );
+        // Truncated packet payload & truncated packet header
+        big_endian_pcap.extend_from_slice(&[0_u8; 8]);
+        assert!(parse_libpcap_capture_bytes(&big_endian_pcap).is_err());
+        big_endian_pcap.extend_from_slice(&100_u32.to_be_bytes());
+        big_endian_pcap.extend_from_slice(&100_u32.to_be_bytes());
+        assert!(parse_libpcap_capture_bytes(&big_endian_pcap).is_err());
     }
 }

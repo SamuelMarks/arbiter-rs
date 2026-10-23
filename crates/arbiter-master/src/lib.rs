@@ -21,7 +21,7 @@ use arbiter_alloc::federation::{
 };
 use arbiter_alloc::gang::GangAgentCandidate;
 use arbiter_alloc::preemption::{
-    PreemptionPlan, RunningTaskInstance, solve_minimum_disruption_preemption,
+    PreemptionPlan, RunningTaskInstance, solve_minimum_disruption_preemption_with_caas_primaries,
 };
 use arbiter_alloc::topology_packer::AgentHardwareInventory;
 use arbiter_core::error::{ArbiterError, ArbiterResult};
@@ -139,23 +139,42 @@ pub struct MasterNode<S: StateStore> {
     pub operator_event_log: Vec<OperatorEvent>,
     /// Whether the cluster defaults to partition-aware `TaskState::Unreachable` on transient Agent timeouts.
     pub partition_aware_tasks: bool,
-    /// Active Master logging verbosity level (`0..=3`, default `1`).
-    #[serde(default = "default_logging_level")]
-    pub logging_level: u8,
+    /// Active Master logging verbosity level.
+    #[serde(default)]
+    pub logging_level: arbiter_core::units::LoggingLevel,
     /// Virtual/persisted sandbox files keyed by file path for `LIST_FILES` and `READ_FILE` Operator calls.
     #[serde(default)]
     pub sandbox_files: BTreeMap<String, String>,
+    /// Current elected [`MasterInfo`] persisted to `/master/leader_info`.
+    #[serde(default)]
+    pub master_info: MasterInfo,
+    /// Whether this Master instance is currently the active Raft/consensus leader.
+    #[serde(default)]
+    pub is_leader: bool,
+    /// Redirect base URL (`http://<leader_host>:<leader_port>`) returned in HTTP `307 Temporary Redirect` when `!is_leader`.
+    #[serde(default)]
+    pub leader_redirect_url: Option<String>,
+    /// Bounded ring buffer of torn-down [`FrameworkId`]s.
+    #[serde(default)]
+    pub completed_frameworks: std::collections::VecDeque<FrameworkId>,
+    /// Maximum number of completed frameworks retained in `completed_frameworks`.
+    #[serde(default)]
+    pub max_completed_frameworks: usize,
+    /// Bounded ring buffer of terminal [`TaskId`]s.
+    #[serde(default)]
+    pub completed_tasks: std::collections::VecDeque<TaskId>,
+    /// Maximum number of terminal tasks retained in `completed_tasks`.
+    #[serde(default)]
+    pub max_completed_tasks: usize,
+    /// Unacknowledged offer operation status updates awaiting [`SchedulerCall::AcknowledgeOperationStatus`].
+    #[serde(default)]
+    pub unacknowledged_operation_updates:
+        BTreeMap<StatusUpdateUuid, (FrameworkId, OperationId, OperationState)>,
+    /// Whether Master Registry strict recovery mode (`--registry_strict`) is enforced for re-registering Agents.
+    #[serde(default)]
+    pub strict_registry_recovery: bool,
     /// Agent heartbeat lease TTL in ticks.
     pub agent_lease_ttl_ticks: u64,
-}
-
-/// Returns the default logging level (`1` = `INFO`).
-///
-/// # Returns
-///
-/// `1`.
-const fn default_logging_level() -> u8 {
-    1
 }
 
 impl<S: StateStore> MasterNode<S> {
@@ -205,10 +224,156 @@ impl<S: StateStore> MasterNode<S> {
             pending_gang_jobs: Vec::new(),
             operator_event_log: Vec::new(),
             partition_aware_tasks: false,
-            logging_level: default_logging_level(),
+            logging_level: arbiter_core::units::LoggingLevel::default(),
             sandbox_files: BTreeMap::new(),
+            master_info: MasterInfo {
+                leader_id: "master-1".to_owned(),
+                version: "0.1.0".to_owned(),
+                elected_term: 1,
+            },
+            is_leader: true,
+            leader_redirect_url: None,
+            completed_frameworks: std::collections::VecDeque::new(),
+            max_completed_frameworks: 100,
+            completed_tasks: std::collections::VecDeque::new(),
+            max_completed_tasks: 1_000,
+            unacknowledged_operation_updates: BTreeMap::new(),
+            strict_registry_recovery: false,
             agent_lease_ttl_ticks,
         }
+    }
+
+    /// Verifies that `agent_id` is present in the persistent Master Registry (`/agents/<agent_id>`)
+    /// when `self.strict_registry_recovery` is enabled (`--registry_strict`).
+    ///
+    /// # Arguments
+    ///
+    /// * `agent_id` - Re-registering or heartbeating [`AgentId`].
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when `strict_registry_recovery` is `false` or `agent_id` is in the registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::RegistryRecovery`] when `strict_registry_recovery` is `true` and
+    /// `agent_id` is not registered in `self.agents`.
+    pub fn verify_strict_agent_registration(&self, agent_id: &AgentId) -> ArbiterResult<()> {
+        if self.strict_registry_recovery && !self.agents.contains_key(agent_id) {
+            return Err(ArbiterError::RegistryRecovery(
+                arbiter_core::error::RegistryRecoveryError::new(
+                    &self.master_info.leader_id,
+                    true,
+                    &format!("agent '{agent_id}' is not present in strict master registry"),
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Rescinds all active [`InverseOffer`]s targeting `agent_id` (e.g., when a maintenance window
+    /// is cancelled or `StopMaintenance` is invoked) and emits [`SchedulerEvent::RescindInverseOffer`].
+    ///
+    /// # Arguments
+    ///
+    /// * `agent_id` - [`AgentId`] whose maintenance was cancelled or completed.
+    ///
+    /// # Returns
+    ///
+    /// Vector of `(FrameworkId, SchedulerEvent::RescindInverseOffer)` pairs.
+    pub fn rescind_inverse_offers_for_agent(
+        &mut self,
+        agent_id: &AgentId,
+    ) -> Vec<(FrameworkId, SchedulerEvent)> {
+        let matching: Vec<(OfferId, FrameworkId)> = self
+            .active_inverse_offers
+            .iter()
+            .filter(|(_, io)| &io.agent_id == agent_id)
+            .map(|(oid, io)| (oid.clone(), io.framework_id.clone()))
+            .collect();
+        let mut events = Vec::with_capacity(matching.len());
+        for (oid, fw_id) in matching {
+            self.active_inverse_offers.remove(&oid);
+            self.consumed_offers.insert(oid.clone());
+            events.push((fw_id, SchedulerEvent::RescindInverseOffer(oid)));
+        }
+        events
+    }
+
+    /// Promotes this [`MasterNode`] to active consensus leader for `elected_term`, persisting
+    /// [`MasterInfo`] to `/master/leader_info` in `self.store` and recovering all cluster state.
+    ///
+    /// # Arguments
+    ///
+    /// * `leader_id` - Identifier of the newly elected Master leader.
+    /// * `elected_term` - Monotonic consensus term.
+    /// * `current_tick` - Monotonic tick of leader promotion.
+    ///
+    /// # Returns
+    ///
+    /// Number of Agent records recovered from `self.store`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ArbiterError`] if persisting `/master/leader_info` or reading state fails.
+    pub fn promote_to_leader(
+        &mut self,
+        leader_id: &str,
+        elected_term: u64,
+        current_tick: u64,
+    ) -> ArbiterResult<usize> {
+        let info = MasterInfo {
+            leader_id: leader_id.to_owned(),
+            version: "0.1.0".to_owned(),
+            elected_term,
+        };
+        let _ = self.store.put(
+            "/master/leader_info",
+            serde_json::to_vec(&info).unwrap_or_default(),
+        )?;
+        self.master_info = info;
+        self.is_leader = true;
+        self.leader_redirect_url = None;
+        self.recover_from_state_store(current_tick)
+    }
+
+    /// Steps this [`MasterNode`] down to standby follower state and records `leader_http_url`
+    /// for HTTP `307 Temporary Redirect` responses.
+    ///
+    /// # Arguments
+    ///
+    /// * `leader_http_url` - Active leader HTTP base URL (e.g., `"http://10.0.0.1:5051"`).
+    pub fn step_down_to_standby(&mut self, leader_http_url: &str) {
+        self.is_leader = false;
+        self.leader_redirect_url = Some(leader_http_url.to_owned());
+    }
+
+    /// Verifies that this [`MasterNode`] is the active leader, or returns an HTTP `307 Temporary Redirect`
+    /// [`ArbiterError::HttpHandlerError`] pointing to `self.leader_redirect_url` for `/api/v1/{scheduler,operator,jobs}`.
+    ///
+    /// # Arguments
+    ///
+    /// * `endpoint_path` - Requested API path (e.g., `"/api/v1/scheduler"`).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when `self.is_leader` is `true`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::HttpHandlerError`] with `status_code: 307` when `!self.is_leader`.
+    pub fn check_leader_or_redirect(&self, endpoint_path: &str) -> ArbiterResult<()> {
+        if self.is_leader {
+            return Ok(());
+        }
+        let target = self
+            .leader_redirect_url
+            .as_deref()
+            .unwrap_or("http://127.0.0.1:5051");
+        Err(ArbiterError::HttpHandlerError {
+            status_code: 307,
+            message: format!("307 Temporary Redirect: Location: {target}{endpoint_path}"),
+        })
     }
 
     /// Commits a batch of `(key, value)` puts and `delete_keys` to `self.store` via an atomic [`StoreTransaction`].
@@ -483,6 +648,16 @@ impl<S: StateStore> MasterNode<S> {
             self.election_plane.restore_lease(grant);
         }
 
+        for info in self
+            .store
+            .scan_prefix("/master/")
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|e| serde_json::from_slice::<MasterInfo>(&e.value).ok())
+        {
+            self.master_info = info;
+        }
+
         Ok(recovered)
     }
 
@@ -518,6 +693,7 @@ impl<S: StateStore> MasterNode<S> {
                     agent_id: hb.agent_id.clone(),
                     healthy_tasks: hb.healthy_tasks.clone(),
                     heartbeat_tick: hb.tick,
+                    replication_progress: Vec::new(),
                 });
         let mut puts = Vec::with_capacity(renewed.len());
         for grant in &renewed {
@@ -844,6 +1020,10 @@ impl<S: StateStore> MasterNode<S> {
 
         self.commit_store_puts_and_deletes(&puts, &deletes);
         self.active_executors.retain(|_, fw| fw != framework_id);
+        self.completed_frameworks.push_back(framework_id.clone());
+        while self.completed_frameworks.len() > self.max_completed_frameworks {
+            let _ = self.completed_frameworks.pop_front();
+        }
         self.operator_event_log
             .push(OperatorEvent::FrameworkRemoved(framework_id.clone()));
         Ok(killed_count)
@@ -893,11 +1073,7 @@ impl<S: StateStore> MasterNode<S> {
                 }
                 Ok(vec![SchedulerEvent::Subscribed(
                     fw_id,
-                    MasterInfo {
-                        leader_id: "master-1".to_owned(),
-                        version: "0.1.0".to_owned(),
-                        elected_term: 1,
-                    },
+                    self.master_info.clone(),
                     BenchmarkTicks::new(self.agent_lease_ttl_ticks),
                 )])
             }
@@ -920,6 +1096,12 @@ impl<S: StateStore> MasterNode<S> {
                 }
                 let mut events = Vec::new();
                 if let Some(op_id) = operation_id {
+                    let op_uuid =
+                        StatusUpdateUuid::new(&format!("uuid-op-{op_id}")).unwrap_or_default();
+                    self.unacknowledged_operation_updates.insert(
+                        op_uuid.clone(),
+                        (fw_id.clone(), op_id.clone(), OperationState::Finished),
+                    );
                     self.tracked_operations.insert(
                         op_id.clone(),
                         (fw_id.clone(), None, OperationState::Finished),
@@ -941,7 +1123,7 @@ impl<S: StateStore> MasterNode<S> {
                         op_id,
                         OperationState::Finished,
                         "offer operation committed".to_owned(),
-                        None,
+                        Some(op_uuid),
                     ));
                 }
                 Ok(events)
@@ -1017,7 +1199,7 @@ impl<S: StateStore> MasterNode<S> {
                 }
                 Ok(Vec::new())
             }
-            SchedulerCall::Kill(framework_id, task_id, _, _) => {
+            SchedulerCall::Kill(framework_id, task_id, _, kill_policy) => {
                 if !self.frameworks.contains_key(&framework_id) {
                     return Err(ArbiterError::FrameworkNotFound {
                         framework_id: framework_id.to_string(),
@@ -1029,6 +1211,12 @@ impl<S: StateStore> MasterNode<S> {
                         reason: "unknown task in Kill call".to_owned(),
                     });
                 };
+                self.queue_agent_wire_message(
+                    &aid,
+                    arbiter_proto::WireMessage::ExecutorEvent(Box::new(
+                        arbiter_proto::ExecutorEvent::Kill(task_id.clone(), kill_policy),
+                    )),
+                );
                 let update = TaskStatusUpdate {
                     task_id,
                     agent_id: aid,
@@ -1064,6 +1252,7 @@ impl<S: StateStore> MasterNode<S> {
                     });
                 }
                 self.unacknowledged_updates.remove(&status_uuid);
+                self.unacknowledged_operation_updates.remove(&status_uuid);
                 Ok(Vec::new())
             }
             SchedulerCall::ReconcileTasks(framework_id, tasks) => {
@@ -1355,6 +1544,16 @@ impl<S: StateStore> MasterNode<S> {
                 }
                 Ok(OperatorResponse::Executors(list))
             }
+            OperatorCall::GetOperations => {
+                let list = self
+                    .tracked_operations
+                    .iter()
+                    .map(|(op_id, (fw_id, maybe_aid, st))| {
+                        (op_id.clone(), fw_id.clone(), maybe_aid.clone(), *st)
+                    })
+                    .collect();
+                Ok(OperatorResponse::Operations(list))
+            }
             OperatorCall::GetTasks => {
                 let list = self
                     .tasks
@@ -1387,7 +1586,7 @@ impl<S: StateStore> MasterNode<S> {
                 self.commit_store_puts_and_deletes(&puts, &[]);
                 Ok(OperatorResponse::Ok("weights updated".to_owned()))
             }
-            OperatorCall::SetQuota(role, quota) => {
+            OperatorCall::UpdateQuota(role, quota) | OperatorCall::SetQuota(role, quota) => {
                 self.role_hierarchy.set_role_quota(&role, quota.clone())?;
                 self.commit_store_puts_and_deletes(
                     &[(
@@ -1402,6 +1601,10 @@ impl<S: StateStore> MasterNode<S> {
                 self.role_hierarchy.remove_role_quota(&role)?;
                 self.commit_store_puts_and_deletes(&[], &[format!("/quotas/{role}")]);
                 Ok(OperatorResponse::Ok("quota removed".to_owned()))
+            }
+            OperatorCall::TeardownFramework(framework_id) => {
+                let _ = self.teardown_framework(&framework_id)?;
+                Ok(OperatorResponse::Ok("framework torn down".to_owned()))
             }
             OperatorCall::ReserveResources(reservation) => {
                 self.apply_dynamic_reservation(&reservation)?;
@@ -1433,29 +1636,32 @@ impl<S: StateStore> MasterNode<S> {
             }
             OperatorCall::GetLoggingLevel => Ok(OperatorResponse::LoggingLevel(self.logging_level)),
             OperatorCall::SetLoggingLevel(level, _) => {
-                let parsed = arbiter_core::units::LoggingLevel::from_u8(level)?;
-                self.logging_level = parsed.as_u8();
+                self.logging_level = level;
                 Ok(OperatorResponse::Ok("logging level updated".to_owned()))
             }
             OperatorCall::ListFiles(prefix) => {
+                let prefix_str = prefix.as_str();
                 let matches = self
                     .sandbox_files
                     .keys()
-                    .filter(|p| p.starts_with(&prefix))
-                    .cloned()
+                    .filter(|p| p.starts_with(prefix_str))
+                    .filter_map(|p| arbiter_core::ids::SandboxPath::new(p).ok())
                     .collect();
                 Ok(OperatorResponse::FileList(matches))
             }
             OperatorCall::ReadFile(path, offset, length) => {
-                let Some(content) = self.sandbox_files.get(&path) else {
+                let path_str = path.as_str();
+                let Some(content) = self.sandbox_files.get(path_str) else {
                     return Err(ArbiterError::StoreReadError {
-                        key: path,
+                        key: path_str.to_owned(),
                         reason: "sandbox file not found in ReadFile".to_owned(),
                     });
                 };
-                let start = usize::try_from(offset).unwrap_or(0).min(content.len());
+                let start = usize::try_from(offset.get())
+                    .unwrap_or(0)
+                    .min(content.len());
                 let end = start
-                    .saturating_add(usize::try_from(length).unwrap_or(0))
+                    .saturating_add(usize::try_from(length.get()).unwrap_or(0))
                     .min(content.len());
                 let chunk = content.get(start..end).unwrap_or("").to_owned();
                 Ok(OperatorResponse::FileChunk(offset, chunk))
@@ -1515,6 +1721,7 @@ impl<S: StateStore> MasterNode<S> {
                         serde_json::to_vec(&(&aid, AgentMaintenanceState::Normal))
                             .unwrap_or_default(),
                     ));
+                    let _ = self.rescind_inverse_offers_for_agent(&aid);
                     self.agent_maintenance
                         .insert(aid, AgentMaintenanceState::Normal);
                 }
@@ -1883,6 +2090,127 @@ impl<S: StateStore> MasterNode<S> {
             .unwrap_or_default()
     }
 
+    /// Dispatches all queued outbound [`arbiter_proto::WireMessage`]s for `agent_id` through
+    /// `dispatcher`, automatically applying any returned [`TaskStatusUpdate`]s to Master state.
+    ///
+    /// # Arguments
+    ///
+    /// * `agent_id` - Target [`AgentId`].
+    /// * `dispatcher` - Callback transmitting a [`arbiter_proto::WireMessage`] to the Agent and returning an optional [`TaskStatusUpdate`].
+    ///
+    /// # Returns
+    ///
+    /// Number of wire messages dispatched.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ArbiterError`] if `dispatcher` or `update_task_status` fails.
+    pub fn dispatch_outbound_agent_messages_with<F>(
+        &mut self,
+        agent_id: &AgentId,
+        mut dispatcher: F,
+    ) -> ArbiterResult<usize>
+    where
+        F: FnMut(&arbiter_proto::WireMessage) -> ArbiterResult<Option<TaskStatusUpdate>>,
+    {
+        let messages = self.drain_outbound_agent_messages(agent_id);
+        let count = messages.len();
+        for msg in &messages {
+            if let Some(status) = dispatcher(msg)? {
+                self.update_task_status(&status)?;
+            }
+        }
+        Ok(count)
+    }
+
+    /// Re-registers a reconnecting Agent (`ReregisterAgent`) after a Master leader failover or
+    /// network partition heal, reconciling its running tasks, active executors, unacknowledged
+    /// status updates, and CSI resource providers into Master state and the backing [`StateStore`].
+    ///
+    /// # Arguments
+    ///
+    /// * `reg` - Agent [`RegisterAgent`] descriptor.
+    /// * `running_tasks` - Currently running `(TaskId, ResourceBundle, Option<FrameworkId>)` tuples on the Agent.
+    /// * `active_executors` - Active `(ExecutorId, FrameworkId)` pairs on the Agent.
+    /// * `unacknowledged_updates` - Unacknowledged `(StatusUpdateUuid, FrameworkId, TaskStatusUpdate)` tuples replayed by the Agent.
+    /// * `resource_providers` - Local [`ResourceProviderInfo`]s hosted on the Agent.
+    /// * `current_tick` - Monotonic tick of re-registration.
+    ///
+    /// # Returns
+    ///
+    /// Number of running tasks reconciled from the re-registering Agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ArbiterError`] if persisting the Agent registration fails.
+    pub fn reregister_agent(
+        &mut self,
+        reg: RegisterAgent,
+        running_tasks: Vec<(TaskId, ResourceBundle, Option<FrameworkId>)>,
+        active_executors: Vec<(ExecutorId, FrameworkId)>,
+        unacknowledged_updates: Vec<(StatusUpdateUuid, FrameworkId, TaskStatusUpdate)>,
+        resource_providers: Vec<ResourceProviderInfo>,
+        current_tick: u64,
+    ) -> ArbiterResult<usize> {
+        let aid = reg.agent_id.clone();
+        self.register_agent(reg, current_tick)?;
+        let mut puts = Vec::new();
+        let mut reconciled = 0_usize;
+        for (tid, res, owner) in running_tasks {
+            for (_, rec) in self.agents.iter_mut().filter(|(id, _)| *id == &aid) {
+                rec.available_resources = rec
+                    .available_resources
+                    .try_sub(&res)
+                    .unwrap_or(ResourceBundle::zero());
+            }
+            if let Some(ref fw_id) = owner {
+                self.task_owners.insert(tid.clone(), fw_id.clone());
+            }
+            puts.push((
+                format!("/tasks/{tid}"),
+                serde_json::to_vec(&(&tid, TaskState::Running, &aid, &res, &owner))
+                    .unwrap_or_default(),
+            ));
+            self.tasks
+                .insert(tid, (TaskState::Running, aid.clone(), res));
+            reconciled = reconciled.saturating_add(1);
+        }
+        for (eid, fw_id) in active_executors {
+            self.active_executors.insert((aid.clone(), eid), fw_id);
+        }
+        for (uuid, fw_id, upd) in unacknowledged_updates {
+            self.unacknowledged_updates.insert(uuid, (fw_id, upd));
+        }
+        for rp in resource_providers {
+            let pid = rp.provider_id.clone();
+            puts.push((
+                format!("/resource_providers/{pid}"),
+                serde_json::to_vec(&rp).unwrap_or_default(),
+            ));
+            self.resource_providers.insert(pid, rp);
+        }
+        self.commit_store_puts_and_deletes(&puts, &[]);
+        Ok(reconciled)
+    }
+
+    /// Drains `self.operator_event_log` and encodes all buffered [`OperatorEvent`]s into a
+    /// Mesos `RecordIO` (`<byte_length>\n<json_bytes>`) streaming byte buffer.
+    ///
+    /// # Returns
+    ///
+    /// `RecordIO`-framed byte stream for subscribed Operators.
+    pub fn drain_operator_event_recordio_stream(&mut self) -> Vec<u8> {
+        let events = core::mem::take(&mut self.operator_event_log);
+        let mut out = Vec::new();
+        for ev in events {
+            let json = serde_json::to_vec(&ev).unwrap_or_default();
+            let prefix = format!("{}\n", json.len());
+            out.extend_from_slice(prefix.as_bytes());
+            out.extend_from_slice(&json);
+        }
+        out
+    }
+
     /// Expands an existing persistent volume on `agent_id` by `additional_bytes` (`GROW_VOLUME`),
     /// deducting `additional_bytes` from the Agent's available disk pool.
     ///
@@ -2113,8 +2441,8 @@ impl<S: StateStore> MasterNode<S> {
             }),
         );
 
-        let mut evicted = 0_usize;
-        for (state, aid, held) in self.tasks.values_mut() {
+        let mut evicted_tasks = Vec::new();
+        for (tid, (state, aid, held)) in &mut self.tasks {
             if aid == agent_id && !state.is_terminal() {
                 *state = TaskState::Killed;
                 let reclaimed = core::mem::replace(held, ResourceBundle::zero());
@@ -2124,8 +2452,20 @@ impl<S: StateStore> MasterNode<S> {
                         .try_add(&reclaimed)
                         .unwrap_or_default();
                 }
-                evicted = evicted.saturating_add(1);
+                evicted_tasks.push(tid.clone());
             }
+        }
+        let evicted = evicted_tasks.len();
+        for tid in evicted_tasks {
+            self.queue_agent_wire_message(
+                agent_id,
+                arbiter_proto::WireMessage::ExecutorEvent(Box::new(
+                    arbiter_proto::ExecutorEvent::Kill(
+                        tid,
+                        Some(arbiter_core::workload::KillPolicy { grace_period_ticks }),
+                    ),
+                )),
+            );
         }
 
         if completion_mode == DrainCompletionMode::MarkGoneOnComplete {
@@ -2177,6 +2517,13 @@ impl<S: StateStore> MasterNode<S> {
         self.agent_maintenance
             .insert(agent_id.clone(), AgentMaintenanceState::Deactivated);
         let _ = self.rescind_offers_for_agent(agent_id, OfferRescindReason::AgentDisconnected);
+        let _ = self.election_plane.revoke_leases_on_agent(agent_id);
+        self.queue_agent_wire_message(
+            agent_id,
+            arbiter_proto::WireMessage::ExecutorEvent(Box::new(
+                arbiter_proto::ExecutorEvent::Shutdown(BenchmarkTicks::ZERO),
+            )),
+        );
 
         let mut gone_count = 0_usize;
         for (state, aid, _) in self.tasks.values_mut() {
@@ -2291,13 +2638,28 @@ impl<S: StateStore> MasterNode<S> {
         }
 
         let mut puts = Vec::new();
-        // Record placed direct tasks and gang tasks as Staging.
+        // Record placed direct tasks and gang tasks as Staging and queue LaunchTaskCommand.
         for (tid, plan) in &outcome.direct_placements {
-            let task_res = direct_queue
-                .iter()
-                .find(|t| &t.task_id == tid)
+            let matched_task = direct_queue.iter().find(|t| &t.task_id == tid).cloned();
+            let task_res = matched_task
+                .as_ref()
                 .map(|t| t.resources.clone())
                 .unwrap_or_default();
+            let _ = matched_task.map(|mut task_spec| {
+                task_spec.isolation.env.push((
+                    "ARBITER_PINNED_NUMA_NODE".to_owned(),
+                    plan.selected_numa_node.to_string(),
+                ));
+                self.queue_agent_wire_message(
+                    &plan.agent_id,
+                    arbiter_proto::WireMessage::LaunchTaskCommand(Box::new(
+                        arbiter_proto::LaunchTaskCommand {
+                            agent_id: plan.agent_id.clone(),
+                            task: task_spec,
+                        },
+                    )),
+                );
+            });
             puts.push((
                 format!("/tasks/{tid}"),
                 serde_json::to_vec(&(
@@ -2317,13 +2679,40 @@ impl<S: StateStore> MasterNode<S> {
                 .push(OperatorEvent::TaskAdded(tid.clone(), plan.agent_id.clone()));
         }
         for gang_res in &outcome.gang_reservations {
-            for (tid, plan) in &gang_res.member_placements {
-                let task_res = gang_queue
+            let world_size = gang_res.member_placements.len();
+            for (rank, (tid, plan)) in gang_res.member_placements.iter().enumerate() {
+                let matched_task = gang_queue
                     .iter()
                     .flat_map(|g| &g.tasks)
                     .find(|t| &t.task_id == tid)
+                    .cloned();
+                let task_res = matched_task
+                    .as_ref()
                     .map(|t| t.resources.clone())
                     .unwrap_or_default();
+                let _ = matched_task.map(|mut task_spec| {
+                    task_spec
+                        .isolation
+                        .env
+                        .push(("ARBITER_GANG_RANK".to_owned(), rank.to_string()));
+                    task_spec
+                        .isolation
+                        .env
+                        .push(("ARBITER_GANG_WORLD_SIZE".to_owned(), world_size.to_string()));
+                    task_spec.isolation.env.push((
+                        "ARBITER_PINNED_NUMA_NODE".to_owned(),
+                        plan.selected_numa_node.to_string(),
+                    ));
+                    self.queue_agent_wire_message(
+                        &plan.agent_id,
+                        arbiter_proto::WireMessage::LaunchTaskCommand(Box::new(
+                            arbiter_proto::LaunchTaskCommand {
+                                agent_id: plan.agent_id.clone(),
+                                task: task_spec,
+                            },
+                        )),
+                    );
+                });
                 puts.push((
                     format!("/tasks/{tid}"),
                     serde_json::to_vec(&(
@@ -2400,9 +2789,10 @@ impl<S: StateStore> MasterNode<S> {
         )
     }
 
-    /// Solves minimum-disruption preemption on `agent_id` for `incoming_task` against `running_victims`,
-    /// transitioning evicted tasks to [`TaskState::Preempting`] and reclaiming their resources so
-    /// `incoming_task` can be staged immediately on `agent_id`.
+    /// Solves minimum-disruption preemption on `agent_id` for `incoming_task` against `running_victims`
+    /// while penalizing active `CaaS` primaries in `self.election_plane`, transitioning evicted tasks
+    /// to [`TaskState::Preempting`], queuing [`arbiter_proto::WireMessage::PreemptTaskCommand`]s,
+    /// and reclaiming their resources so `incoming_task` can be staged immediately on `agent_id`.
     ///
     /// # Arguments
     ///
@@ -2434,14 +2824,37 @@ impl<S: StateStore> MasterNode<S> {
                 reason: "unknown agent in preempt_for_high_priority_task".to_owned(),
             });
         };
-        let decision = solve_minimum_disruption_preemption(
+        let active_primaries: BTreeSet<TaskId> = self
+            .election_plane
+            .groups()
+            .values()
+            .filter_map(|g| g.current_lease.as_ref().map(|l| l.primary_task_id.clone()))
+            .collect();
+        let decision = solve_minimum_disruption_preemption_with_caas_primaries(
             incoming_task,
             agent_id,
             &current_free,
             running_victims,
             true,
+            &active_primaries,
+            50_000,
         )?;
         for (victim_tid, _) in &decision.victims {
+            let victim_policy = running_victims
+                .iter()
+                .find(|v| &v.task_id == victim_tid)
+                .map_or(
+                    arbiter_core::workload::PreemptionPolicy::GracefulSigterm,
+                    |v| v.preemption_policy,
+                );
+            self.queue_agent_wire_message(
+                agent_id,
+                arbiter_proto::WireMessage::PreemptTaskCommand(arbiter_proto::PreemptTaskCommand {
+                    agent_id: agent_id.clone(),
+                    task_id: victim_tid.clone(),
+                    policy: victim_policy,
+                }),
+            );
             let _ = self.update_task_status(&TaskStatusUpdate {
                 task_id: victim_tid.clone(),
                 agent_id: agent_id.clone(),
@@ -2927,6 +3340,10 @@ impl<S: StateStore> MasterNode<S> {
                     .try_add(&reclaimed)
                     .unwrap_or_default();
             }
+            self.completed_tasks.push_back(update.task_id.clone());
+            while self.completed_tasks.len() > self.max_completed_tasks {
+                let _ = self.completed_tasks.pop_front();
+            }
         }
         let persisted_res = self
             .tasks
@@ -2949,6 +3366,135 @@ impl<S: StateStore> MasterNode<S> {
             &[],
         );
         Ok(())
+    }
+
+    /// Re-emits all unacknowledged offer operation status updates queued in
+    /// `self.unacknowledged_operation_updates` until acknowledged via [`SchedulerCall::AcknowledgeOperationStatus`].
+    ///
+    /// # Returns
+    ///
+    /// Vector of `(FrameworkId, SchedulerEvent::OperationUpdate)` pairs.
+    pub fn retry_unacknowledged_operation_updates(&self) -> Vec<(FrameworkId, SchedulerEvent)> {
+        self.unacknowledged_operation_updates
+            .iter()
+            .map(|(uuid, (fw_id, op_id, state))| {
+                (
+                    fw_id.clone(),
+                    SchedulerEvent::OperationUpdate(
+                        op_id.clone(),
+                        *state,
+                        "retrying unacknowledged offer operation status".to_owned(),
+                        Some(uuid.clone()),
+                    ),
+                )
+            })
+            .collect()
+    }
+
+    /// Serves legacy/convenience Apache Mesos HTTP GET endpoints (`/health`, `/redirect`,
+    /// `/state`, `/state-summary`, `/metrics/snapshot`, and `/metrics`).
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Requested HTTP GET URI path.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(HttpStatusCode, content_type, body)` representing the HTTP response.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::HttpHandlerError`] with `status_code: 404` if `path` is not a recognized endpoint.
+    pub fn handle_legacy_mesos_http_get(
+        &self,
+        path: &str,
+    ) -> ArbiterResult<(arbiter_core::units::HttpStatusCode, &'static str, String)> {
+        use arbiter_core::units::HttpStatusCode;
+        match path {
+            "/health" => {
+                if self.is_leader {
+                    Ok((
+                        HttpStatusCode::OK,
+                        "application/json",
+                        format!(
+                            "{{\"healthy\":true,\"is_leader\":true,\"leader_id\":\"{}\"}}",
+                            self.master_info.leader_id
+                        ),
+                    ))
+                } else {
+                    Ok((
+                        HttpStatusCode::SERVICE_UNAVAILABLE,
+                        "application/json",
+                        "{\"healthy\":false,\"is_leader\":false}".to_owned(),
+                    ))
+                }
+            }
+            "/redirect" => {
+                let target = self
+                    .leader_redirect_url
+                    .as_deref()
+                    .unwrap_or("http://127.0.0.1:5051");
+                Ok((
+                    HttpStatusCode::TEMPORARY_REDIRECT,
+                    "text/plain",
+                    target.to_owned(),
+                ))
+            }
+            "/state" | "/state-summary" => {
+                let running_tasks = self
+                    .tasks
+                    .values()
+                    .filter(|(st, _, _)| *st == TaskState::Running)
+                    .count();
+                let body = format!(
+                    "{{\"leader\":\"{}\",\"version\":\"{}\",\"elected_term\":{},\"activated_slaves\":{},\"connected_frameworks\":{},\"running_tasks\":{},\"active_offers\":{},\"completed_tasks\":{}}}",
+                    self.master_info.leader_id,
+                    self.master_info.version,
+                    self.master_info.elected_term,
+                    self.agents.len(),
+                    self.frameworks.len(),
+                    running_tasks,
+                    self.active_offers.len(),
+                    self.completed_tasks.len(),
+                );
+                Ok((HttpStatusCode::OK, "application/json", body))
+            }
+            "/metrics/snapshot" => {
+                let elected = u8::from(self.is_leader);
+                let running_tasks = self
+                    .tasks
+                    .values()
+                    .filter(|(st, _, _)| *st == TaskState::Running)
+                    .count();
+                let body = format!(
+                    "{{\"master/elected\":{},\"master/slaves_active\":{},\"master/frameworks_active\":{},\"master/tasks_running\":{},\"master/offers_active\":{}}}",
+                    elected,
+                    self.agents.len(),
+                    self.frameworks.len(),
+                    running_tasks,
+                    self.active_offers.len(),
+                );
+                Ok((HttpStatusCode::OK, "application/json", body))
+            }
+            "/metrics" => {
+                let elected = u8::from(self.is_leader);
+                let running_tasks = self
+                    .tasks
+                    .values()
+                    .filter(|(st, _, _)| *st == TaskState::Running)
+                    .count();
+                let body = format!(
+                    "arbiter_master_elected {elected}\narbiter_master_agents_active {}\narbiter_master_frameworks_active {}\narbiter_master_tasks_running {running_tasks}\n",
+                    self.agents.len(),
+                    self.frameworks.len(),
+                );
+                Ok((HttpStatusCode::OK, "text/plain; version=0.0.4", body))
+            }
+            _ => Err(ArbiterError::HttpHandlerError {
+                status_code: 404,
+                message: format!("unknown Mesos GET endpoint '{path}'"),
+            }),
+        }
     }
 }
 
@@ -3008,7 +3554,9 @@ impl<S: StateStore> SharedMasterCoordinator<S> {
             .inner
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let events = guard.handle_scheduler_call(call, current_tick)?;
+        let events = guard
+            .handle_scheduler_call(call, current_tick)
+            .unwrap_or_default();
         drop(guard);
         self.framework_queues
             .lock()
@@ -3047,7 +3595,9 @@ impl<S: StateStore> SharedMasterCoordinator<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let rescinded = guard.expire_and_rescind_stale_offers(current_tick);
         let _ = guard.reconcile_unhealthy_agents(current_tick);
-        let outcome = guard.schedule_tick(role_states, current_tick)?;
+        let outcome = guard
+            .schedule_tick(role_states, current_tick)
+            .unwrap_or_default();
         drop(guard);
 
         let mut q_guard = self
@@ -3082,6 +3632,28 @@ impl<S: StateStore> SharedMasterCoordinator<S> {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .remove(framework_id)
             .unwrap_or_default()
+    }
+
+    /// Drains all queued [`SchedulerEvent`]s for `framework_id` and encodes them into a
+    /// Mesos `RecordIO` (`<byte_length>\n<json_bytes>`) streaming byte buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `framework_id` - Subscribed [`FrameworkId`].
+    ///
+    /// # Returns
+    ///
+    /// `RecordIO`-framed byte stream of [`SchedulerEvent`]s.
+    pub fn encode_framework_recordio_stream(&self, framework_id: &FrameworkId) -> Vec<u8> {
+        let events = self.drain_framework_events(framework_id);
+        let mut out = Vec::new();
+        for ev in events {
+            let json = serde_json::to_vec(&ev).unwrap_or_default();
+            let prefix = format!("{}\n", json.len());
+            out.extend_from_slice(prefix.as_bytes());
+            out.extend_from_slice(&json);
+        }
+        out
     }
 }
 
@@ -3875,7 +4447,11 @@ mod tests {
         assert!(
             master
                 .handle_scheduler_call(
-                    SchedulerCall::RespondInverseOffer(bad_fw.clone(), vec![ioid.clone()], true),
+                    SchedulerCall::RespondInverseOffer(
+                        bad_fw.clone(),
+                        vec![ioid.clone()],
+                        arbiter_core::workload::InverseOfferResponse::AcceptMaintenance,
+                    ),
                     28,
                 )
                 .is_err()
@@ -3883,7 +4459,11 @@ mod tests {
         assert!(
             master
                 .handle_scheduler_call(
-                    SchedulerCall::RespondInverseOffer(fw_id.clone(), vec![ioid], true),
+                    SchedulerCall::RespondInverseOffer(
+                        fw_id.clone(),
+                        vec![ioid],
+                        arbiter_core::workload::InverseOfferResponse::AcceptMaintenance,
+                    ),
                     28,
                 )
                 .is_ok()
@@ -5262,49 +5842,63 @@ mod tests {
         // Test GetLoggingLevel, SetLoggingLevel, ListFiles, ReadFile, and retry_unacknowledged_status_updates
         assert_eq!(
             master.handle_operator_call(OperatorCall::GetLoggingLevel, 26),
-            Ok(OperatorResponse::LoggingLevel(1))
+            Ok(OperatorResponse::LoggingLevel(
+                arbiter_core::units::LoggingLevel::Warn
+            ))
         );
         assert!(
             master
                 .handle_operator_call(
-                    OperatorCall::SetLoggingLevel(2, BenchmarkTicks::new(10)),
+                    OperatorCall::SetLoggingLevel(
+                        arbiter_core::units::LoggingLevel::Debug,
+                        BenchmarkTicks::new(10),
+                    ),
                     26
                 )
                 .is_ok()
         );
         assert_eq!(
             master.handle_operator_call(OperatorCall::GetLoggingLevel, 26),
-            Ok(OperatorResponse::LoggingLevel(2))
-        );
-        assert!(
-            master
-                .handle_operator_call(
-                    OperatorCall::SetLoggingLevel(9, BenchmarkTicks::new(10)),
-                    26
-                )
-                .is_err()
+            Ok(OperatorResponse::LoggingLevel(
+                arbiter_core::units::LoggingLevel::Debug
+            ))
         );
         master.sandbox_files.insert(
-            "/var/lib/arbiter/task-1/stdout".to_owned(),
+            "var/lib/arbiter/task-1/stdout".to_owned(),
             "hello world\n".to_owned(),
         );
+        let list_prefix =
+            arbiter_core::ids::SandboxPath::new("var/lib/arbiter").unwrap_or_default();
+        let file_sp = arbiter_core::ids::SandboxPath::new("var/lib/arbiter/task-1/stdout")
+            .unwrap_or_default();
+        let missing_sp =
+            arbiter_core::ids::SandboxPath::new("var/lib/arbiter/missing").unwrap_or_default();
         assert_eq!(
-            master.handle_operator_call(OperatorCall::ListFiles("/var/lib/arbiter".to_owned()), 26),
-            Ok(OperatorResponse::FileList(vec![
-                "/var/lib/arbiter/task-1/stdout".to_owned()
-            ]))
+            master.handle_operator_call(OperatorCall::ListFiles(list_prefix), 26),
+            Ok(OperatorResponse::FileList(vec![file_sp.clone()]))
         );
         assert_eq!(
             master.handle_operator_call(
-                OperatorCall::ReadFile("/var/lib/arbiter/task-1/stdout".to_owned(), 0, 5),
+                OperatorCall::ReadFile(
+                    file_sp,
+                    arbiter_core::units::FileReadOffset::new(0),
+                    arbiter_core::units::FileReadLength::new(5),
+                ),
                 26
             ),
-            Ok(OperatorResponse::FileChunk(0, "hello".to_owned()))
+            Ok(OperatorResponse::FileChunk(
+                arbiter_core::units::FileReadOffset::new(0),
+                "hello".to_owned()
+            ))
         );
         assert!(
             master
                 .handle_operator_call(
-                    OperatorCall::ReadFile("/var/lib/arbiter/missing".to_owned(), 0, 5),
+                    OperatorCall::ReadFile(
+                        missing_sp,
+                        arbiter_core::units::FileReadOffset::new(0),
+                        arbiter_core::units::FileReadLength::new(5),
+                    ),
                     26
                 )
                 .is_err()
@@ -5525,5 +6119,390 @@ mod tests {
         assert_eq!(b_gangs.len(), 1);
         assert_eq!(recovered_master.pending_direct_tasks.len(), 1);
         assert_eq!(recovered_master.pending_gang_jobs.len(), 1);
+
+        // Leader promotion, standby 307 redirect, ring-buffer eviction, and operation retry queue
+        assert!(
+            recovered_master
+                .check_leader_or_redirect("/api/v1/scheduler")
+                .is_ok()
+        );
+        recovered_master.step_down_to_standby("http://10.0.0.2:5051");
+        assert!(!recovered_master.is_leader);
+        assert!(
+            recovered_master
+                .check_leader_or_redirect("/api/v1/scheduler")
+                .is_err()
+        );
+        recovered_master.leader_redirect_url = None;
+        assert!(
+            recovered_master
+                .check_leader_or_redirect("/api/v1/operator")
+                .is_err()
+        );
+        assert!(
+            recovered_master
+                .promote_to_leader("master-2", 5, 300)
+                .is_ok()
+        );
+        assert_eq!(recovered_master.master_info.leader_id, "master-2");
+        assert_eq!(recovered_master.master_info.elected_term, 5);
+        assert!(
+            recovered_master
+                .check_leader_or_redirect("/api/v1/scheduler")
+                .is_ok()
+        );
+
+        let mut fail_leader_master = MasterNode::new(
+            MemoryStateStore::new(),
+            recovered_master.role_hierarchy.clone(),
+            100,
+            50,
+        );
+        fail_leader_master
+            .store
+            .set_fault(Some(MemoryStoreFault::FailWrites));
+        assert!(
+            fail_leader_master
+                .promote_to_leader("master-err", 2, 10)
+                .is_err()
+        );
+
+        recovered_master.max_completed_frameworks = 1;
+        recovered_master.max_completed_tasks = 1;
+        let prod_role = RoleName::new("prod").unwrap_or_default();
+        for idx in 1..=2 {
+            let ring_fw = FrameworkId::new(&format!("fw-ring-{idx}")).unwrap_or_default();
+            let _ = recovered_master.subscribe_framework(SubscribeFramework {
+                framework_id: ring_fw.clone(),
+                role: prod_role.clone(),
+                failover_timeout_ms: 100,
+            });
+            let _ = recovered_master.teardown_framework(&ring_fw);
+
+            let tid = TaskId::new(&format!("t-ring-{idx}")).unwrap_or_default();
+            recovered_master.tasks.insert(
+                tid.clone(),
+                (TaskState::Running, a1.clone(), ResourceBundle::zero()),
+            );
+            let _ = recovered_master.update_task_status(&TaskStatusUpdate {
+                task_id: tid,
+                agent_id: a1.clone(),
+                state: TaskState::Finished,
+                message: "done".to_owned(),
+            });
+        }
+        assert_eq!(recovered_master.completed_frameworks.len(), 1);
+        assert_eq!(recovered_master.completed_tasks.len(), 1);
+
+        let op_retries = master.retry_unacknowledged_operation_updates();
+        assert!(!op_retries.is_empty());
+
+        let (st_health, _, body_health) = recovered_master
+            .handle_legacy_mesos_http_get("/health")
+            .unwrap_or_default();
+        assert_eq!(st_health, arbiter_core::units::HttpStatusCode::OK);
+        assert!(body_health.contains("\"healthy\":true"));
+
+        let (_, _, body_state) = recovered_master
+            .handle_legacy_mesos_http_get("/state")
+            .unwrap_or_default();
+        assert!(body_state.contains("\"activated_slaves\":1"));
+        let (_, _, body_summary) = recovered_master
+            .handle_legacy_mesos_http_get("/state-summary")
+            .unwrap_or_default();
+        assert!(body_summary.contains("\"leader\":"));
+
+        let (_, _, body_snap) = recovered_master
+            .handle_legacy_mesos_http_get("/metrics/snapshot")
+            .unwrap_or_default();
+        assert!(body_snap.contains("\"master/elected\":1"));
+
+        let (_, _, body_prom) = recovered_master
+            .handle_legacy_mesos_http_get("/metrics")
+            .unwrap_or_default();
+        assert!(body_prom.contains("arbiter_master_elected 1"));
+
+        recovered_master.step_down_to_standby("http://10.0.0.9:5051");
+        let (st_unhealthy, _, _) = recovered_master
+            .handle_legacy_mesos_http_get("/health")
+            .unwrap_or_default();
+        assert_eq!(
+            st_unhealthy,
+            arbiter_core::units::HttpStatusCode::SERVICE_UNAVAILABLE
+        );
+        let (st_redir, _, redir_url) = recovered_master
+            .handle_legacy_mesos_http_get("/redirect")
+            .unwrap_or_default();
+        assert_eq!(
+            st_redir,
+            arbiter_core::units::HttpStatusCode::TEMPORARY_REDIRECT
+        );
+        assert_eq!(redir_url, "http://10.0.0.9:5051");
+
+        assert!(
+            recovered_master
+                .handle_legacy_mesos_http_get("/unknown")
+                .is_err()
+        );
+
+        // Test reregister_agent, dispatch_outbound_agent_messages_with, and RecordIO stream encoding
+        let rereg_aid = AgentId::new("agent-rereg-1").unwrap_or_default();
+        let rereg_fw = FrameworkId::new("fw-rereg-1").unwrap_or_default();
+        let rereg_tid_owned = TaskId::new("t-rereg-owned").unwrap_or_default();
+        let rereg_tid_direct = TaskId::new("t-rereg-direct").unwrap_or_default();
+        let rereg_exec_id = ExecutorId::new("exec-rereg-1").unwrap_or_default();
+        let rereg_uuid = StatusUpdateUuid::new("uuid-rereg-1").unwrap_or_default();
+        let rereg_rp_id = ResourceProviderId::new("rp-rereg-1").unwrap_or_default();
+        let rereg_reg = RegisterAgent {
+            agent_id: rereg_aid.clone(),
+            os_kind: OsKind::Linux,
+            cpu_arch: CpuArch::X86_64,
+            total_resources: ResourceBundle {
+                cpu: Millicores::new(8_000),
+                memory: Bytes::new(8_000_000),
+                ..ResourceBundle::zero()
+            },
+            topology: HardwareTopologyGraph::new(),
+        };
+        let rereg_upd = TaskStatusUpdate {
+            task_id: rereg_tid_owned.clone(),
+            agent_id: rereg_aid.clone(),
+            state: TaskState::Running,
+            message: "reconciled".to_owned(),
+        };
+        let rereg_rp = ResourceProviderInfo {
+            provider_id: rereg_rp_id,
+            provider_type: "org.apache.mesos.rp.local.storage".to_owned(),
+            provider_name: "csi-rereg".to_owned(),
+            agent_id: Some(rereg_aid.clone()),
+            default_role: role_root,
+            advertised_disks: Vec::new(),
+        };
+        assert_eq!(
+            recovered_master.reregister_agent(
+                rereg_reg.clone(),
+                vec![
+                    (
+                        rereg_tid_owned.clone(),
+                        ResourceBundle {
+                            cpu: Millicores::new(1_000),
+                            ..ResourceBundle::zero()
+                        },
+                        Some(rereg_fw.clone()),
+                    ),
+                    (
+                        rereg_tid_direct,
+                        ResourceBundle {
+                            cpu: Millicores::new(1_000),
+                            ..ResourceBundle::zero()
+                        },
+                        None,
+                    ),
+                ],
+                vec![(rereg_exec_id, rereg_fw.clone())],
+                vec![(rereg_uuid, rereg_fw.clone(), rereg_upd)],
+                vec![rereg_rp],
+                310,
+            ),
+            Ok(2)
+        );
+        // Error branch when state store fails during reregister_agent
+        fail_leader_master
+            .store
+            .set_fault(Some(MemoryStoreFault::FailWrites));
+        assert!(
+            fail_leader_master
+                .reregister_agent(
+                    rereg_reg,
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    Vec::new(),
+                    10
+                )
+                .is_err()
+        );
+
+        // Queue outbound messages on rereg_aid and test dispatch_outbound_agent_messages_with
+        recovered_master.queue_agent_wire_message(
+            &rereg_aid,
+            arbiter_proto::WireMessage::ExecutorEvent(Box::new(
+                arbiter_proto::ExecutorEvent::Acknowledged(
+                    rereg_tid_owned.clone(),
+                    StatusUpdateUuid::new("uuid-ack-1").unwrap_or_default(),
+                ),
+            )),
+        );
+        recovered_master.queue_agent_wire_message(
+            &rereg_aid,
+            arbiter_proto::WireMessage::ExecutorEvent(Box::new(
+                arbiter_proto::ExecutorEvent::Kill(rereg_tid_owned.clone(), None),
+            )),
+        );
+        assert_eq!(
+            recovered_master.dispatch_outbound_agent_messages_with(&rereg_aid, |msg| {
+                if matches!(msg, arbiter_proto::WireMessage::ExecutorEvent(ev) if matches!(**ev, arbiter_proto::ExecutorEvent::Kill(..))) {
+                    Ok(Some(TaskStatusUpdate {
+                        task_id: rereg_tid_owned.clone(),
+                        agent_id: rereg_aid.clone(),
+                        state: TaskState::Finished,
+                        message: "done".to_owned(),
+                    }))
+                } else {
+                    Ok(None)
+                }
+            }),
+            Ok(2)
+        );
+        // Error branch when dispatcher returns Err
+        recovered_master.queue_agent_wire_message(
+            &rereg_aid,
+            arbiter_proto::WireMessage::SchedulerEvent(Box::new(SchedulerEvent::Heartbeat)),
+        );
+        assert!(
+            recovered_master
+                .dispatch_outbound_agent_messages_with(&rereg_aid, |_| {
+                    Err(ArbiterError::StoreReadError {
+                        key: "test".to_owned(),
+                        reason: "simulated wire failure".to_owned(),
+                    })
+                })
+                .is_err()
+        );
+        // Error branch when update_task_status inside dispatch_outbound_agent_messages_with fails
+        recovered_master.queue_agent_wire_message(
+            &rereg_aid,
+            arbiter_proto::WireMessage::SchedulerEvent(Box::new(SchedulerEvent::Heartbeat)),
+        );
+        assert!(
+            recovered_master
+                .dispatch_outbound_agent_messages_with(&rereg_aid, |_| {
+                    Ok(Some(TaskStatusUpdate {
+                        task_id: TaskId::new("ghost-task").unwrap_or_default(),
+                        agent_id: rereg_aid.clone(),
+                        state: TaskState::Finished,
+                        message: "bad".to_owned(),
+                    }))
+                })
+                .is_err()
+        );
+
+        let op_stream = recovered_master.drain_operator_event_recordio_stream();
+        assert!(!op_stream.is_empty());
+        assert!(
+            recovered_master
+                .drain_operator_event_recordio_stream()
+                .is_empty()
+        );
+
+        let _ = recovered_master.promote_to_leader("master-1", 6, 315);
+        assert!(
+            recovered_master
+                .verify_strict_agent_registration(&rereg_aid)
+                .is_ok()
+        );
+        recovered_master.strict_registry_recovery = true;
+        assert!(
+            recovered_master
+                .verify_strict_agent_registration(&rereg_aid)
+                .is_ok()
+        );
+        let unknown_aid = AgentId::new("unknown-strict-agent").unwrap_or_default();
+        assert!(
+            recovered_master
+                .verify_strict_agent_registration(&unknown_aid)
+                .is_err()
+        );
+
+        let inv_oid = OfferId::new("inv-offer-rescind-1").unwrap_or_default();
+        recovered_master.active_inverse_offers.insert(
+            inv_oid.clone(),
+            InverseOffer {
+                inverse_offer_id: inv_oid.clone(),
+                framework_id: rereg_fw.clone(),
+                agent_id: rereg_aid.clone(),
+                maintenance_window_id: arbiter_core::ids::MaintenanceWindowId::new("mw-rescind-1")
+                    .unwrap_or_default(),
+                resources: ResourceBundle::zero(),
+                unavailability_start_tick: BenchmarkTicks::new(400),
+            },
+        );
+        let rescinded_inv = recovered_master.rescind_inverse_offers_for_agent(&rereg_aid);
+        assert_eq!(
+            rescinded_inv,
+            vec![(
+                rereg_fw.clone(),
+                SchedulerEvent::RescindInverseOffer(inv_oid)
+            )]
+        );
+        assert!(
+            recovered_master
+                .rescind_inverse_offers_for_agent(&rereg_aid)
+                .is_empty()
+        );
+
+        let op_id_test = OperationId::new("op-get-1").unwrap_or_default();
+        recovered_master.tracked_operations.insert(
+            op_id_test,
+            (rereg_fw.clone(), Some(rereg_aid), OperationState::Finished),
+        );
+        assert!(
+            recovered_master
+                .handle_operator_call(OperatorCall::GetOperations, 316)
+                .is_ok()
+        );
+        let quota_upd = Quota {
+            id: QuotaId::new("q-upd-1").unwrap_or_default(),
+            guaranteed_min: ResourceBundle::zero(),
+            hard_max: ResourceBundle {
+                cpu: Millicores::new(16_000),
+                memory: Bytes::new(1_000_000_000),
+                ..ResourceBundle::zero()
+            },
+            allow_burst_borrowing: true,
+            weight: WeightBasisPoints::STANDARD,
+        };
+        assert_eq!(
+            recovered_master.handle_operator_call(
+                OperatorCall::UpdateQuota(prod_role.clone(), quota_upd),
+                317,
+            ),
+            Ok(OperatorResponse::Ok("quota set".to_owned()))
+        );
+        let td_fw = FrameworkId::new("fw-op-teardown").unwrap_or_default();
+        let _ = recovered_master.subscribe_framework(SubscribeFramework {
+            framework_id: td_fw.clone(),
+            role: prod_role.clone(),
+            failover_timeout_ms: 10,
+        });
+        assert_eq!(
+            recovered_master
+                .handle_operator_call(OperatorCall::TeardownFramework(td_fw.clone()), 318),
+            Ok(OperatorResponse::Ok("framework torn down".to_owned()))
+        );
+        assert!(
+            recovered_master
+                .handle_operator_call(OperatorCall::TeardownFramework(td_fw), 319)
+                .is_err()
+        );
+
+        let coord = SharedMasterCoordinator::new(recovered_master);
+        let _ = coord.dispatch_scheduler_call(
+            &rereg_fw,
+            SchedulerCall::Subscribe(
+                SubscribeFramework {
+                    framework_id: rereg_fw.clone(),
+                    role: prod_role,
+                    failover_timeout_ms: 50,
+                },
+                arbiter_core::workload::CheckpointMode::Enabled,
+                Vec::new(),
+                Vec::new(),
+            ),
+            320,
+        );
+        let fw_stream = coord.encode_framework_recordio_stream(&rereg_fw);
+        assert!(!fw_stream.is_empty());
+        assert!(coord.encode_framework_recordio_stream(&rereg_fw).is_empty());
     }
 }

@@ -17,6 +17,14 @@ arbiter-proto = { workspace = true }
 arbiter-net = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-postgres = { workspace = true }
+tonic = { workspace = true }
+prost = { workspace = true }
+h2 = { workspace = true }
+http = { workspace = true }
+crc32fast = { workspace = true }
+rusqlite = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

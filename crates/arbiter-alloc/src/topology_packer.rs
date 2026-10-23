@@ -468,7 +468,10 @@ fn select_optimal_gpu_island_subset<'a>(
     require_nvlink: bool,
 ) -> ArbiterResult<(Vec<&'a GpuDevice>, u64)> {
     let n = whole_candidates.len();
-    let mut best_subset: Option<(Vec<&'a GpuDevice>, u64)> = None;
+    let mut last_err = ArbiterError::NoEligibleAgents {
+        workload: task.task_id.to_string(),
+        reason: "selected GPUs are not connected via NVLink/NVSwitch/InfinityFabric".to_owned(),
+    };
 
     for (anchor_idx, &anchor) in whole_candidates
         .iter()
@@ -499,18 +502,13 @@ fn select_optimal_gpu_island_subset<'a>(
             subset.push(peer);
         }
 
-        if let Ok(score) =
-            verify_and_score_gpu_island(task, topology, anchor, &subset, require_nvlink)
-        {
-            best_subset = Some((subset, score));
-            break;
+        match verify_and_score_gpu_island(task, topology, anchor, &subset, require_nvlink) {
+            Ok(score) => return Ok((subset, score)),
+            Err(err) => last_err = err,
         }
     }
 
-    best_subset.ok_or_else(|| ArbiterError::NoEligibleAgents {
-        workload: task.task_id.to_string(),
-        reason: "selected GPUs are not connected via NVLink/NVSwitch/InfinityFabric".to_owned(),
-    })
+    Err(last_err)
 }
 
 /// Selects a NUMA domain capable of hosting the task's CPU and memory requirements.
@@ -648,6 +646,24 @@ fn place_fractional_gpu(
     })
 }
 
+/// Returns `true` if `kind` is a high-speed GPU interconnect (`NvLink`, `NvSwitch`, or `AmdInfinityFabric`).
+///
+/// # Arguments
+///
+/// * `kind` - [`InterconnectKind`] to inspect.
+///
+/// # Returns
+///
+/// `true` if high-speed GPU interconnect.
+fn is_high_speed_gpu_interconnect(kind: InterconnectKind) -> bool {
+    [
+        InterconnectKind::NvLink,
+        InterconnectKind::NvSwitch,
+        InterconnectKind::AmdInfinityFabric,
+    ]
+    .contains(&kind)
+}
+
 /// Verifies interconnect connectivity across a multi-GPU set and computes average pairwise affinity.
 ///
 /// # Arguments
@@ -674,29 +690,22 @@ fn verify_and_score_gpu_island(
 ) -> ArbiterResult<u64> {
     let mut total_score = 0_u64;
     for &other_gpu in gpus.iter().skip(1) {
-        if require_nvlink {
-            let has_high_speed = topology.edges().iter().any(|e| {
+        let has_high_speed = !require_nvlink
+            || topology.edges().iter().any(|e| {
                 e.source == first_gpu.device_id
                     && e.target == other_gpu.device_id
-                    && matches!(
-                        e.kind,
-                        InterconnectKind::NvLink
-                            | InterconnectKind::NvSwitch
-                            | InterconnectKind::AmdInfinityFabric
-                    )
+                    && is_high_speed_gpu_interconnect(e.kind)
             });
-            if !has_high_speed {
-                return Err(ArbiterError::NoEligibleAgents {
-                    workload: task.task_id.to_string(),
-                    reason: "selected GPUs are not connected via NVLink/NVSwitch/InfinityFabric"
-                        .to_owned(),
-                });
-            }
+        if !has_high_speed {
+            return Err(ArbiterError::NoEligibleAgents {
+                workload: task.task_id.to_string(),
+                reason: "selected GPUs lack NVLink/NVSwitch/InfinityFabric".to_owned(),
+            });
         }
         let score = topology
             .compute_affinity(&first_gpu.device_id, &other_gpu.device_id)
             .map(|a| a.composite_score)
-            .unwrap_or(100);
+            .unwrap_or(0);
         total_score = total_score.saturating_add(score);
     }
     Ok(total_score)
@@ -791,6 +800,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::too_many_lines)]
     fn sample_inventory() -> AgentHardwareInventory {
         let mut topo = HardwareTopologyGraph::new();
         let dev_g0 = DeviceId::new("gpu-0").unwrap_or_default();
@@ -821,11 +831,15 @@ mod tests {
             });
         }
 
-        for pair in [(&dev_g0, &dev_g1), (&dev_g0, &dev_g2), (&dev_g0, &dev_g3)] {
+        for (pair, kind) in [
+            ((&dev_g0, &dev_g1), InterconnectKind::NvLink),
+            ((&dev_g0, &dev_g2), InterconnectKind::NvSwitch),
+            ((&dev_g0, &dev_g3), InterconnectKind::AmdInfinityFabric),
+        ] {
             let _ = topo.add_bidirectional_link(
                 pair.0.clone(),
                 pair.1.clone(),
-                InterconnectKind::NvLink,
+                kind,
                 BandwidthBps::new(7_200_000_000_000),
                 LatencyNanoseconds::new(40),
             );
@@ -968,16 +982,15 @@ mod tests {
         inv.topology = HardwareTopologyGraph::new();
         let g0 = DeviceId::new("gpu-0").unwrap_or_default();
         let g1 = DeviceId::new("gpu-1").unwrap_or_default();
-        let _ = inv.topology.add_node(TopologyNode {
-            id: g0.clone(),
-            kind: TopologyNodeKind::GpuNode,
-            numa_node_id: 0,
-        });
-        let _ = inv.topology.add_node(TopologyNode {
-            id: g1.clone(),
-            kind: TopologyNodeKind::GpuNode,
-            numa_node_id: 0,
-        });
+        let g2 = DeviceId::new("gpu-2").unwrap_or_default();
+        let g3 = DeviceId::new("gpu-3").unwrap_or_default();
+        for g_id in [&g0, &g1, &g2, &g3] {
+            let _ = inv.topology.add_node(TopologyNode {
+                id: g_id.clone(),
+                kind: TopologyNodeKind::GpuNode,
+                numa_node_id: 0,
+            });
+        }
         let _ = inv.topology.add_bidirectional_link(
             g0,
             g1,

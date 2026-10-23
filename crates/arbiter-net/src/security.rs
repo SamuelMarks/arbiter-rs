@@ -218,6 +218,28 @@ impl SvidAuthority {
         self.revoked_uris.insert(uri.to_owned());
     }
 
+    /// Returns the trust domain governed by this [`SvidAuthority`].
+    ///
+    /// # Returns
+    ///
+    /// Trust domain string slice.
+    pub fn trust_domain(&self) -> &str {
+        &self.trust_domain
+    }
+
+    /// Returns `true` if `uri` is present in the authority's certificate revocation list (`revoked_uris`).
+    ///
+    /// # Arguments
+    ///
+    /// * `uri` - SPIFFE URI string to check.
+    ///
+    /// # Returns
+    ///
+    /// `true` if revoked.
+    pub fn is_uri_revoked(&self, uri: &str) -> bool {
+        self.revoked_uris.contains(uri)
+    }
+
     /// Issues a signed [`SpiffeSvid`] for a validated URI at `current_tick`.
     ///
     /// # Arguments
@@ -288,6 +310,78 @@ impl SvidAuthority {
         Ok(())
     }
 
+    /// Issues an [`SpiffeSvid`] paired with an asymmetric 64-byte [`Ed25519Keypair`] signature
+    /// over the canonical SVID ASN.1 SAN + validity transcript.
+    ///
+    /// # Arguments
+    ///
+    /// * `uri` - SPIFFE URI string.
+    /// * `current_tick` - Current monotonic tick.
+    /// * `ca_keypair` - Signing [`Ed25519Keypair`] of the SPIFFE CA.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(SpiffeSvid, [u8; 64])` containing the SVID and its 64-byte `Ed25519` signature.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SpiffeIdentityInvalid`] if `uri` is invalid for this trust domain.
+    pub fn issue_ed25519_svid(
+        &self,
+        uri: &str,
+        current_tick: u64,
+        ca_keypair: &Ed25519Keypair,
+    ) -> ArbiterResult<(SpiffeSvid, [u8; 64])> {
+        let svid = self.issue_svid(uri, current_tick)?;
+        let transcript = Self::build_ed25519_svid_transcript(&svid);
+        let sig = ca_keypair.sign(&transcript);
+        Ok((svid, sig))
+    }
+
+    /// Verifies an [`SpiffeSvid`] and its 64-byte asymmetric `Ed25519` signature against `ca_public_key`.
+    ///
+    /// # Arguments
+    ///
+    /// * `svid` - Presented [`SpiffeSvid`].
+    /// * `ed25519_sig` - 64-byte `Ed25519` signature over the SVID transcript.
+    /// * `ca_public_key` - 32-byte CA public verification key.
+    /// * `current_tick` - Current monotonic tick.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if valid, unrevoked, unexpired, and verified under `ca_public_key`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ArbiterError`] if CRL/expiry validation or `Ed25519Keypair::verify` fails.
+    pub fn verify_ed25519_svid(
+        &self,
+        svid: &SpiffeSvid,
+        ed25519_sig: &[u8; 64],
+        ca_public_key: &[u8; 32],
+        current_tick: u64,
+    ) -> ArbiterResult<()> {
+        self.verify_svid(svid, current_tick)?;
+        let transcript = Self::build_ed25519_svid_transcript(svid);
+        Ed25519Keypair::verify(ca_public_key, &transcript, ed25519_sig)
+    }
+
+    /// Builds the canonical byte transcript signed by [`Self::issue_ed25519_svid`].
+    ///
+    /// # Arguments
+    ///
+    /// * `svid` - [`SpiffeSvid`] to serialize.
+    ///
+    /// # Returns
+    ///
+    /// Canonical byte vector `(DER_SAN || issued_at_le || expires_at_le)`.
+    fn build_ed25519_svid_transcript(svid: &SpiffeSvid) -> Vec<u8> {
+        let mut out = encode_x509_san_der(&svid.spiffe_id);
+        out.extend_from_slice(&svid.issued_at_tick.to_le_bytes());
+        out.extend_from_slice(&svid.expires_at_tick.to_le_bytes());
+        out
+    }
+
     /// Rotates an existing [`SpiffeSvid`], issuing a fresh SVID with extended expiration.
     ///
     /// # Arguments
@@ -320,7 +414,8 @@ impl SvidAuthority {
         })
     }
 
-    /// Computes a keyed SHA-256 MAC over SVID claims.
+    /// Computes a deterministic signature digest over SVID claims using [`Ed25519Keypair`]
+    /// derived from `self.signing_key`.
     ///
     /// # Arguments
     ///
@@ -330,13 +425,16 @@ impl SvidAuthority {
     ///
     /// # Returns
     ///
-    /// 32-byte digest.
+    /// 32-byte commitment over the `Ed25519` signature.
     fn compute_svid_mac(&self, uri: &str, issued_at: u64, expires_at: u64) -> [u8; 32] {
+        let mut msg = Vec::with_capacity(uri.len() + 16);
+        msg.extend_from_slice(uri.as_bytes());
+        msg.extend_from_slice(&issued_at.to_le_bytes());
+        msg.extend_from_slice(&expires_at.to_le_bytes());
+        let ed_sk = Ed25519Keypair::from_seed(self.signing_key);
+        let sig64 = ed_sk.sign(&msg);
         let mut hasher = Sha256::new();
-        hasher.update(self.signing_key);
-        hasher.update(uri.as_bytes());
-        hasher.update(issued_at.to_le_bytes());
-        hasher.update(expires_at.to_le_bytes());
+        hasher.update(sig64);
         hasher.finalize().into()
     }
 }
@@ -841,7 +939,21 @@ pub fn chacha20_poly1305_aead_tag(
     poly1305_mac(&otk, &mac_data)
 }
 
-/// Computes an RFC 2104 `HMAC-SHA256` 32-byte authentication code over `message` using `key`.
+/// Computes a FIPS 180-4 `SHA-256` 32-byte digest over `message`.
+///
+/// # Arguments
+///
+/// * `message` - Input byte slice.
+///
+/// # Returns
+///
+/// 32-byte `SHA-256` digest.
+pub fn sha256_digest(message: &[u8]) -> [u8; 32] {
+    Sha256::digest(message).into()
+}
+
+/// Computes an RFC 2104 `HMAC-SHA256` 32-byte authentication code over `message` using `key`
+/// backed by `hmac::Hmac<Sha256>`.
 ///
 /// # Arguments
 ///
@@ -852,6 +964,7 @@ pub fn chacha20_poly1305_aead_tag(
 ///
 /// 32-byte RFC 2104 `HMAC-SHA256` digest.
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
+    use hmac::Mac as _;
     let mut k_block = [0_u8; 64];
     if key.len() > 64 {
         let hashed_key: [u8; 32] = Sha256::digest(key).into();
@@ -863,26 +976,83 @@ pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
             *dst_b = src_b;
         }
     }
-    let mut ipad = [0x36_u8; 64];
-    let mut opad = [0x5c_u8; 64];
-    for ((ip, op), &kb) in ipad.iter_mut().zip(opad.iter_mut()).zip(k_block.iter()) {
-        *ip ^= kb;
-        *op ^= kb;
-    }
-    let mut inner = Sha256::new();
-    inner.update(ipad);
-    inner.update(message);
-    let inner_digest: [u8; 32] = inner.finalize().into();
+    hmac::Hmac::<Sha256>::new_from_slice(&k_block)
+        .map(|mut mac| {
+            mac.update(message);
+            mac.finalize().into_bytes().into()
+        })
+        .unwrap_or([0_u8; 32])
+}
 
-    let mut outer = Sha256::new();
-    outer.update(opad);
-    outer.update(inner_digest);
-    outer.finalize().into()
+/// Seals a plaintext payload using `RustCrypto` `chacha20poly1305::ChaCha20Poly1305` (RFC 8439),
+/// returning `(ciphertext, 16-byte_tag)`.
+///
+/// # Arguments
+///
+/// * `key` - 32-byte `ChaCha20-Poly1305` key.
+/// * `nonce_bytes` - 12-byte IETF nonce.
+/// * `aad_bytes` - Additional authenticated data (`AAD`).
+/// * `plaintext` - Plaintext bytes to seal.
+///
+/// # Returns
+///
+/// Tuple `(ciphertext_bytes, 16-byte_tag)`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::AeadCipher`] if encryption fails.
+pub fn chacha20poly1305_aead_seal(
+    key: &[u8; 32],
+    nonce_bytes: [u8; 12],
+    aad_bytes: &[u8],
+    plaintext: &[u8],
+) -> ArbiterResult<(Vec<u8>, [u8; 16])> {
+    use chacha20poly1305::aead::{AeadInPlace as _, KeyInit as _};
+    let cipher = chacha20poly1305::ChaCha20Poly1305::new(key.into());
+    let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
+    let mut buffer = plaintext.to_vec();
+    let tag = cipher.encrypt_in_place_detached(&nonce, aad_bytes, &mut buffer)?;
+    let mut tag_arr = [0_u8; 16];
+    tag_arr.copy_from_slice(tag.as_slice());
+    Ok((buffer, tag_arr))
+}
+
+/// Opens and authenticates a ciphertext payload using `RustCrypto` `chacha20poly1305::ChaCha20Poly1305` (RFC 8439).
+///
+/// # Arguments
+///
+/// * `key` - 32-byte `ChaCha20-Poly1305` key.
+/// * `nonce_bytes` - 12-byte IETF nonce.
+/// * `aad_bytes` - Additional authenticated data (`AAD`).
+/// * `ciphertext` - Encrypted bytes.
+/// * `tag_bytes` - 16-byte authentication tag.
+///
+/// # Returns
+///
+/// Authenticated plaintext byte vector.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::AeadCipher`] if authentication tag verification fails.
+pub fn chacha20poly1305_aead_open(
+    key: &[u8; 32],
+    nonce_bytes: [u8; 12],
+    aad_bytes: &[u8],
+    ciphertext: &[u8],
+    tag_bytes: &[u8; 16],
+) -> ArbiterResult<Vec<u8>> {
+    use chacha20poly1305::aead::{AeadInPlace as _, KeyInit as _};
+    let cipher = chacha20poly1305::ChaCha20Poly1305::new(key.into());
+    let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
+    let tag = chacha20poly1305::Tag::from(*tag_bytes);
+    let mut buffer = ciphertext.to_vec();
+    cipher.decrypt_in_place_detached(&nonce, aad_bytes, &mut buffer, &tag)?;
+    Ok(buffer)
 }
 
 /// Computes the 32-byte AEAD authentication tag over `(key, secret_id, nonce, ciphertext)`
-/// combining the 16-byte RFC 8439 `ChaCha20-Poly1305` AEAD tag (`bytes 0..16`) with a 16-byte
-/// `HMAC-SHA256` commitment (`bytes 16..32`).
+/// combining the 16-byte RFC 8439 `ChaCha20-Poly1305` AEAD tag (`bytes 0..16`) with the 16-byte
+/// NIST SP 800-38D `AES-256-GCM` tag (`bytes 16..32`).
 ///
 /// # Arguments
 ///
@@ -901,15 +1071,196 @@ fn compute_aead_tag(
     ciphertext: &[u8],
 ) -> [u8; 32] {
     let poly_tag = chacha20_poly1305_aead_tag(key, nonce, secret_id.as_bytes(), ciphertext);
-    let hmac_tag = hmac_sha256(key, &poly_tag);
+    let (_, gcm_tag) = aes256_gcm_seal(key, nonce, secret_id.as_bytes(), ciphertext);
     let mut out = [0_u8; 32];
-    for (dst_b, &src_b) in out
-        .iter_mut()
-        .zip(poly_tag.iter().chain(hmac_tag.iter().take(16)))
-    {
+    for (dst_b, &src_b) in out.iter_mut().zip(poly_tag.iter().chain(gcm_tag.iter())) {
         *dst_b = src_b;
     }
     out
+}
+
+/// Seals a plaintext payload using `ring::aead::CHACHA20_POLY1305` (RFC 8439) and `ring::aead::AES_256_GCM`
+/// (NIST SP 800-38D), returning `(ciphertext, 16-byte_tag)`.
+///
+/// # Arguments
+///
+/// * `use_aes_256_gcm` - If `true`, uses `ring::aead::AES_256_GCM`; otherwise uses `ring::aead::CHACHA20_POLY1305`.
+/// * `key` - 32-byte AEAD key.
+/// * `nonce_bytes` - 12-byte AEAD nonce.
+/// * `aad_bytes` - Additional authenticated data (`AAD`).
+/// * `plaintext` - Plaintext bytes to seal.
+///
+/// # Returns
+///
+/// Tuple `(ciphertext_bytes, 16-byte_tag)`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::AeadCipher`] if `ring::aead` sealing fails.
+pub fn ring_aead_seal(
+    use_aes_256_gcm: bool,
+    key: &[u8; 32],
+    nonce_bytes: [u8; 12],
+    aad_bytes: &[u8],
+    plaintext: &[u8],
+) -> ArbiterResult<(Vec<u8>, [u8; 16])> {
+    let alg = if use_aes_256_gcm {
+        &ring::aead::AES_256_GCM
+    } else {
+        &ring::aead::CHACHA20_POLY1305
+    };
+    let unbound = ring::aead::UnboundKey::new(alg, key)?;
+    let less_safe = ring::aead::LessSafeKey::new(unbound);
+    let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_bytes);
+    let aad = ring::aead::Aad::from(aad_bytes);
+    let mut in_out = plaintext.to_vec();
+    let tag = less_safe.seal_in_place_separate_tag(nonce, aad, &mut in_out)?;
+    let mut tag_arr = [0_u8; 16];
+    tag_arr.copy_from_slice(tag.as_ref());
+    Ok((in_out, tag_arr))
+}
+
+/// Opens and authenticates a ciphertext payload using `ring::aead::CHACHA20_POLY1305` (RFC 8439)
+/// or `ring::aead::AES_256_GCM` (NIST SP 800-38D).
+///
+/// # Arguments
+///
+/// * `use_aes_256_gcm` - If `true`, uses `ring::aead::AES_256_GCM`; otherwise uses `ring::aead::CHACHA20_POLY1305`.
+/// * `key` - 32-byte AEAD key.
+/// * `nonce_bytes` - 12-byte AEAD nonce.
+/// * `aad_bytes` - Additional authenticated data (`AAD`).
+/// * `ciphertext` - Encrypted bytes.
+/// * `tag_bytes` - 16-byte authentication tag.
+///
+/// # Returns
+///
+/// Authenticated plaintext byte vector.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::AeadCipher`] if authentication tag verification fails.
+pub fn ring_aead_open(
+    use_aes_256_gcm: bool,
+    key: &[u8; 32],
+    nonce_bytes: [u8; 12],
+    aad_bytes: &[u8],
+    ciphertext: &[u8],
+    tag_bytes: &[u8; 16],
+) -> ArbiterResult<Vec<u8>> {
+    let alg = if use_aes_256_gcm {
+        &ring::aead::AES_256_GCM
+    } else {
+        &ring::aead::CHACHA20_POLY1305
+    };
+    let unbound = ring::aead::UnboundKey::new(alg, key)?;
+    let less_safe = ring::aead::LessSafeKey::new(unbound);
+    let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_bytes);
+    let aad = ring::aead::Aad::from(aad_bytes);
+    let mut in_out = Vec::with_capacity(ciphertext.len() + tag_bytes.len());
+    in_out.extend_from_slice(ciphertext);
+    in_out.extend_from_slice(tag_bytes);
+    let plain_slice = less_safe.open_in_place(nonce, aad, &mut in_out)?;
+    Ok(plain_slice.to_vec())
+}
+
+/// Seals a plaintext secret using NIST SP 800-38D `AES-256-GCM` with Associated Data (`AAD`).
+///
+/// # Arguments
+///
+/// * `secret_id` - Unique [`SecretId`].
+/// * `master_key` - 32-byte `AES-256` master key.
+/// * `nonce` - 12-byte (`96-bit`) GCM IV.
+/// * `associated_data` - Context-binding AAD (`role || task_id || agent_id`).
+/// * `plaintext` - Secret bytes to encrypt.
+///
+/// # Returns
+///
+/// [`SealedSecretEnvelope`] encrypted and authenticated with `AES-256-GCM`.
+pub fn seal_secret_aes256_gcm(
+    secret_id: SecretId,
+    master_key: &[u8; 32],
+    nonce: [u8; 12],
+    associated_data: &[u8],
+    plaintext: &[u8],
+) -> SealedSecretEnvelope {
+    let mut full_aad = Vec::with_capacity(secret_id.as_str().len() + 1 + associated_data.len());
+    full_aad.extend_from_slice(secret_id.as_str().as_bytes());
+    full_aad.push(b':');
+    full_aad.extend_from_slice(associated_data);
+    let (ciphertext, gcm_tag) = aes256_gcm_seal(master_key, &nonce, &full_aad, plaintext);
+    let hmac_commit = hmac_sha256(master_key, &gcm_tag);
+    let mut auth_tag = [0_u8; 32];
+    for (dst, &src) in auth_tag
+        .iter_mut()
+        .zip(gcm_tag.iter().chain(hmac_commit.iter().take(16)))
+    {
+        *dst = src;
+    }
+    SealedSecretEnvelope {
+        secret_id,
+        nonce,
+        ciphertext,
+        auth_tag,
+    }
+}
+
+/// Unseals a [`SealedSecretEnvelope`] encrypted via [`seal_secret_aes256_gcm`] into a [`ZeroizingSecretBuffer`].
+///
+/// # Arguments
+///
+/// * `envelope` - Sealed secret envelope.
+/// * `master_key` - 32-byte `AES-256` master key.
+/// * `associated_data` - Expected AAD bytes (`role || task_id || agent_id`).
+///
+/// # Returns
+///
+/// Decrypted [`ZeroizingSecretBuffer`] that wipes plaintext from RAM on `Drop`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::SecretDecryptionFailed`] if `AES-256-GCM` tag verification fails.
+pub fn unseal_secret_aes256_gcm(
+    envelope: &SealedSecretEnvelope,
+    master_key: &[u8; 32],
+    associated_data: &[u8],
+) -> ArbiterResult<ZeroizingSecretBuffer> {
+    let mut full_aad =
+        Vec::with_capacity(envelope.secret_id.as_str().len() + 1 + associated_data.len());
+    full_aad.extend_from_slice(envelope.secret_id.as_str().as_bytes());
+    full_aad.push(b':');
+    full_aad.extend_from_slice(associated_data);
+    let mut gcm_tag = [0_u8; 16];
+    for (dst, &src) in gcm_tag.iter_mut().zip(envelope.auth_tag.iter().take(16)) {
+        *dst = src;
+    }
+    let expected_commit = hmac_sha256(master_key, &gcm_tag);
+    let mut commit_diff = 0_u8;
+    for (&actual, &expected) in envelope
+        .auth_tag
+        .iter()
+        .skip(16)
+        .zip(expected_commit.iter().take(16))
+    {
+        commit_diff |= actual ^ expected;
+    }
+    if commit_diff != 0 {
+        return Err(ArbiterError::SecretDecryptionFailed {
+            secret_id: envelope.secret_id.to_string(),
+            reason: "AES-256-GCM envelope commitment mismatch".to_owned(),
+        });
+    }
+    let plaintext = aes256_gcm_open(
+        master_key,
+        &envelope.nonce,
+        &full_aad,
+        &envelope.ciphertext,
+        &gcm_tag,
+    )
+    .map_err(|_| ArbiterError::SecretDecryptionFailed {
+        secret_id: envelope.secret_id.to_string(),
+        reason: "AES-256-GCM authentication tag verification failed".to_owned(),
+    })?;
+    Ok(ZeroizingSecretBuffer::new(plaintext))
 }
 
 /// Seals a plaintext secret with explicit Associated Data (`AAD` = `role || task_id || agent_id`)
@@ -1550,8 +1901,8 @@ impl OidcJwtClaims {
     /// Computes a hex cryptographic signature tag over `header` and `payload` using `key`.
     ///
     /// - For `alg=HS256`: computes standard RFC 2104 `HMAC-SHA256(key, header || "." || payload)`.
-    /// - For `alg=EdDSA` / `alg=ES256`: derives a domain-separated signing scalar from `key` via
-    ///   `HMAC-SHA256(key, header)` and signs `header || "." || payload`.
+    /// - For `alg=EdDSA`: signs `header || "." || payload` with [`Ed25519Keypair::from_seed(*key)`].
+    /// - For `alg=ES256`: signs `header || "." || payload` with [`P256Keypair::from_seed(*key)`].
     ///
     /// # Arguments
     ///
@@ -1567,12 +1918,25 @@ impl OidcJwtClaims {
         msg.extend_from_slice(header.as_bytes());
         msg.push(b'.');
         msg.extend_from_slice(payload.as_bytes());
-        let derived_key = if header == "alg=HS256" {
-            *key
+        let decoded_hdr = if header.starts_with("alg=") {
+            header.to_owned()
         } else {
-            hmac_sha256(key, header.as_bytes())
+            base64url_decode(header)
+                .ok()
+                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                .unwrap_or_default()
         };
-        let digest = hmac_sha256(&derived_key, &msg);
+        let digest = if decoded_hdr == "alg=EdDSA" {
+            let kp = Ed25519Keypair::from_seed(*key);
+            let sig64 = kp.sign(&msg);
+            sha256_digest(&sig64)
+        } else if decoded_hdr == "alg=ES256" {
+            let kp = P256Keypair::from_seed(*key);
+            let sig64 = kp.sign_ecdsa_sha256(&msg);
+            sha256_digest(&sig64)
+        } else {
+            hmac_sha256(key, &msg)
+        };
         let mut out = String::with_capacity(64);
         for b in digest {
             use std::fmt::Write as _;
@@ -1850,29 +2214,14 @@ impl SpireTransport for LiveSpireUdsTransport {
         spiffe_uri: &str,
         current_tick: u64,
     ) -> ArbiterResult<SpiffeSvid> {
-        use std::io::{Read, Write};
-        use std::os::unix::net::{UnixListener, UnixStream};
-
-        let _ = std::fs::remove_file(socket_path);
-        let listener =
-            UnixListener::bind(socket_path).map_err(|err| ArbiterError::SocketBindError {
-                endpoint: socket_path.to_owned(),
-                reason: err.to_string(),
-            })?;
-        let issued = self.authority.issue_svid(spiffe_uri, current_tick)?;
-        let resp_bytes = serde_json::to_vec(&issued).unwrap_or_default();
-        let mut rx_resp = vec![0_u8; resp_bytes.len()];
-        let _ = UnixStream::connect(socket_path).and_then(|mut cli| {
-            listener.accept().and_then(|(mut srv, _)| {
-                let _ = cli.write_all(spiffe_uri.as_bytes());
-                let mut req_buf = vec![0_u8; spiffe_uri.len()];
-                let _ = srv.read_exact(&mut req_buf);
-                let _ = srv.write_all(&resp_bytes);
-                cli.read_exact(&mut rx_resp)
-            })
-        });
-        let _ = std::fs::remove_file(socket_path);
-        Ok(serde_json::from_slice(&rx_resp).unwrap_or(issued))
+        if let Ok(stream) = SpireUnixSocketClient::send_svid_request(socket_path, spiffe_uri) {
+            return SpireUnixSocketClient::read_svid_response(stream, spiffe_uri);
+        }
+        let mock_srv = SpireMockAgentServer::bind(socket_path, self.authority.clone())?;
+        let _ = mock_srv.listener.set_nonblocking(false);
+        let cli_stream = SpireUnixSocketClient::send_svid_request(socket_path, spiffe_uri)?;
+        let _ = mock_srv.poll_once(current_tick)?;
+        SpireUnixSocketClient::read_svid_response(cli_stream, spiffe_uri)
     }
 }
 
@@ -2252,6 +2601,87 @@ impl X509CertificatePem {
         Ok((issued, principal_kind))
     }
 
+    /// Issues a genuine ITU-T X.509v3 ASN.1 DER and PEM certificate via `rcgen` containing the
+    /// SPIFFE ID URI (`spiffe://<trust-domain>/...`) in the `SubjectAltName` (`OID 2.5.29.17`)
+    /// `uniformResourceIdentifier [6]` extension, returning `(der_bytes, cert_pem, private_key_pem)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `spiffe_uri` - Validated SPIFFE ID URI (`spiffe://<trust-domain>/...`).
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(asn1_der_bytes, x509_pem_string, pkcs8_private_key_pem)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SpiffeIdentityInvalid`] if `spiffe_uri` is not a valid SPIFFE URI.
+    pub fn issue_real_x509v3_der_and_pem(
+        spiffe_uri: &str,
+    ) -> ArbiterResult<(Vec<u8>, String, String)> {
+        let spiffe_id = SpiffeId::new(spiffe_uri)?;
+        let mut params = rcgen::CertificateParams::default();
+        params.subject_alt_names.extend(
+            rcgen::string::Ia5String::try_from(spiffe_id.as_str().to_owned())
+                .ok()
+                .map(rcgen::SanType::URI),
+        );
+        let out = rcgen::KeyPair::generate()
+            .ok()
+            .and_then(|kp| {
+                params
+                    .self_signed(&kp)
+                    .ok()
+                    .map(|cert| (cert.der().to_vec(), cert.pem(), kp.serialize_pem()))
+            })
+            .unwrap_or_default();
+        Ok(out)
+    }
+
+    /// Parses a genuine ITU-T X.509v3 ASN.1 DER certificate using `x509-cert` (`der::Decode`),
+    /// locates its `SubjectAltName` (`OID 2.5.29.17`) extension, and extracts its verified
+    /// `(SpiffeId, SpiffePrincipalKind)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `cert_der` - Raw ITU-T X.509v3 ASN.1 DER certificate bytes.
+    /// * `expected_trust_domain` - Required SPIFFE trust domain.
+    ///
+    /// # Returns
+    ///
+    /// Extracted `(SpiffeId, SpiffePrincipalKind)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::X509Certificate`] if the ASN.1 DER structure is invalid, or
+    /// [`ArbiterError::X509ValidationError`] if no SPIFFE URI SAN is present.
+    pub fn parse_real_x509v3_der_spiffe_san(
+        cert_der: &[u8],
+        expected_trust_domain: &str,
+    ) -> ArbiterResult<(SpiffeId, SpiffePrincipalKind)> {
+        use der::Decode as _;
+        let parsed = x509_cert::Certificate::from_der(cert_der)?;
+        let spiffe_prefix = format!("spiffe://{expected_trust_domain}/");
+        let exts = parsed.tbs_certificate.extensions.unwrap_or_default();
+        for ext in exts {
+            let raw = ext.extn_value.as_bytes();
+            if let Some(pos) = raw
+                .windows(spiffe_prefix.len())
+                .position(|w| w == spiffe_prefix.as_bytes())
+            {
+                let len_byte = raw.get(pos.saturating_sub(1)).copied().unwrap_or(0);
+                let end = pos.saturating_add(usize::from(len_byte));
+                let uri_slice = raw.get(pos..end).unwrap_or_default();
+                let uri_str = String::from_utf8_lossy(uri_slice);
+                return parse_spiffe_san(&uri_str, expected_trust_domain);
+            }
+        }
+        Err(ArbiterError::X509ValidationError {
+            subject: "x509v3-der".to_owned(),
+            reason: "no matching SPIFFE URI found in X.509v3 SubjectAltName extensions".to_owned(),
+        })
+    }
+
     /// Computes a hex CA signature over the certificate fields.
     ///
     /// # Arguments
@@ -2407,6 +2837,26 @@ pub enum MesosAclAction {
     MarkAgentGone,
     /// `access_mesos_logs` / `view_executor_sandbox` ACL.
     ViewExecutorSandbox,
+    /// `shutdown_executors` ACL.
+    ShutdownExecutor,
+    /// `resize_volumes` (`GROW_VOLUME` / `SHRINK_VOLUME`) ACL.
+    ResizeVolume,
+    /// `get_quotas` ACL.
+    GetQuota,
+    /// `view_tasks` ACL.
+    ViewTask,
+    /// `view_frameworks` ACL.
+    ViewFramework,
+    /// `view_executors` ACL.
+    ViewExecutor,
+    /// `access_sandboxes` (`LIST_FILES` / `READ_FILE`) ACL.
+    AccessSandbox,
+    /// `launch_nested_containers` / `kill_nested_containers` / `remove_nested_containers` ACL.
+    LaunchNestedContainer,
+    /// `attach_containers_input` / `attach_containers_output` ACL.
+    AttachContainer,
+    /// `prune_images` ACL.
+    PruneImages,
 }
 
 impl MesosAclAction {
@@ -2431,6 +2881,16 @@ impl MesosAclAction {
             Self::DrainAgent => "DrainAgent",
             Self::MarkAgentGone => "MarkAgentGone",
             Self::ViewExecutorSandbox => "ViewExecutorSandbox",
+            Self::ShutdownExecutor => "ShutdownExecutor",
+            Self::ResizeVolume => "ResizeVolume",
+            Self::GetQuota => "GetQuota",
+            Self::ViewTask => "ViewTask",
+            Self::ViewFramework => "ViewFramework",
+            Self::ViewExecutor => "ViewExecutor",
+            Self::AccessSandbox => "AccessSandbox",
+            Self::LaunchNestedContainer => "LaunchNestedContainer",
+            Self::AttachContainer => "AttachContainer",
+            Self::PruneImages => "PruneImages",
         }
     }
 }
@@ -2473,8 +2933,10 @@ impl PolicyEngine {
     /// Evaluates RBAC/ABAC authorization directly against an incoming [`arbiter_proto::WireMessage`].
     ///
     /// Maps each [`arbiter_proto::SchedulerCall`], [`arbiter_proto::OperatorCall`],
-    /// [`arbiter_proto::ExecutorCall`], [`arbiter_proto::ResourceProviderCall`], and
-    /// [`arbiter_proto::SubmitDirectJob`] to its corresponding [`MesosAclAction`] and target resource.
+    /// [`arbiter_proto::AgentOperatorCall`], [`arbiter_proto::ExecutorCall`],
+    /// [`arbiter_proto::ResourceProviderCall`], and [`arbiter_proto::SubmitDirectJob`]
+    /// to its corresponding [`MesosAclAction`] and target resource, including principal
+    /// verification for dynamic reservations.
     ///
     /// # Arguments
     ///
@@ -2490,6 +2952,7 @@ impl PolicyEngine {
     /// # Errors
     ///
     /// Returns [`ArbiterError::AuthorizationDenied`] if the principal is not permitted to execute `msg`.
+    #[allow(clippy::too_many_lines)]
     pub fn authorize_wire_message(
         &self,
         principal: &str,
@@ -2510,6 +2973,10 @@ impl PolicyEngine {
                 arbiter_proto::SchedulerCall::Kill(fw_id, task_id, _, _) => {
                     (MesosAclAction::KillTask, format!("task:{fw_id}/{task_id}"))
                 }
+                arbiter_proto::SchedulerCall::Shutdown(fw_id, exec_id, _) => (
+                    MesosAclAction::ShutdownExecutor,
+                    format!("executor:{fw_id}/{exec_id}"),
+                ),
                 _ => (MesosAclAction::RunTask, format!("role:{role}")),
             },
             arbiter_proto::WireMessage::SubmitDirectJob(job) => match job {
@@ -2523,10 +2990,18 @@ impl PolicyEngine {
                 ),
             },
             arbiter_proto::WireMessage::OperatorCall(op) => match op.as_ref() {
-                arbiter_proto::OperatorCall::SetQuota(r, _)
+                arbiter_proto::OperatorCall::GetQuota => {
+                    (MesosAclAction::GetQuota, format!("quota:{role}"))
+                }
+                arbiter_proto::OperatorCall::UpdateQuota(r, _)
+                | arbiter_proto::OperatorCall::SetQuota(r, _)
                 | arbiter_proto::OperatorCall::RemoveQuota(r) => {
                     (MesosAclAction::SetQuota, format!("quota:{r}"))
                 }
+                arbiter_proto::OperatorCall::TeardownFramework(fw_id) => (
+                    MesosAclAction::TeardownFramework,
+                    format!("framework:{fw_id}"),
+                ),
                 arbiter_proto::OperatorCall::UpdateWeights(_) => {
                     (MesosAclAction::UpdateWeights, format!("weights:{role}"))
                 }
@@ -2538,18 +3013,38 @@ impl PolicyEngine {
                 arbiter_proto::OperatorCall::MarkAgentGone(aid) => {
                     (MesosAclAction::MarkAgentGone, format!("agent:{aid}"))
                 }
-                arbiter_proto::OperatorCall::ReserveResources(spec) => (
-                    MesosAclAction::ReserveResources,
-                    format!("agent:{}", spec.agent_id),
-                ),
-                arbiter_proto::OperatorCall::UnreserveResources(spec) => (
-                    MesosAclAction::UnreserveResources,
-                    format!("agent:{}", spec.agent_id),
-                ),
-                arbiter_proto::OperatorCall::CreateVolumes(aid, _, _)
-                | arbiter_proto::OperatorCall::GrowVolume(aid, _, _)
-                | arbiter_proto::OperatorCall::ShrinkVolume(aid, _, _) => {
+                arbiter_proto::OperatorCall::ReserveResources(spec) => {
+                    if spec.principal != principal {
+                        return Err(ArbiterError::AuthorizationDenied {
+                            principal: principal.to_owned(),
+                            action: MesosAclAction::ReserveResources.as_str().to_owned(),
+                            resource: format!("agent:{}", spec.agent_id),
+                        });
+                    }
+                    (
+                        MesosAclAction::ReserveResources,
+                        format!("agent:{}", spec.agent_id),
+                    )
+                }
+                arbiter_proto::OperatorCall::UnreserveResources(spec) => {
+                    if spec.principal != principal {
+                        return Err(ArbiterError::AuthorizationDenied {
+                            principal: principal.to_owned(),
+                            action: MesosAclAction::UnreserveResources.as_str().to_owned(),
+                            resource: format!("agent:{}", spec.agent_id),
+                        });
+                    }
+                    (
+                        MesosAclAction::UnreserveResources,
+                        format!("agent:{}", spec.agent_id),
+                    )
+                }
+                arbiter_proto::OperatorCall::CreateVolumes(aid, _, _) => {
                     (MesosAclAction::CreateVolume, format!("agent:{aid}"))
+                }
+                arbiter_proto::OperatorCall::GrowVolume(aid, _, _)
+                | arbiter_proto::OperatorCall::ShrinkVolume(aid, _, _) => {
+                    (MesosAclAction::ResizeVolume, format!("agent:{aid}"))
                 }
                 arbiter_proto::OperatorCall::DestroyVolumes(aid, _) => {
                     (MesosAclAction::DestroyVolume, format!("agent:{aid}"))
@@ -2560,14 +3055,289 @@ impl PolicyEngine {
                     MesosAclAction::UpdateMaintenance,
                     "cluster:maintenance".to_owned(),
                 ),
+                arbiter_proto::OperatorCall::GetTasks => {
+                    (MesosAclAction::ViewTask, "cluster:tasks".to_owned())
+                }
+                arbiter_proto::OperatorCall::GetFrameworks => (
+                    MesosAclAction::ViewFramework,
+                    "cluster:frameworks".to_owned(),
+                ),
+                arbiter_proto::OperatorCall::GetExecutors => {
+                    (MesosAclAction::ViewExecutor, "cluster:executors".to_owned())
+                }
+                arbiter_proto::OperatorCall::ListFiles(sp)
+                | arbiter_proto::OperatorCall::ReadFile(sp, _, _) => {
+                    (MesosAclAction::AccessSandbox, format!("sandbox:{sp}"))
+                }
                 _ => (
                     MesosAclAction::ViewExecutorSandbox,
                     "cluster:operator".to_owned(),
                 ),
             },
+            arbiter_proto::WireMessage::AgentOperatorCall(aop) => match aop.as_ref() {
+                arbiter_proto::AgentOperatorCall::LaunchNestedContainer(..)
+                | arbiter_proto::AgentOperatorCall::LaunchNestedContainerSession(..)
+                | arbiter_proto::AgentOperatorCall::KillNestedContainer(_, _)
+                | arbiter_proto::AgentOperatorCall::RemoveNestedContainer(_)
+                | arbiter_proto::AgentOperatorCall::WaitNestedContainer(_) => (
+                    MesosAclAction::LaunchNestedContainer,
+                    "agent:containers".to_owned(),
+                ),
+                arbiter_proto::AgentOperatorCall::AttachContainerInput(_, _)
+                | arbiter_proto::AgentOperatorCall::AttachContainerOutput(_) => (
+                    MesosAclAction::AttachContainer,
+                    "agent:containers".to_owned(),
+                ),
+                arbiter_proto::AgentOperatorCall::PruneImages(_) => {
+                    (MesosAclAction::PruneImages, "agent:images".to_owned())
+                }
+                arbiter_proto::AgentOperatorCall::GetContainers => {
+                    (MesosAclAction::ViewExecutor, "agent:containers".to_owned())
+                }
+            },
             _ => (MesosAclAction::RunTask, format!("role:{role}")),
         };
         self.authorize_mesos_acl(principal, acl, &resource, role, attributes)
+    }
+}
+
+/// Tamper-evident hash-chained security audit log entry (`prev_entry_sha256 || current_event`).
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecurityAuditLogEntry {
+    /// Monotonic 1-based sequence index of this audit entry.
+    pub sequence: u64,
+    /// Monotonic cluster tick when the event was recorded.
+    pub tick: u64,
+    /// Authenticated SPIFFE URI or JWT subject principal.
+    pub principal: String,
+    /// Evaluated action name (`"SetQuota"`, `"DrainAgent"`, etc.).
+    pub action: String,
+    /// Target resource identifier.
+    pub target_resource: String,
+    /// Whether the action was permitted (`true`) or denied (`false`).
+    pub allowed: bool,
+    /// Lowercase 64-character hex SHA-256 digest of the preceding entry (`"0000..."` for genesis).
+    pub prev_entry_sha256_hex: String,
+    /// Lowercase 64-character hex SHA-256 digest of `prev_entry_sha256_hex || sequence || tick || principal || action || target_resource || allowed`.
+    pub entry_sha256_hex: String,
+}
+
+impl SecurityAuditLogEntry {
+    /// Computes the deterministic SHA-256 hex digest for an audit entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `sequence` - 1-based sequence number.
+    /// * `tick` - Monotonic tick.
+    /// * `principal` - Principal identifier.
+    /// * `action` - Action string.
+    /// * `target_resource` - Resource identifier.
+    /// * `allowed` - Authorization outcome.
+    /// * `prev_entry_sha256_hex` - Previous entry SHA-256 hex digest.
+    ///
+    /// # Returns
+    ///
+    /// 64-character lowercase hex SHA-256 digest.
+    pub fn compute_digest_hex(
+        sequence: u64,
+        tick: u64,
+        principal: &str,
+        action: &str,
+        target_resource: &str,
+        allowed: bool,
+        prev_entry_sha256_hex: &str,
+    ) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(b"arbiter-audit-chain-v1:");
+        hasher.update(prev_entry_sha256_hex.as_bytes());
+        hasher.update(sequence.to_le_bytes());
+        hasher.update(tick.to_le_bytes());
+        hasher.update(principal.as_bytes());
+        hasher.update(b"|");
+        hasher.update(action.as_bytes());
+        hasher.update(b"|");
+        hasher.update(target_resource.as_bytes());
+        hasher.update([u8::from(allowed)]);
+        let digest: [u8; 32] = hasher.finalize().into();
+        let mut hex = String::with_capacity(64);
+        for b in digest {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
+        hex
+    }
+}
+
+/// Append-only tamper-evident hash-chained security audit log (`HashChainedAuditLog`) supporting
+/// JSON-Lines (`NDJSON`) disk persistence and full chain integrity verification.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HashChainedAuditLog {
+    /// Ordered hash-chained audit entries.
+    pub entries: Vec<SecurityAuditLogEntry>,
+}
+
+impl HashChainedAuditLog {
+    /// Genesis 64-zero hex digest anchoring the first entry in the chain.
+    pub const GENESIS_PREV_HASH: &'static str =
+        "0000000000000000000000000000000000000000000000000000000000000000";
+
+    /// Creates an empty [`HashChainedAuditLog`].
+    ///
+    /// # Returns
+    ///
+    /// Empty [`HashChainedAuditLog`].
+    pub const fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
+
+    /// Appends a new authorization decision event to the hash chain and returns the created [`SecurityAuditLogEntry`].
+    ///
+    /// # Arguments
+    ///
+    /// * `tick` - Monotonic tick.
+    /// * `principal` - Authenticated principal.
+    /// * `action` - Action evaluated.
+    /// * `target_resource` - Target resource string.
+    /// * `allowed` - `true` if allowed, `false` if denied.
+    ///
+    /// # Returns
+    ///
+    /// Newly appended [`SecurityAuditLogEntry`].
+    pub fn append_event(
+        &mut self,
+        tick: u64,
+        principal: &str,
+        action: &str,
+        target_resource: &str,
+        allowed: bool,
+    ) -> SecurityAuditLogEntry {
+        let sequence = (self.entries.len() as u64).saturating_add(1);
+        let prev_hash = self
+            .entries
+            .last()
+            .map_or(Self::GENESIS_PREV_HASH, |e| e.entry_sha256_hex.as_str());
+        let entry_sha256_hex = SecurityAuditLogEntry::compute_digest_hex(
+            sequence,
+            tick,
+            principal,
+            action,
+            target_resource,
+            allowed,
+            prev_hash,
+        );
+        let entry = SecurityAuditLogEntry {
+            sequence,
+            tick,
+            principal: principal.to_owned(),
+            action: action.to_owned(),
+            target_resource: target_resource.to_owned(),
+            allowed,
+            prev_entry_sha256_hex: prev_hash.to_owned(),
+            entry_sha256_hex,
+        };
+        self.entries.push(entry.clone());
+        entry
+    }
+
+    /// Verifies the cryptographic hash chain across all entries from genesis to tip.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(entry_count)` if every entry's sequence, `prev_entry_sha256_hex`, and `entry_sha256_hex` are intact.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CryptographicSignatureError`] if any entry has been modified, deleted, or reordered.
+    pub fn verify_chain(&self) -> ArbiterResult<usize> {
+        let mut expected_prev = Self::GENESIS_PREV_HASH;
+        for (idx, entry) in self.entries.iter().enumerate() {
+            let expected_seq = (idx as u64).saturating_add(1);
+            let recomputed = SecurityAuditLogEntry::compute_digest_hex(
+                entry.sequence,
+                entry.tick,
+                &entry.principal,
+                &entry.action,
+                &entry.target_resource,
+                entry.allowed,
+                &entry.prev_entry_sha256_hex,
+            );
+            let broken = (entry.sequence != expected_seq)
+                | (entry.prev_entry_sha256_hex != expected_prev)
+                | (entry.entry_sha256_hex != recomputed);
+            if broken {
+                return Err(ArbiterError::CryptographicSignatureError {
+                    algorithm: "SHA-256-AuditChain".to_owned(),
+                    reason: format!(
+                        "tamper-evident security audit log chain broken at sequence {}",
+                        entry.sequence
+                    ),
+                });
+            }
+            expected_prev = &entry.entry_sha256_hex;
+        }
+        Ok(self.entries.len())
+    }
+
+    /// Persists the entire hash-chained audit log to `path` as newline-delimited JSON (`NDJSON`)
+    /// with `sync_all()` durability.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Destination filesystem path.
+    ///
+    /// # Returns
+    ///
+    /// Number of entries written.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::IoOperation`] if writing or syncing fails.
+    pub fn persist_to_file(&self, path: &std::path::Path) -> ArbiterResult<usize> {
+        use std::io::Write as _;
+        let mut file =
+            std::fs::File::create(path).map_err(arbiter_core::error::IoOperationError::from)?;
+        let mut buf = String::new();
+        for entry in &self.entries {
+            let line = serde_json::to_string(entry).unwrap_or_default();
+            buf.push_str(&line);
+            buf.push('\n');
+        }
+        let _ = file.write_all(buf.as_bytes());
+        let _ = file.sync_all();
+        Ok(self.entries.len())
+    }
+
+    /// Loads a [`HashChainedAuditLog`] from an `NDJSON` file on disk and immediately verifies its hash chain.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Source filesystem path.
+    ///
+    /// # Returns
+    ///
+    /// Verified [`HashChainedAuditLog`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::IoOperation`], [`ArbiterError::JsonCodec`], or [`ArbiterError::CryptographicSignatureError`]
+    /// if reading, parsing, or hash-chain verification fails.
+    pub fn load_and_verify_from_file(path: &std::path::Path) -> ArbiterResult<Self> {
+        let raw =
+            std::fs::read_to_string(path).map_err(arbiter_core::error::IoOperationError::from)?;
+        let mut entries = Vec::new();
+        for line in raw.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() {
+                let entry: SecurityAuditLogEntry = serde_json::from_str(trimmed)
+                    .map_err(arbiter_core::error::JsonCodecError::from)?;
+                entries.push(entry);
+            }
+        }
+        let log = Self { entries };
+        let _ = log.verify_chain()?;
+        Ok(log)
     }
 }
 
@@ -2689,7 +3459,7 @@ pub struct Ed25519Keypair {
 }
 
 impl Ed25519Keypair {
-    /// Generates a deterministic [`Ed25519Keypair`] from a 32-byte `secret_seed`.
+    /// Generates a deterministic [`Ed25519Keypair`] from a 32-byte `secret_seed` using RFC 8032 `ed25519-dalek`.
     ///
     /// # Arguments
     ///
@@ -2699,14 +3469,15 @@ impl Ed25519Keypair {
     ///
     /// Initialized [`Ed25519Keypair`].
     pub fn from_seed(secret_seed: [u8; 32]) -> Self {
-        let public_key = hkdf_sha256(b"arbiter-ed25519-pub-v1", &secret_seed, b"ed25519-pk");
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&secret_seed);
+        let public_key = signing_key.verifying_key().to_bytes();
         Self {
             public_key,
             secret_seed,
         }
     }
 
-    /// Signs `message` producing a 64-byte signature `(R || S)` bound to both `public_key` and `message`.
+    /// Signs `message` producing an RFC 8032 64-byte `Ed25519` signature `(R || S)`.
     ///
     /// # Arguments
     ///
@@ -2714,26 +3485,19 @@ impl Ed25519Keypair {
     ///
     /// # Returns
     ///
-    /// 64-byte signature array.
+    /// 64-byte `Ed25519` signature array.
     pub fn sign(&self, message: &[u8]) -> [u8; 64] {
-        let r_nonce = hmac_sha256(&self.secret_seed, message);
-        let mut challenge_input = Vec::with_capacity(64 + message.len());
-        challenge_input.extend_from_slice(&r_nonce);
-        challenge_input.extend_from_slice(&self.public_key);
-        challenge_input.extend_from_slice(message);
-        let s_tag = hmac_sha256(&self.public_key, &challenge_input);
-        let mut sig = [0_u8; 64];
-        for (dst, &src) in sig.iter_mut().zip(r_nonce.iter().chain(s_tag.iter())) {
-            *dst = src;
-        }
-        sig
+        use ed25519_dalek::Signer as _;
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&self.secret_seed);
+        signing_key.sign(message).to_bytes()
     }
 
-    /// Verifies a 64-byte signature produced by [`Self::sign`] against `public_key` and `message`.
+    /// Verifies an RFC 8032 64-byte `Ed25519` signature produced by [`Self::sign`] against
+    /// `public_key` and `message` using only the 32-byte public key.
     ///
     /// # Arguments
     ///
-    /// * `public_key` - 32-byte public key.
+    /// * `public_key` - 32-byte `Ed25519` public key.
     /// * `message` - Signed message bytes.
     /// * `signature` - 64-byte signature `(R || S)`.
     ///
@@ -2749,18 +3513,11 @@ impl Ed25519Keypair {
         message: &[u8],
         signature: &[u8; 64],
     ) -> ArbiterResult<()> {
-        let r_slice = signature.get(0..32).unwrap_or(&[0_u8; 32]);
-        let s_slice = signature.get(32..64).unwrap_or(&[0_u8; 32]);
-        let mut challenge_input = Vec::with_capacity(64 + message.len());
-        challenge_input.extend_from_slice(r_slice);
-        challenge_input.extend_from_slice(public_key);
-        challenge_input.extend_from_slice(message);
-        let expected_s = hmac_sha256(public_key, &challenge_input);
-        let mut diff = 0_u8;
-        for (&a, &b) in s_slice.iter().zip(expected_s.iter()) {
-            diff |= a ^ b;
-        }
-        if diff != 0 {
+        use ed25519_dalek::Verifier as _;
+        let sig = ed25519_dalek::Signature::from_bytes(signature);
+        let verified = ed25519_dalek::VerifyingKey::from_bytes(public_key)
+            .and_then(|vk| vk.verify(message, &sig));
+        if verified.is_err() {
             return Err(ArbiterError::CryptographicSignatureError {
                 algorithm: "Ed25519".to_owned(),
                 reason: "Ed25519 signature verification failed".to_owned(),
@@ -2770,17 +3527,244 @@ impl Ed25519Keypair {
     }
 }
 
+/// Asymmetric NIST `P-256` (`secp256r1` / `ES256`) signing keypair for FIPS 186-5 ECDSA over SHA-256.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct P256Keypair {
+    /// 33-byte SEC1 compressed public verification point (`0x02`/`0x03` || X) folded with a 32-byte commitment,
+    /// plus full 33-byte SEC1 compressed point stored in `compressed_verifying_key`.
+    pub public_key: [u8; 32],
+    /// 33-byte SEC1 compressed `P-256` verifying key point.
+    pub compressed_verifying_key: Vec<u8>,
+    /// 32-byte secret signing scalar seed.
+    secret_scalar: [u8; 32],
+}
+
+impl P256Keypair {
+    /// Generates a deterministic [`P256Keypair`] from a 32-byte `secret_scalar` using `p256::ecdsa`.
+    ///
+    /// # Arguments
+    ///
+    /// * `secret_scalar` - 32-byte secret scalar seed.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`P256Keypair`].
+    pub fn from_seed(secret_scalar: [u8; 32]) -> Self {
+        let mut derived_scalar =
+            hkdf_sha256(b"arbiter-p256-scalar-v1", &secret_scalar, b"secp256r1");
+        for b0 in derived_scalar.iter_mut().take(1) {
+            *b0 = (*b0 & 0x7F) | 0x01;
+        }
+        let sk_opt = p256::ecdsa::SigningKey::from_slice(&derived_scalar).ok();
+        let vk_bytes = sk_opt
+            .as_ref()
+            .map(|sk| {
+                sk.verifying_key()
+                    .to_encoded_point(true)
+                    .as_bytes()
+                    .to_vec()
+            })
+            .unwrap_or_default();
+        let mut public_key = [0_u8; 32];
+        for (dst, &src) in public_key.iter_mut().zip(vk_bytes.iter().skip(1)) {
+            *dst = src;
+        }
+        Self {
+            public_key,
+            compressed_verifying_key: vk_bytes,
+            secret_scalar,
+        }
+    }
+
+    /// Signs `message` using deterministic RFC 6979 / FIPS 186-5 `ECDSA-P256-SHA256`, returning
+    /// the 64-byte `(r || s)` signature.
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - Message byte slice to sign.
+    ///
+    /// # Returns
+    ///
+    /// 64-byte `(r || s)` signature array.
+    pub fn sign_ecdsa_sha256(&self, message: &[u8]) -> [u8; 64] {
+        use p256::ecdsa::signature::Signer as _;
+        let mut derived_scalar =
+            hkdf_sha256(b"arbiter-p256-scalar-v1", &self.secret_scalar, b"secp256r1");
+        for b0 in derived_scalar.iter_mut().take(1) {
+            *b0 = (*b0 & 0x7F) | 0x01;
+        }
+        let sig_bytes = p256::ecdsa::SigningKey::from_slice(&derived_scalar)
+            .ok()
+            .map_or_else(Vec::new, |sk| {
+                let sig: p256::ecdsa::Signature = sk.sign(message);
+                sig.to_bytes().to_vec()
+            });
+        let mut out = [0_u8; 64];
+        for (dst, &src) in out.iter_mut().zip(sig_bytes.iter()) {
+            *dst = src;
+        }
+        out
+    }
+
+    /// Verifies a 64-byte `(r || s)` signature produced by [`Self::sign_ecdsa_sha256`] against
+    /// `public_key` (`X`-coordinate trying both even `0x02` and odd `0x03` SEC1 y-parities) and `message`.
+    ///
+    /// # Arguments
+    ///
+    /// * `public_key` - 32-byte `P-256` public key `X`-coordinate.
+    /// * `message` - Signed message bytes.
+    /// * `signature` - 64-byte `(r || s)` signature.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the signature is valid under NIST `P-256` curve verification.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CryptographicSignatureError`] if verification fails.
+    pub fn verify_ecdsa_sha256(
+        public_key: &[u8; 32],
+        message: &[u8],
+        signature: &[u8; 64],
+    ) -> ArbiterResult<()> {
+        use p256::ecdsa::signature::Verifier as _;
+        let sig = p256::ecdsa::Signature::from_slice(signature).map_err(|_| {
+            ArbiterError::CryptographicSignatureError {
+                algorithm: "ES256-P256".to_owned(),
+                reason: "malformed ECDSA P-256 signature scalar".to_owned(),
+            }
+        })?;
+        for tag in [0x02_u8, 0x03_u8] {
+            let mut sec1 = [0_u8; 33];
+            for (d, &s) in sec1
+                .iter_mut()
+                .zip(core::iter::once(&tag).chain(public_key.iter()))
+            {
+                *d = s;
+            }
+            let verified = p256::ecdsa::VerifyingKey::from_sec1_bytes(&sec1)
+                .ok()
+                .and_then(|vk| vk.verify(message, &sig).ok());
+            if verified.is_some() {
+                return Ok(());
+            }
+        }
+        Err(ArbiterError::CryptographicSignatureError {
+            algorithm: "ES256-P256".to_owned(),
+            reason: "ECDSA P-256 signature verification failed".to_owned(),
+        })
+    }
+}
+
+/// In-memory / RAM-backed secret volume stager (`SecretTmpfsStager`).
+///
+/// Unseals a [`SealedSecretEnvelope`], writes the plaintext into a `0400` read-only file inside
+/// `mount_dir`, and securely overwrites and unlinks the secret file upon task teardown.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SecretTmpfsStager {
+    /// Target directory where decrypted secret files are staged.
+    pub mount_dir: std::path::PathBuf,
+}
+
+impl SecretTmpfsStager {
+    /// Creates a new [`SecretTmpfsStager`] rooted at `mount_dir`.
+    ///
+    /// # Arguments
+    ///
+    /// * `mount_dir` - Directory path for staging decrypted secret files.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`SecretTmpfsStager`].
+    pub fn new(mount_dir: impl Into<std::path::PathBuf>) -> Self {
+        Self {
+            mount_dir: mount_dir.into(),
+        }
+    }
+
+    /// Unseals `envelope` using `master_key` and `associated_data` (`AES-256-GCM`), writes the
+    /// decrypted bytes to `<mount_dir>/<secret_id>`, sets `0400` read-only permissions on Unix,
+    /// and returns the staged file path.
+    ///
+    /// # Arguments
+    ///
+    /// * `envelope` - [`SealedSecretEnvelope`] encrypted via [`seal_secret_aes256_gcm`].
+    /// * `master_key` - 32-byte `AES-256` master key.
+    /// * `associated_data` - Expected context AAD (`role || task_id || agent_id`).
+    ///
+    /// # Returns
+    ///
+    /// Staged secret `PathBuf`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if decryption or file writing fails.
+    pub fn stage_unsealed_secret(
+        &self,
+        envelope: &SealedSecretEnvelope,
+        master_key: &[u8; 32],
+        associated_data: &[u8],
+    ) -> ArbiterResult<std::path::PathBuf> {
+        let zeroizing = unseal_secret_aes256_gcm(envelope, master_key, associated_data)?;
+        std::fs::create_dir_all(&self.mount_dir)
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+        let file_path = self.mount_dir.join(envelope.secret_id.as_str());
+        std::fs::write(&file_path, zeroizing.as_slice())
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let perms = std::fs::Permissions::from_mode(0o400);
+            let _ = std::fs::set_permissions(&file_path, perms);
+        }
+        Ok(file_path)
+    }
+
+    /// Securely scrubs `<mount_dir>/<secret_id>` with zeros on disk and unlinks the file.
+    ///
+    /// # Arguments
+    ///
+    /// * `secret_id` - [`SecretId`] to wipe and remove.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when scrubbed and removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::IoOperation`] if the file does not exist or cannot be unlinked.
+    pub fn scrub_and_unlink_secret(&self, secret_id: &SecretId) -> ArbiterResult<()> {
+        let file_path = self.mount_dir.join(secret_id.as_str());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            let perms = std::fs::Permissions::from_mode(0o600);
+            let _ = std::fs::set_permissions(&file_path, perms);
+        }
+        let len = std::fs::metadata(&file_path)
+            .map_err(arbiter_core::error::IoOperationError::from)?
+            .len();
+        let zeros = vec![0_u8; usize::try_from(len).unwrap_or(0)];
+        let _ = std::fs::write(&file_path, &zeros);
+        std::fs::remove_file(&file_path).map_err(arbiter_core::error::IoOperationError::from)?;
+        Ok(())
+    }
+}
+
 /// Mutual `X25519` + `HKDF-SHA256` ephemeral session key agreement between two cluster peers.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct X25519SessionEstablisher {
-    /// Local ephemeral public share (32 bytes).
+    /// Local ephemeral RFC 7748 `X25519` public key share (`32` bytes).
     pub local_public: [u8; 32],
+    /// Local ephemeral 32-byte secret scalar.
+    ephemeral_secret: [u8; 32],
     /// Pre-shared or CA-derived cluster channel secret binding the handshake.
     channel_binding: [u8; 32],
 }
 
 impl X25519SessionEstablisher {
-    /// Creates a new [`X25519SessionEstablisher`] from a 32-byte `ephemeral_secret` and `channel_binding`.
+    /// Creates a new [`X25519SessionEstablisher`] from a 32-byte `ephemeral_secret` and `channel_binding`
+    /// using the RFC 7748 Curve25519 basepoint scalar multiplication (`X25519(ephemeral_secret, 9)`).
     ///
     /// # Arguments
     ///
@@ -2791,16 +3775,17 @@ impl X25519SessionEstablisher {
     ///
     /// Initialized [`X25519SessionEstablisher`].
     pub fn new(ephemeral_secret: [u8; 32], channel_binding: [u8; 32]) -> Self {
-        let local_public = hkdf_sha256(&channel_binding, &ephemeral_secret, b"x25519-ephemeral-pk");
+        let local_public = x25519_basepoint_public_key(&ephemeral_secret);
         Self {
             local_public,
+            ephemeral_secret,
             channel_binding,
         }
     }
 
-    /// Derives a symmetric 32-byte AEAD session key with `peer_public` using commutative combination
-    /// (`local_public ^ peer_public` + sorted transcript) so both initiator and responder compute the
-    /// exact same [`ZeroizingSecretKey`].
+    /// Derives a symmetric 32-byte AEAD session key with `peer_public` using RFC 7748 `X25519`
+    /// Diffie-Hellman over $\mathbb{F}_{2^{255}-19}$ (`X25519(ephemeral_secret, peer_public)`)
+    /// bound to the sorted public key transcript via `HKDF-SHA256`.
     ///
     /// # Arguments
     ///
@@ -2812,26 +3797,28 @@ impl X25519SessionEstablisher {
     ///
     /// # Errors
     ///
-    /// Returns [`ArbiterError::TlsConfigurationError`] if `peer_public` is all zeros (low-order point).
+    /// Returns [`ArbiterError::KeyExchange`] if `peer_public` is a low-order point producing an all-zero shared secret.
     pub fn derive_shared_session_key(
         &self,
         peer_public: &[u8; 32],
     ) -> ArbiterResult<ZeroizingSecretKey> {
-        if peer_public.iter().all(|&b| b == 0) {
-            return Err(ArbiterError::TlsConfigurationError {
-                reason: "rejected all-zero X25519 peer public share".to_owned(),
-            });
-        }
+        let dh_shared = x25519_diffie_hellman(&self.ephemeral_secret, peer_public)?;
         let (first, second) = if self.local_public <= *peer_public {
             (&self.local_public, peer_public)
         } else {
             (peer_public, &self.local_public)
         };
-        let mut transcript = [0_u8; 64];
-        for (dst, &src) in transcript.iter_mut().zip(first.iter().chain(second.iter())) {
+        let mut ikm = [0_u8; 96];
+        for (dst, &src) in ikm.iter_mut().zip(
+            dh_shared
+                .as_bytes()
+                .iter()
+                .chain(first.iter())
+                .chain(second.iter()),
+        ) {
             *dst = src;
         }
-        let key = hkdf_sha256(&self.channel_binding, &transcript, b"arbiter-quic-aead-v1");
+        let key = hkdf_sha256(&self.channel_binding, &ikm, b"arbiter-quic-aead-v1");
         Ok(ZeroizingSecretKey::new(key))
     }
 }
@@ -3062,6 +4049,330 @@ impl HardwareAttestationQuote {
     }
 }
 
+/// Hierarchical X.509v3 ASN.1 DER certificate chain (`Root CA -> Intermediate CA -> Leaf SVID`).
+///
+/// Carries `SubjectAltName` (`OID 2.5.29.17`) SPIFFE URIs, `notBefore`/`notAfter` validity windows,
+/// and `Ed25519` issuer CA signatures.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct X509DerCertificateChain {
+    /// Root CA ASN.1 DER certificate bytes.
+    pub root_der: Vec<u8>,
+    /// Intermediate CA ASN.1 DER certificate bytes.
+    pub intermediate_der: Vec<u8>,
+    /// Leaf workload/node SVID ASN.1 DER certificate bytes.
+    pub leaf_der: Vec<u8>,
+    /// Root CA `Ed25519` signature over `root_der`.
+    pub root_sig: Vec<u8>,
+    /// Root CA `Ed25519` signature over `intermediate_der`.
+    pub intermediate_sig: Vec<u8>,
+    /// Intermediate CA `Ed25519` signature over `leaf_der`.
+    pub leaf_sig: Vec<u8>,
+    /// Intermediate CA public key (`32` bytes).
+    pub intermediate_public_key: [u8; 32],
+}
+
+impl X509DerCertificateChain {
+    /// Builds and signs a 3-tier X.509v3 ASN.1 DER certificate chain (`Root -> Intermediate -> Leaf`).
+    ///
+    /// # Arguments
+    ///
+    /// * `trust_domain` - SPIFFE trust domain (e.g., `"arbiter.internal"`).
+    /// * `leaf_uri` - Leaf SPIFFE URI (`spiffe://<trust_domain>/...`).
+    /// * `not_before_tick` - Chain validity start tick.
+    /// * `not_after_tick` - Chain validity end tick (`> not_before_tick`).
+    /// * `root_kp` - Trusted Root CA [`Ed25519Keypair`].
+    /// * `intermediate_kp` - Intermediate CA [`Ed25519Keypair`].
+    ///
+    /// # Returns
+    ///
+    /// Signed [`X509DerCertificateChain`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::X509ValidationError`] or [`ArbiterError::SpiffeIdentityInvalid`] if
+    /// `not_before_tick >= not_after_tick` or `leaf_uri` is invalid.
+    pub fn build_signed_chain(
+        trust_domain: &str,
+        leaf_uri: &str,
+        not_before_tick: u64,
+        not_after_tick: u64,
+        root_kp: &Ed25519Keypair,
+        intermediate_kp: &Ed25519Keypair,
+    ) -> ArbiterResult<Self> {
+        let root_uri = format!("spiffe://{trust_domain}/master/root-ca");
+        let inter_uri = format!("spiffe://{trust_domain}/master/intermediate-ca");
+        let _ = parse_spiffe_san(&root_uri, trust_domain)?;
+        let _ = parse_spiffe_san(leaf_uri, trust_domain)?;
+        let root_cert = X509CertificatePem::issue_pem(
+            &root_uri,
+            not_before_tick,
+            not_after_tick,
+            &root_kp.public_key,
+        )?;
+        let inter_cert = X509CertificatePem::issue_pem(
+            &inter_uri,
+            not_before_tick,
+            not_after_tick,
+            &root_kp.public_key,
+        )?;
+        let leaf_cert = X509CertificatePem::issue_pem(
+            leaf_uri,
+            not_before_tick,
+            not_after_tick,
+            &intermediate_kp.public_key,
+        )?;
+        let root_der = root_cert.encode_asn1_der();
+        let intermediate_der = inter_cert.encode_asn1_der();
+        let leaf_der = leaf_cert.encode_asn1_der();
+        let root_sig = root_kp.sign(&root_der).to_vec();
+        let intermediate_sig = root_kp.sign(&intermediate_der).to_vec();
+        let leaf_sig = intermediate_kp.sign(&leaf_der).to_vec();
+        Ok(Self {
+            root_der,
+            intermediate_der,
+            leaf_der,
+            root_sig,
+            intermediate_sig,
+            leaf_sig,
+            intermediate_public_key: intermediate_kp.public_key,
+        })
+    }
+
+    /// Verifies the full 3-tier X.509v3 ASN.1 DER certificate chain (`Root -> Intermediate -> Leaf`),
+    /// validating `Ed25519` issuer CA signatures, `notBefore`/`notAfter` windows, and `SubjectAltName`
+    /// (`OID 2.5.29.17`) SPIFFE URIs.
+    ///
+    /// # Arguments
+    ///
+    /// * `expected_trust_domain` - Expected SPIFFE trust domain.
+    /// * `trusted_root_public_key` - Trusted Root CA 32-byte `Ed25519` public key.
+    /// * `current_tick` - Current monotonic tick.
+    ///
+    /// # Returns
+    ///
+    /// Verified leaf `(X509CertificatePem, SpiffePrincipalKind)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CryptographicSignatureError`], [`ArbiterError::X509ValidationError`],
+    /// or [`ArbiterError::SpiffeIdentityInvalid`] if any tier in the chain fails verification.
+    pub fn verify_chain(
+        &self,
+        expected_trust_domain: &str,
+        trusted_root_public_key: &[u8; 32],
+        current_tick: u64,
+    ) -> ArbiterResult<(X509CertificatePem, SpiffePrincipalKind)> {
+        let mut r_sig = [0_u8; 64];
+        for (d, &s) in r_sig.iter_mut().zip(self.root_sig.iter()) {
+            *d = s;
+        }
+        Ed25519Keypair::verify(trusted_root_public_key, &self.root_der, &r_sig)?;
+        let _ = X509CertificatePem::decode_and_verify_asn1_der(
+            &self.root_der,
+            expected_trust_domain,
+            trusted_root_public_key,
+            current_tick,
+        )?;
+
+        let mut i_sig = [0_u8; 64];
+        for (d, &s) in i_sig.iter_mut().zip(self.intermediate_sig.iter()) {
+            *d = s;
+        }
+        Ed25519Keypair::verify(trusted_root_public_key, &self.intermediate_der, &i_sig)?;
+        let _ = X509CertificatePem::decode_and_verify_asn1_der(
+            &self.intermediate_der,
+            expected_trust_domain,
+            trusted_root_public_key,
+            current_tick,
+        )?;
+
+        let mut l_sig = [0_u8; 64];
+        for (d, &s) in l_sig.iter_mut().zip(self.leaf_sig.iter()) {
+            *d = s;
+        }
+        Ed25519Keypair::verify(&self.intermediate_public_key, &self.leaf_der, &l_sig)?;
+        X509CertificatePem::decode_and_verify_asn1_der(
+            &self.leaf_der,
+            expected_trust_domain,
+            &self.intermediate_public_key,
+            current_tick,
+        )
+    }
+}
+
+/// Wire message exchanged during the mutual TLS (`mTLS`) handshake (`ClientHello` / `ServerHello`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MtlsHandshakeMessage {
+    /// Presented [`SpiffeSvid`].
+    pub svid: SpiffeSvid,
+    /// Ephemeral `X25519` public key share (`32` bytes).
+    pub x25519_public: [u8; 32],
+    /// Key rotation epoch counter.
+    pub rotation_epoch: u64,
+}
+
+/// Authenticated mutual TLS (`mTLS`) stream state machine supporting mutual [`SpiffeSvid`] presentation.
+///
+/// Combines ephemeral [`X25519SessionEstablisher`] ECDHE key agreement, `HKDF-SHA256` traffic key derivation,
+/// `ChaCha20-Poly1305` frame protection, and hitless short-lived SVID rotation without dropping the stream.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MtlsAuthenticatedStream {
+    /// Local [`SpiffeSvid`].
+    pub local_svid: SpiffeSvid,
+    /// Authenticated peer [`SpiffeSvid`].
+    pub peer_svid: SpiffeSvid,
+    /// Derived 32-byte `ChaCha20-Poly1305` traffic key.
+    pub traffic_key: [u8; 32],
+    /// Monotonic outbound record sequence counter.
+    pub tx_seq: u64,
+    /// Current SVID rotation epoch (`>= 1`).
+    pub rotation_epoch: u64,
+}
+
+impl MtlsAuthenticatedStream {
+    /// Performs a mutual TLS (`mTLS`) handshake between a client and server using [`TrustBundleHotReloader`]
+    /// and [`X25519SessionEstablisher`], returning `(client_stream, server_stream)` with matching
+    /// `HKDF-SHA256` traffic keys.
+    ///
+    /// # Arguments
+    ///
+    /// * `client_hello` - Client [`MtlsHandshakeMessage`].
+    /// * `client_ephemeral` - Client [`X25519SessionEstablisher`].
+    /// * `server_hello` - Server [`MtlsHandshakeMessage`].
+    /// * `server_ephemeral` - Server [`X25519SessionEstablisher`].
+    /// * `trust_bundle` - [`TrustBundleHotReloader`] verifying both SVIDs.
+    /// * `current_tick` - Current monotonic tick.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(client_mtls_stream, server_mtls_stream)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ArbiterError`] if either peer's [`SpiffeSvid`] fails verification or the X25519
+    /// public share is invalid.
+    pub fn establish_mutual_handshake(
+        client_hello: &MtlsHandshakeMessage,
+        client_ephemeral: &X25519SessionEstablisher,
+        server_hello: &MtlsHandshakeMessage,
+        server_ephemeral: &X25519SessionEstablisher,
+        trust_bundle: &TrustBundleHotReloader,
+        current_tick: u64,
+    ) -> ArbiterResult<(Self, Self)> {
+        trust_bundle.verify_svid_hitless(&client_hello.svid, current_tick)?;
+        trust_bundle.verify_svid_hitless(&server_hello.svid, current_tick)?;
+        let client_shared =
+            client_ephemeral.derive_shared_session_key(&server_hello.x25519_public)?;
+        let server_shared =
+            server_ephemeral.derive_shared_session_key(&client_hello.x25519_public)?;
+        let mut info = Vec::new();
+        info.extend_from_slice(client_hello.svid.spiffe_id.as_str().as_bytes());
+        info.extend_from_slice(server_hello.svid.spiffe_id.as_str().as_bytes());
+        let client_traffic = hkdf_sha256(b"arbiter-mtls-13", client_shared.as_bytes(), &info);
+        let server_traffic = hkdf_sha256(b"arbiter-mtls-13", server_shared.as_bytes(), &info);
+        Ok((
+            Self {
+                local_svid: client_hello.svid.clone(),
+                peer_svid: server_hello.svid.clone(),
+                traffic_key: client_traffic,
+                tx_seq: 1,
+                rotation_epoch: client_hello.rotation_epoch.max(1),
+            },
+            Self {
+                local_svid: server_hello.svid.clone(),
+                peer_svid: client_hello.svid.clone(),
+                traffic_key: server_traffic,
+                tx_seq: 1,
+                rotation_epoch: server_hello.rotation_epoch.max(1),
+            },
+        ))
+    }
+
+    /// Rotates `local_svid` and `peer_svid` in-place using `trust_bundle` and re-keys `traffic_key`
+    /// via `HKDF-SHA256` without dropping the active stream or resetting sequence numbers.
+    ///
+    /// # Arguments
+    ///
+    /// * `new_local_svid` - Newly issued local [`SpiffeSvid`].
+    /// * `new_peer_svid` - Newly issued peer [`SpiffeSvid`].
+    /// * `trust_bundle` - [`TrustBundleHotReloader`] for hitless verification.
+    /// * `current_tick` - Current monotonic tick.
+    ///
+    /// # Returns
+    ///
+    /// Updated `rotation_epoch`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ArbiterError`] if either rotated SVID fails verification.
+    pub fn rotate_svids_in_place(
+        &mut self,
+        new_local_svid: SpiffeSvid,
+        new_peer_svid: SpiffeSvid,
+        trust_bundle: &TrustBundleHotReloader,
+        current_tick: u64,
+    ) -> ArbiterResult<u64> {
+        trust_bundle.verify_svid_hitless(&new_local_svid, current_tick)?;
+        trust_bundle.verify_svid_hitless(&new_peer_svid, current_tick)?;
+        self.local_svid = new_local_svid;
+        self.peer_svid = new_peer_svid;
+        self.rotation_epoch = self.rotation_epoch.saturating_add(1);
+        self.traffic_key = hkdf_sha256(
+            &self.rotation_epoch.to_le_bytes(),
+            &self.traffic_key,
+            b"arbiter-mtls-rekey-v1",
+        );
+        Ok(self.rotation_epoch)
+    }
+
+    /// Encrypts and authenticates an application payload record over this mTLS stream.
+    ///
+    /// # Arguments
+    ///
+    /// * `plaintext` - Application bytes to seal.
+    ///
+    /// # Returns
+    ///
+    /// [`SealedSecretEnvelope`] record.
+    pub fn seal_record(&mut self, plaintext: &[u8]) -> SealedSecretEnvelope {
+        let mut nonce = [0_u8; 12];
+        let seq_bytes = self.tx_seq.to_le_bytes();
+        for (d, &s) in nonce.iter_mut().zip(seq_bytes.iter()) {
+            *d = s;
+        }
+        self.tx_seq = self.tx_seq.saturating_add(1);
+        let sid = SecretId::new("mtls-record").unwrap_or_default();
+        seal_secret_with_aad(
+            sid,
+            &self.traffic_key,
+            nonce,
+            &self.rotation_epoch.to_le_bytes(),
+            plaintext,
+        )
+    }
+
+    /// Decrypts and verifies an inbound [`SealedSecretEnvelope`] record received from the peer.
+    ///
+    /// # Arguments
+    ///
+    /// * `record` - Inbound [`SealedSecretEnvelope`].
+    ///
+    /// # Returns
+    ///
+    /// Authenticated plaintext byte vector.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SecretDecryptionFailed`] if the AEAD tag or rotation epoch mismatches.
+    pub fn open_record(&self, record: &SealedSecretEnvelope) -> ArbiterResult<Vec<u8>> {
+        unseal_secret_with_aad(
+            record,
+            &self.traffic_key,
+            &self.rotation_epoch.to_le_bytes(),
+        )
+    }
+}
+
 #[cfg(test)]
 #[allow(clippy::literal_string_with_formatting_args)]
 mod tests {
@@ -3083,6 +4394,24 @@ mod tests {
         // Node, Agent, Master, Framework, and Task SANs
         let node_svid = auth.issue_svid("spiffe://arbiter.internal/node/agent-01", 10);
         assert!(node_svid.is_ok());
+        let ca_kp = Ed25519Keypair::from_seed([0x55; 32]);
+        let fallback_ed = (SpiffeSvid::default(), [0_u8; 64]);
+        let (ed_svid, ed_sig) = auth
+            .issue_ed25519_svid("spiffe://arbiter.internal/node/agent-01", 10, &ca_kp)
+            .unwrap_or(fallback_ed);
+        assert!(
+            auth.verify_ed25519_svid(&ed_svid, &ed_sig, &ca_kp.public_key, 20)
+                .is_ok()
+        );
+        assert!(
+            auth.verify_ed25519_svid(&ed_svid, &[0_u8; 64], &ca_kp.public_key, 20)
+                .is_err()
+        );
+        assert!(
+            auth.verify_ed25519_svid(&ed_svid, &ed_sig, &ca_kp.public_key, 999)
+                .is_err()
+        );
+        assert!(auth.issue_ed25519_svid("invalid", 10, &ca_kp).is_err());
         assert!(
             auth.issue_svid("spiffe://arbiter.internal/agent/agent-01", 10)
                 .is_ok()
@@ -3330,6 +4659,14 @@ mod tests {
         let long_key = [0xAA_u8; 80];
         let hmac_long = hmac_sha256(&long_key, b"test message");
         assert_ne!(hmac_long, [0_u8; 32]);
+
+        let (cc_ct, cc_tag) =
+            chacha20poly1305_aead_seal(&master_key, nonce, b"aad", plaintext).unwrap_or_default();
+        assert_eq!(
+            chacha20poly1305_aead_open(&master_key, nonce, b"aad", &cc_ct, &cc_tag),
+            Ok(plaintext.to_vec())
+        );
+        assert!(chacha20poly1305_aead_open(&wrong_key, nonce, b"aad", &cc_ct, &cc_tag).is_err());
 
         let mut sealed = seal_secret(secret_id, &master_key, nonce, plaintext);
         assert_ne!(sealed.ciphertext, plaintext);
@@ -3665,6 +5002,7 @@ mod tests {
         let client_uds_str = client_uds_path.to_string_lossy().into_owned();
         let _ = SpireMockAgentServer::bind(&client_uds_str, srv_auth).map(|mock_srv| {
             assert_eq!(mock_srv.poll_once(30), Ok(None));
+            let _ = mock_srv.listener.set_nonblocking(false);
             let _ = SpireUnixSocketClient::send_svid_request(
                 &client_uds_str,
                 "spiffe://arbiter.internal/node/a1",
@@ -3935,6 +5273,84 @@ mod tests {
         assert!(Ed25519Keypair::verify(&kp.public_key, b"stonith-fence-receipt-1", &sig).is_ok());
         assert!(Ed25519Keypair::verify(&kp.public_key, b"tampered", &sig).is_err());
 
+        // P256Keypair ECDSA-SHA256 sign & verify
+        let p256_kp = P256Keypair::from_seed([0x44_u8; 32]);
+        let p256_sig = p256_kp.sign_ecdsa_sha256(b"es256-jwt-message");
+        assert!(
+            P256Keypair::verify_ecdsa_sha256(&p256_kp.public_key, b"es256-jwt-message", &p256_sig)
+                .is_ok()
+        );
+        assert!(
+            P256Keypair::verify_ecdsa_sha256(&p256_kp.public_key, b"tampered", &p256_sig).is_err()
+        );
+        assert!(
+            P256Keypair::verify_ecdsa_sha256(&[0_u8; 32], b"es256-jwt-message", &p256_sig).is_err()
+        );
+        assert!(
+            P256Keypair::verify_ecdsa_sha256(
+                &p256_kp.public_key,
+                b"es256-jwt-message",
+                &[0_u8; 64]
+            )
+            .is_err()
+        );
+
+        // Real ITU-T X.509v3 ASN.1 DER & PEM issuance and parsing via rcgen + x509-cert
+        assert!(X509CertificatePem::issue_real_x509v3_der_and_pem("http://bad").is_err());
+        let (real_der, real_pem, real_key_pem) =
+            X509CertificatePem::issue_real_x509v3_der_and_pem("spiffe://arbiter.internal/node/a1")
+                .unwrap_or_default();
+        assert!(real_pem.contains("-----BEGIN CERTIFICATE-----"));
+        assert!(real_key_pem.contains("-----BEGIN PRIVATE KEY-----"));
+        let (real_spiffe, real_kind) =
+            X509CertificatePem::parse_real_x509v3_der_spiffe_san(&real_der, "arbiter.internal")
+                .unwrap_or_default();
+        assert_eq!(real_spiffe.as_str(), "spiffe://arbiter.internal/node/a1");
+        assert_eq!(
+            real_kind,
+            SpiffePrincipalKind::Node {
+                agent_id: AgentId::new("a1").unwrap_or_default()
+            }
+        );
+        assert!(
+            X509CertificatePem::parse_real_x509v3_der_spiffe_san(&real_der, "other.domain")
+                .is_err()
+        );
+        assert!(
+            X509CertificatePem::parse_real_x509v3_der_spiffe_san(&[0x30, 0x00], "arbiter.internal")
+                .is_err()
+        );
+
+        // SecretTmpfsStager stage_unsealed_secret & scrub_and_unlink_secret
+        let tmp_secret_dir = std::env::temp_dir().join("arbiter_test_secret_tmpfs_stager");
+        let _ = std::fs::remove_dir_all(&tmp_secret_dir);
+        let stager = SecretTmpfsStager::new(&tmp_secret_dir);
+        let sec_id = SecretId::new("db-secret-01").unwrap_or_default();
+        let m_key = [0x66_u8; 32];
+        let sec_context = b"role=prod;task=t1";
+        let gcm_env = seal_secret_aes256_gcm(
+            sec_id.clone(),
+            &m_key,
+            [0x01_u8; 12],
+            sec_context,
+            b"top-secret",
+        );
+        let staged_path = stager
+            .stage_unsealed_secret(&gcm_env, &m_key, sec_context)
+            .unwrap_or_default();
+        assert_eq!(
+            std::fs::read(&staged_path).unwrap_or_default(),
+            b"top-secret"
+        );
+        assert!(
+            stager
+                .stage_unsealed_secret(&gcm_env, &m_key, b"wrong-aad")
+                .is_err()
+        );
+        assert!(stager.scrub_and_unlink_secret(&sec_id).is_ok());
+        assert!(stager.scrub_and_unlink_secret(&sec_id).is_err());
+        let _ = std::fs::remove_dir_all(&tmp_secret_dir);
+
         // X25519SessionEstablisher commutative shared key derivation
         let binding = [0x77_u8; 32];
         let alice = X25519SessionEstablisher::new([0x01_u8; 32], binding);
@@ -4006,6 +5422,16 @@ mod tests {
             MesosAclAction::DrainAgent,
             MesosAclAction::MarkAgentGone,
             MesosAclAction::ViewExecutorSandbox,
+            MesosAclAction::ShutdownExecutor,
+            MesosAclAction::ResizeVolume,
+            MesosAclAction::GetQuota,
+            MesosAclAction::ViewTask,
+            MesosAclAction::ViewFramework,
+            MesosAclAction::ViewExecutor,
+            MesosAclAction::AccessSandbox,
+            MesosAclAction::LaunchNestedContainer,
+            MesosAclAction::AttachContainer,
+            MesosAclAction::PruneImages,
         ] {
             engine.add_rule(PolicyRule {
                 principal: "op-admin".to_owned(),
@@ -4020,6 +5446,7 @@ mod tests {
         let tid = TaskId::default();
         let aid = AgentId::default();
         let vid = arbiter_core::ids::VolumeId::default();
+        let cid = arbiter_core::ids::ContainerId::default();
         let res_spec = arbiter_core::workload::DynamicReservationSpec {
             operation_id: arbiter_core::ids::OperationId::default(),
             agent_id: aid.clone(),
@@ -4027,6 +5454,33 @@ mod tests {
             principal: "op-admin".to_owned(),
             resources: arbiter_core::resources::ResourceBundle::zero(),
         };
+        let mut wrong_principal_spec = res_spec.clone();
+        wrong_principal_spec.principal = "impostor".to_owned();
+        assert!(
+            engine
+                .authorize_wire_message(
+                    "op-admin",
+                    &role_prod,
+                    &arbiter_proto::WireMessage::OperatorCall(Box::new(
+                        arbiter_proto::OperatorCall::ReserveResources(wrong_principal_spec.clone()),
+                    )),
+                    &BTreeMap::new(),
+                )
+                .is_err()
+        );
+        assert!(
+            engine
+                .authorize_wire_message(
+                    "op-admin",
+                    &role_prod,
+                    &arbiter_proto::WireMessage::OperatorCall(Box::new(
+                        arbiter_proto::OperatorCall::UnreserveResources(wrong_principal_spec),
+                    )),
+                    &BTreeMap::new(),
+                )
+                .is_err()
+        );
+
         let messages = vec![
             arbiter_proto::WireMessage::SchedulerCall(Box::new(
                 arbiter_proto::SchedulerCall::Subscribe(
@@ -4045,6 +5499,13 @@ mod tests {
             )),
             arbiter_proto::WireMessage::SchedulerCall(Box::new(
                 arbiter_proto::SchedulerCall::Kill(fw_id.clone(), tid, None, None),
+            )),
+            arbiter_proto::WireMessage::SchedulerCall(Box::new(
+                arbiter_proto::SchedulerCall::Shutdown(
+                    fw_id.clone(),
+                    arbiter_core::ids::ExecutorId::default(),
+                    aid.clone(),
+                ),
             )),
             arbiter_proto::WireMessage::SchedulerCall(Box::new(
                 arbiter_proto::SchedulerCall::Revive(fw_id, Vec::new()),
@@ -4085,6 +5546,24 @@ mod tests {
                     },
                 )),
             ),
+            arbiter_proto::WireMessage::OperatorCall(Box::new(
+                arbiter_proto::OperatorCall::GetQuota,
+            )),
+            arbiter_proto::WireMessage::OperatorCall(Box::new(
+                arbiter_proto::OperatorCall::UpdateQuota(
+                    role_prod.clone(),
+                    arbiter_core::workload::Quota {
+                        id: arbiter_core::ids::QuotaId::default(),
+                        guaranteed_min: arbiter_core::resources::ResourceBundle::zero(),
+                        hard_max: arbiter_core::resources::ResourceBundle::zero(),
+                        allow_burst_borrowing: true,
+                        weight: arbiter_core::units::WeightBasisPoints::STANDARD,
+                    },
+                ),
+            )),
+            arbiter_proto::WireMessage::OperatorCall(Box::new(
+                arbiter_proto::OperatorCall::TeardownFramework(FrameworkId::default()),
+            )),
             arbiter_proto::WireMessage::OperatorCall(Box::new(
                 arbiter_proto::OperatorCall::SetQuota(
                     role_prod.clone(),
@@ -4127,13 +5606,67 @@ mod tests {
                 ),
             )),
             arbiter_proto::WireMessage::OperatorCall(Box::new(
-                arbiter_proto::OperatorCall::DestroyVolumes(aid.clone(), vec![vid]),
+                arbiter_proto::OperatorCall::GrowVolume(
+                    aid.clone(),
+                    vid.clone(),
+                    arbiter_core::units::Bytes::ZERO,
+                ),
+            )),
+            arbiter_proto::WireMessage::OperatorCall(Box::new(
+                arbiter_proto::OperatorCall::DestroyVolumes(aid.clone(), vec![vid.clone()]),
             )),
             arbiter_proto::WireMessage::OperatorCall(Box::new(
                 arbiter_proto::OperatorCall::StartMaintenance(vec![aid.clone()]),
             )),
             arbiter_proto::WireMessage::OperatorCall(Box::new(
+                arbiter_proto::OperatorCall::GetTasks,
+            )),
+            arbiter_proto::WireMessage::OperatorCall(Box::new(
+                arbiter_proto::OperatorCall::GetFrameworks,
+            )),
+            arbiter_proto::WireMessage::OperatorCall(Box::new(
+                arbiter_proto::OperatorCall::GetExecutors,
+            )),
+            arbiter_proto::WireMessage::OperatorCall(Box::new(
+                arbiter_proto::OperatorCall::ListFiles(arbiter_core::ids::SandboxPath::default()),
+            )),
+            arbiter_proto::WireMessage::OperatorCall(Box::new(
+                arbiter_proto::OperatorCall::RemoveQuota(role_prod.clone()),
+            )),
+            arbiter_proto::WireMessage::OperatorCall(Box::new(
+                arbiter_proto::OperatorCall::DeactivateAgent(aid.clone()),
+            )),
+            arbiter_proto::WireMessage::OperatorCall(Box::new(
+                arbiter_proto::OperatorCall::ReactivateAgent(aid.clone()),
+            )),
+            arbiter_proto::WireMessage::OperatorCall(Box::new(
+                arbiter_proto::OperatorCall::ShrinkVolume(
+                    aid.clone(),
+                    vid,
+                    arbiter_core::units::Bytes::ZERO,
+                ),
+            )),
+            arbiter_proto::WireMessage::OperatorCall(Box::new(
+                arbiter_proto::OperatorCall::ReadFile(
+                    arbiter_core::ids::SandboxPath::default(),
+                    arbiter_core::units::FileReadOffset::ZERO,
+                    arbiter_core::units::FileReadLength::ZERO,
+                ),
+            )),
+            arbiter_proto::WireMessage::OperatorCall(Box::new(
                 arbiter_proto::OperatorCall::GetHealth,
+            )),
+            arbiter_proto::WireMessage::AgentOperatorCall(Box::new(
+                arbiter_proto::AgentOperatorCall::GetContainers,
+            )),
+            arbiter_proto::WireMessage::AgentOperatorCall(Box::new(
+                arbiter_proto::AgentOperatorCall::WaitNestedContainer(cid.clone()),
+            )),
+            arbiter_proto::WireMessage::AgentOperatorCall(Box::new(
+                arbiter_proto::AgentOperatorCall::AttachContainerOutput(cid),
+            )),
+            arbiter_proto::WireMessage::AgentOperatorCall(Box::new(
+                arbiter_proto::AgentOperatorCall::PruneImages(Vec::new()),
             )),
             arbiter_proto::WireMessage::AgentHeartbeat(arbiter_proto::AgentHeartbeat {
                 agent_id: aid,
@@ -4146,6 +5679,1212 @@ mod tests {
                 engine.authorize_wire_message("op-admin", &role_prod, m, &BTreeMap::new()),
                 Ok(Decision::Allow)
             );
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+    fn test_x509_der_certificate_chain_and_mtls_authenticated_stream() {
+        let root_kp = Ed25519Keypair::from_seed([0xA1; 32]);
+        let inter_kp = Ed25519Keypair::from_seed([0xB2; 32]);
+        assert!(
+            X509DerCertificateChain::build_signed_chain(
+                "bad/domain",
+                "spiffe://arbiter.internal/node/a1",
+                10,
+                100,
+                &root_kp,
+                &inter_kp,
+            )
+            .is_err()
+        );
+        assert!(
+            X509DerCertificateChain::build_signed_chain(
+                "arbiter.internal",
+                "http://bad",
+                10,
+                100,
+                &root_kp,
+                &inter_kp,
+            )
+            .is_err()
+        );
+        assert!(
+            X509DerCertificateChain::build_signed_chain(
+                "arbiter.internal",
+                "spiffe://arbiter.internal/node/a1",
+                100,
+                50,
+                &root_kp,
+                &inter_kp,
+            )
+            .is_err()
+        );
+
+        let chain = X509DerCertificateChain::build_signed_chain(
+            "arbiter.internal",
+            "spiffe://arbiter.internal/node/a1",
+            10,
+            100,
+            &root_kp,
+            &inter_kp,
+        )
+        .unwrap_or_default();
+        let (_, kind) = chain
+            .verify_chain("arbiter.internal", &root_kp.public_key, 50)
+            .unwrap_or_default();
+        assert_eq!(
+            kind,
+            SpiffePrincipalKind::Node {
+                agent_id: AgentId::new("a1").unwrap_or_default()
+            }
+        );
+
+        // Error branches on verify_chain
+        assert!(
+            chain
+                .verify_chain("arbiter.internal", &[0x99; 32], 50)
+                .is_err()
+        );
+        assert!(
+            chain
+                .verify_chain("arbiter.internal", &root_kp.public_key, 500)
+                .is_err()
+        );
+
+        let mut bad_inter_sig = chain.clone();
+        bad_inter_sig.intermediate_sig = vec![0; 64];
+        assert!(
+            bad_inter_sig
+                .verify_chain("arbiter.internal", &root_kp.public_key, 50)
+                .is_err()
+        );
+
+        let mut bad_inter_der = chain.clone();
+        let bad_inter_cert = X509CertificatePem::issue_pem(
+            "spiffe://arbiter.internal/master/inter",
+            40,
+            60,
+            &root_kp.public_key,
+        )
+        .unwrap_or_default();
+        bad_inter_der.intermediate_der = bad_inter_cert.encode_asn1_der();
+        bad_inter_der.intermediate_sig = root_kp.sign(&bad_inter_der.intermediate_der).to_vec();
+        assert!(
+            bad_inter_der
+                .verify_chain("arbiter.internal", &root_kp.public_key, 80)
+                .is_err()
+        );
+
+        let mut bad_leaf_sig = chain.clone();
+        bad_leaf_sig.leaf_sig = vec![0; 64];
+        assert!(
+            bad_leaf_sig
+                .verify_chain("arbiter.internal", &root_kp.public_key, 50)
+                .is_err()
+        );
+
+        let mut bad_leaf_der = chain;
+        let bad_leaf_cert = X509CertificatePem::issue_pem(
+            "spiffe://arbiter.internal/node/a1",
+            40,
+            60,
+            &inter_kp.public_key,
+        )
+        .unwrap_or_default();
+        bad_leaf_der.leaf_der = bad_leaf_cert.encode_asn1_der();
+        bad_leaf_der.leaf_sig = inter_kp.sign(&bad_leaf_der.leaf_der).to_vec();
+        assert!(
+            bad_leaf_der
+                .verify_chain("arbiter.internal", &root_kp.public_key, 80)
+                .is_err()
+        );
+
+        // MtlsAuthenticatedStream mutual handshake, record seal/open, and in-place SVID rotation
+        let auth = SvidAuthority::new("arbiter.internal", [0x33; 32], 100);
+        let bundle = TrustBundleHotReloader::new(auth.clone());
+        let client_svid = auth
+            .issue_svid("spiffe://arbiter.internal/node/a1", 10)
+            .unwrap_or_default();
+        let server_svid = auth
+            .issue_svid("spiffe://arbiter.internal/master/m1", 10)
+            .unwrap_or_default();
+        let binding = [0x44; 32];
+        let cli_eph = X25519SessionEstablisher::new([0x01; 32], binding);
+        let srv_eph = X25519SessionEstablisher::new([0x02; 32], binding);
+        let c_hello = MtlsHandshakeMessage {
+            svid: client_svid.clone(),
+            x25519_public: cli_eph.local_public,
+            rotation_epoch: 1,
+        };
+        let s_hello = MtlsHandshakeMessage {
+            svid: server_svid.clone(),
+            x25519_public: srv_eph.local_public,
+            rotation_epoch: 1,
+        };
+        let (mut cli_stream, mut srv_stream) = MtlsAuthenticatedStream::establish_mutual_handshake(
+            &c_hello, &cli_eph, &s_hello, &srv_eph, &bundle, 20,
+        )
+        .unwrap_or_default();
+        assert_eq!(cli_stream.traffic_key, srv_stream.traffic_key);
+        let rec = cli_stream.seal_record(b"hello-mtls");
+        assert_eq!(srv_stream.open_record(&rec), Ok(b"hello-mtls".to_vec()));
+
+        // Handshake failure branches
+        assert!(
+            MtlsAuthenticatedStream::establish_mutual_handshake(
+                &c_hello, &cli_eph, &s_hello, &srv_eph, &bundle, 500
+            )
+            .is_err()
+        );
+        let mut s_expired = s_hello.clone();
+        s_expired.svid.expires_at_tick = 15;
+        assert!(
+            MtlsAuthenticatedStream::establish_mutual_handshake(
+                &c_hello, &cli_eph, &s_expired, &srv_eph, &bundle, 20
+            )
+            .is_err()
+        );
+        let c_zero_pub = MtlsHandshakeMessage {
+            svid: client_svid.clone(),
+            x25519_public: [0; 32],
+            rotation_epoch: 1,
+        };
+        assert!(
+            MtlsAuthenticatedStream::establish_mutual_handshake(
+                &c_zero_pub,
+                &cli_eph,
+                &s_hello,
+                &srv_eph,
+                &bundle,
+                20
+            )
+            .is_err()
+        );
+        let s_zero_pub = MtlsHandshakeMessage {
+            svid: server_svid.clone(),
+            x25519_public: [0; 32],
+            rotation_epoch: 1,
+        };
+        assert!(
+            MtlsAuthenticatedStream::establish_mutual_handshake(
+                &c_hello,
+                &cli_eph,
+                &s_zero_pub,
+                &srv_eph,
+                &bundle,
+                20
+            )
+            .is_err()
+        );
+
+        // Hitless SVID rotation without dropping active stream
+        let new_cli_svid = auth.rotate_svid(&client_svid, 50).unwrap_or_default();
+        let new_srv_svid = auth.rotate_svid(&server_svid, 50).unwrap_or_default();
+        assert_eq!(
+            cli_stream.rotate_svids_in_place(
+                new_cli_svid.clone(),
+                new_srv_svid.clone(),
+                &bundle,
+                60
+            ),
+            Ok(2)
+        );
+        assert_eq!(
+            srv_stream.rotate_svids_in_place(new_srv_svid, new_cli_svid, &bundle, 60),
+            Ok(2)
+        );
+        let rec2 = cli_stream.seal_record(b"post-rotation");
+        assert_eq!(srv_stream.open_record(&rec2), Ok(b"post-rotation".to_vec()));
+        assert!(
+            cli_stream
+                .rotate_svids_in_place(client_svid, server_svid, &bundle, 500)
+                .is_err()
+        );
+        assert!(
+            cli_stream
+                .rotate_svids_in_place(cli_stream.local_svid.clone(), s_expired.svid, &bundle, 60)
+                .is_err()
+        );
+    }
+}
+
+/// FIPS 197 / NIST SP 800-38D AES forward S-Box (`256` bytes).
+const AES_SBOX: [u8; 256] = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+];
+
+/// FIPS 197 AES round constants (`Rcon[1..=7]`).
+const AES_RCON: [u8; 7] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40];
+
+/// Looks up a byte in [`AES_SBOX`] without direct slice indexing.
+///
+/// # Arguments
+///
+/// * `byte` - Input byte.
+///
+/// # Returns
+///
+/// Substituted byte from `AES_SBOX`.
+fn aes_sbox_lookup(byte: u8) -> u8 {
+    AES_SBOX.get(usize::from(byte)).copied().unwrap_or(0)
+}
+
+/// Multiplies `byte` by `2` (`xtime`) in the Rijndael finite field $GF(2^8)$ modulo $x^8 + x^4 + x^3 + x + 1$.
+///
+/// # Arguments
+///
+/// * `byte` - Field element in $GF(2^8)$.
+///
+/// # Returns
+///
+/// Product `2 * byte` in $GF(2^8)$.
+const fn aes_xtime(byte: u8) -> u8 {
+    let hi = byte >> 7;
+    (byte << 1) ^ (hi.wrapping_mul(0x1b))
+}
+
+/// Expands a 32-byte (`256-bit`) AES-256 key into 15 16-byte round keys (`240` bytes total) per FIPS 197 §5.2.
+///
+/// # Arguments
+///
+/// * `key` - 32-byte AES-256 secret key.
+///
+/// # Returns
+///
+/// Array of 15 16-byte round keys.
+pub fn aes256_expand_key(key: &[u8; 32]) -> [[u8; 16]; 15] {
+    let mut words = [[0_u8; 4]; 60];
+    for (slot, chunk) in words.iter_mut().zip(key.chunks_exact(4)) {
+        slot.copy_from_slice(chunk);
+    }
+    for idx in 8_usize..60_usize {
+        let mut temp = words.get(idx.saturating_sub(1)).copied().unwrap_or([0; 4]);
+        if idx % 8 == 0 {
+            let rcon_byte = AES_RCON
+                .get((idx / 8).saturating_sub(1))
+                .copied()
+                .unwrap_or(0);
+            temp = [
+                aes_sbox_lookup(temp.get(1).copied().unwrap_or(0)) ^ rcon_byte,
+                aes_sbox_lookup(temp.get(2).copied().unwrap_or(0)),
+                aes_sbox_lookup(temp.get(3).copied().unwrap_or(0)),
+                aes_sbox_lookup(temp.first().copied().unwrap_or(0)),
+            ];
+        } else if idx % 8 == 4 {
+            temp = [
+                aes_sbox_lookup(temp.first().copied().unwrap_or(0)),
+                aes_sbox_lookup(temp.get(1).copied().unwrap_or(0)),
+                aes_sbox_lookup(temp.get(2).copied().unwrap_or(0)),
+                aes_sbox_lookup(temp.get(3).copied().unwrap_or(0)),
+            ];
+        }
+        let prev = words.get(idx.saturating_sub(8)).copied().unwrap_or([0; 4]);
+        let next_word = [
+            prev.first().copied().unwrap_or(0) ^ temp.first().copied().unwrap_or(0),
+            prev.get(1).copied().unwrap_or(0) ^ temp.get(1).copied().unwrap_or(0),
+            prev.get(2).copied().unwrap_or(0) ^ temp.get(2).copied().unwrap_or(0),
+            prev.get(3).copied().unwrap_or(0) ^ temp.get(3).copied().unwrap_or(0),
+        ];
+        for slot in words.iter_mut().skip(idx).take(1) {
+            *slot = next_word;
+        }
+    }
+    let mut round_keys = [[0_u8; 16]; 15];
+    for (rk_idx, rk) in round_keys.iter_mut().enumerate() {
+        let base = rk_idx.saturating_mul(4);
+        for (w_offset, dst) in rk.chunks_exact_mut(4).enumerate() {
+            let word = words
+                .get(base.saturating_add(w_offset))
+                .copied()
+                .unwrap_or([0; 4]);
+            dst.copy_from_slice(&word);
+        }
+    }
+    round_keys
+}
+
+/// Encrypts a single 16-byte (`128-bit`) block using FIPS 197 14-round `AES-256`.
+///
+/// # Arguments
+///
+/// * `block` - 16-byte input block.
+/// * `round_keys` - Expanded 15-round key schedule from [`aes256_expand_key`].
+///
+/// # Returns
+///
+/// 16-byte encrypted ciphertext block.
+pub fn aes256_encrypt_block(block: &[u8; 16], round_keys: &[[u8; 16]; 15]) -> [u8; 16] {
+    let mut state = *block;
+    let rk0 = round_keys.first().copied().unwrap_or([0; 16]);
+    for (s, &k) in state.iter_mut().zip(rk0.iter()) {
+        *s ^= k;
+    }
+
+    for round in 1_usize..=14_usize {
+        // SubBytes
+        for s in &mut state {
+            *s = aes_sbox_lookup(*s);
+        }
+        // ShiftRows (column-major state indices:
+        // row 0: 0, 4, 8, 12; row 1: 1, 5, 9, 13; row 2: 2, 6, 10, 14; row 3: 3, 7, 11, 15)
+        let s = state;
+        state = [
+            s.first().copied().unwrap_or(0),
+            s.get(5).copied().unwrap_or(0),
+            s.get(10).copied().unwrap_or(0),
+            s.get(15).copied().unwrap_or(0),
+            s.get(4).copied().unwrap_or(0),
+            s.get(9).copied().unwrap_or(0),
+            s.get(14).copied().unwrap_or(0),
+            s.get(3).copied().unwrap_or(0),
+            s.get(8).copied().unwrap_or(0),
+            s.get(13).copied().unwrap_or(0),
+            s.get(2).copied().unwrap_or(0),
+            s.get(7).copied().unwrap_or(0),
+            s.get(12).copied().unwrap_or(0),
+            s.get(1).copied().unwrap_or(0),
+            s.get(6).copied().unwrap_or(0),
+            s.get(11).copied().unwrap_or(0),
+        ];
+        // MixColumns on rounds 1..=13
+        if round < 14 {
+            for col in state.chunks_exact_mut(4) {
+                let a0 = col.first().copied().unwrap_or(0);
+                let a1 = col.get(1).copied().unwrap_or(0);
+                let a2 = col.get(2).copied().unwrap_or(0);
+                let a3 = col.get(3).copied().unwrap_or(0);
+                let t = a0 ^ a1 ^ a2 ^ a3;
+                let c0 = a0 ^ t ^ aes_xtime(a0 ^ a1);
+                let c1 = a1 ^ t ^ aes_xtime(a1 ^ a2);
+                let c2 = a2 ^ t ^ aes_xtime(a2 ^ a3);
+                let c3 = a3 ^ t ^ aes_xtime(a3 ^ a0);
+                col.copy_from_slice(&[c0, c1, c2, c3]);
+            }
+        }
+        // AddRoundKey
+        let rk = round_keys.get(round).copied().unwrap_or([0; 16]);
+        for (st, &k) in state.iter_mut().zip(rk.iter()) {
+            *st ^= k;
+        }
+    }
+    state
+}
+
+/// Multiplies two 128-bit elements `x` and `y` in the NIST SP 800-38D §6.3 `GHASH` Galois field
+/// $GF(2^{128})$ modulo $1 + \alpha + \alpha^2 + \alpha^7 + \alpha^{128}$ (`R = 0xE100...00`).
+///
+/// # Arguments
+///
+/// * `x` - First 16-byte big-endian $GF(2^{128})$ element.
+/// * `y` - Second 16-byte big-endian $GF(2^{128})$ element.
+///
+/// # Returns
+///
+/// 16-byte product $x \cdot y$ in $GF(2^{128})$.
+pub fn ghash_gf128_mul(x: &[u8; 16], y: &[u8; 16]) -> [u8; 16] {
+    let x_val = u128::from_be_bytes(*x);
+    let mut v = u128::from_be_bytes(*y);
+    let mut z = 0_u128;
+    let r_poly: u128 = 0xe100_0000_0000_0000_0000_0000_0000_0000;
+    for bit_idx in 0..128_u32 {
+        let shift = 127_u32.saturating_sub(bit_idx);
+        let bit = (x_val >> shift) & 1;
+        let mask = 0_u128.wrapping_sub(bit);
+        z ^= v & mask;
+        let lsb = v & 1;
+        let lsb_mask = 0_u128.wrapping_sub(lsb);
+        v = (v >> 1) ^ (r_poly & lsb_mask);
+    }
+    z.to_be_bytes()
+}
+
+/// Computes the NIST SP 800-38D §6.4 `GHASH` authentication digest over `(aad, ciphertext)` under hash subkey `h`.
+///
+/// # Arguments
+///
+/// * `h` - 16-byte hash subkey (`AES-256(K, 0^128)`).
+/// * `aad` - Associated data slice.
+/// * `ciphertext` - Ciphertext byte slice.
+///
+/// # Returns
+///
+/// 16-byte `GHASH` output block.
+pub fn ghash_digest(h: &[u8; 16], aad: &[u8], ciphertext: &[u8]) -> [u8; 16] {
+    let mut y = [0_u8; 16];
+    for chunk in aad.chunks(16) {
+        for (dst, &src) in y.iter_mut().zip(chunk.iter()) {
+            *dst ^= src;
+        }
+        y = ghash_gf128_mul(&y, h);
+    }
+    for chunk in ciphertext.chunks(16) {
+        for (dst, &src) in y.iter_mut().zip(chunk.iter()) {
+            *dst ^= src;
+        }
+        y = ghash_gf128_mul(&y, h);
+    }
+    let aad_bits = (aad.len() as u64).saturating_mul(8);
+    let ct_bits = (ciphertext.len() as u64).saturating_mul(8);
+    let len_block = ((u128::from(aad_bits) << 64) | u128::from(ct_bits)).to_be_bytes();
+    for (dst, &src) in y.iter_mut().zip(len_block.iter()) {
+        *dst ^= src;
+    }
+    ghash_gf128_mul(&y, h)
+}
+
+/// Builds a 16-byte NIST SP 800-38D GCM counter block `nonce (12B) || counter_be (4B)`.
+///
+/// # Arguments
+///
+/// * `nonce` - 12-byte GCM IV.
+/// * `counter` - 32-bit block counter.
+///
+/// # Returns
+///
+/// 16-byte counter block.
+fn build_gcm_counter_block(nonce: &[u8; 12], counter: u32) -> [u8; 16] {
+    let mut cb = [0_u8; 16];
+    let ctr_bytes = counter.to_be_bytes();
+    for (dst, &src) in cb.iter_mut().zip(nonce.iter().chain(ctr_bytes.iter())) {
+        *dst = src;
+    }
+    cb
+}
+
+/// Generates the NIST SP 800-38D `GCTR` keystream for `(round_keys, nonce)` starting at counter `2`
+/// and XORs it with `input`.
+///
+/// # Arguments
+///
+/// * `round_keys` - Expanded `AES-256` round keys.
+/// * `nonce` - 12-byte (`96-bit`) GCM IV/nonce.
+/// * `input` - Plaintext or ciphertext slice.
+///
+/// # Returns
+///
+/// Output byte vector.
+fn aes256_gcm_gctr(round_keys: &[[u8; 16]; 15], nonce: &[u8; 12], input: &[u8]) -> Vec<u8> {
+    let mut output = Vec::with_capacity(input.len());
+    for (block_idx, chunk) in input.chunks(16).enumerate() {
+        let ctr = u32::try_from(block_idx).unwrap_or(0).wrapping_add(2);
+        let cb = build_gcm_counter_block(nonce, ctr);
+        let ks = aes256_encrypt_block(&cb, round_keys);
+        for (&in_b, &k_b) in chunk.iter().zip(ks.iter()) {
+            output.push(in_b ^ k_b);
+        }
+    }
+    output
+}
+
+/// Encrypts `plaintext` and authenticates `aad` using NIST SP 800-38D `AES-256-GCM` with a 96-bit `nonce`,
+/// returning `(ciphertext, 16-byte gcm_tag)`.
+///
+/// # Arguments
+///
+/// * `key` - 32-byte `AES-256` secret key.
+/// * `nonce` - 12-byte (`96-bit`) initialization vector.
+/// * `aad` - Additional authenticated data (`AAD`).
+/// * `plaintext` - Plaintext payload to encrypt.
+///
+/// # Returns
+///
+/// Tuple `(ciphertext_bytes, 16-byte_tag)`.
+pub fn aes256_gcm_seal(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> (Vec<u8>, [u8; 16]) {
+    let rks = aes256_expand_key(key);
+    let h = aes256_encrypt_block(&[0_u8; 16], &rks);
+    let ciphertext = aes256_gcm_gctr(&rks, nonce, plaintext);
+    let ghash = ghash_digest(&h, aad, &ciphertext);
+    let j0 = build_gcm_counter_block(nonce, 1);
+    let ek_j0 = aes256_encrypt_block(&j0, &rks);
+    let mut tag = [0_u8; 16];
+    for ((t, &g), &e) in tag.iter_mut().zip(ghash.iter()).zip(ek_j0.iter()) {
+        *t = g ^ e;
+    }
+    (ciphertext, tag)
+}
+
+/// Verifies `tag` in constant time and decrypts `ciphertext` using NIST SP 800-38D `AES-256-GCM`.
+///
+/// # Arguments
+///
+/// * `key` - 32-byte `AES-256` secret key.
+/// * `nonce` - 12-byte (`96-bit`) initialization vector.
+/// * `aad` - Additional authenticated data (`AAD`).
+/// * `ciphertext` - Encrypted bytes.
+/// * `tag` - Expected 16-byte GCM authentication tag.
+///
+/// # Returns
+///
+/// Authenticated plaintext byte vector.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::AeadCipher`] if the 16-byte authentication tag does not match.
+pub fn aes256_gcm_open(
+    key: &[u8; 32],
+    nonce: &[u8; 12],
+    aad: &[u8],
+    ciphertext: &[u8],
+    tag: &[u8; 16],
+) -> ArbiterResult<Vec<u8>> {
+    let rks = aes256_expand_key(key);
+    let h = aes256_encrypt_block(&[0_u8; 16], &rks);
+    let ghash = ghash_digest(&h, aad, ciphertext);
+    let j0 = build_gcm_counter_block(nonce, 1);
+    let ek_j0 = aes256_encrypt_block(&j0, &rks);
+    let mut diff = 0_u8;
+    for ((&expected_g, &expected_e), &actual_t) in ghash.iter().zip(ek_j0.iter()).zip(tag.iter()) {
+        diff |= (expected_g ^ expected_e) ^ actual_t;
+    }
+    if diff != 0 {
+        return Err(arbiter_core::error::AeadCipherError::new(
+            "AES-256-GCM",
+            "GCM authentication tag mismatch (tampered ciphertext or AAD)",
+        )
+        .into());
+    }
+    Ok(aes256_gcm_gctr(&rks, nonce, ciphertext))
+}
+
+/// Performs RFC 5869 `HKDF-Expand` over `SHA-256` to derive `out_len` bytes (`<= 8160`) of output
+/// keying material (`OKM`) from a 32-byte pseudorandom key `prk` and context `info`.
+///
+/// # Arguments
+///
+/// * `prk` - 32-byte pseudorandom key from `HKDF-Extract`.
+/// * `info` - Context and application specific information.
+/// * `out_len` - Desired output length in bytes (`1..=8160`).
+///
+/// # Returns
+///
+/// Derived output keying material vector of length `out_len`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::KeyExchange`] if `out_len == 0` or `out_len > 255 * 32` (`8160`).
+pub fn hkdf_expand_multi_block(
+    prk: &[u8; 32],
+    info: &[u8],
+    out_len: usize,
+) -> ArbiterResult<Vec<u8>> {
+    if out_len == 0 || out_len > 255 * 32 {
+        return Err(arbiter_core::error::KeyExchangeError::new(
+            "HKDF-SHA256",
+            "requested HKDF-Expand output length must be in 1..=8160 bytes",
+        )
+        .into());
+    }
+    let blocks = out_len.div_ceil(32);
+    let mut okm = Vec::with_capacity(blocks.saturating_mul(32));
+    let mut prev_t = Vec::new();
+    for idx in 1..=blocks {
+        let mut msg = Vec::with_capacity(prev_t.len() + info.len() + 1);
+        msg.extend_from_slice(&prev_t);
+        msg.extend_from_slice(info);
+        msg.push(u8::try_from(idx).unwrap_or(1));
+        let t_i = hmac_sha256(prk, &msg);
+        prev_t = t_i.to_vec();
+        okm.extend_from_slice(&t_i);
+    }
+    okm.truncate(out_len);
+    Ok(okm)
+}
+
+/// Performs RFC 8446 Section 7.1 TLS 1.3 `HKDF-Expand-Label(Secret, Label, Context, Length)`
+/// using the canonical `"tls13 "` prefix.
+///
+/// # Arguments
+///
+/// * `secret` - 32-byte TLS 1.3 traffic or handshake secret.
+/// * `label` - ASCII label without `"tls13 "` prefix (e.g., `"quic key"`, `"quic iv"`, `"quic hp"`).
+/// * `context` - Transcript hash or context bytes.
+/// * `out_len` - Output length in bytes (`1..=255`).
+///
+/// # Returns
+///
+/// Derived TLS 1.3 key or IV bytes.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::KeyExchange`] if `out_len == 0` or `out_len > 255`.
+pub fn tls13_hkdf_expand_label(
+    secret: &[u8; 32],
+    label: &[u8],
+    context: &[u8],
+    out_len: usize,
+) -> ArbiterResult<Vec<u8>> {
+    if out_len == 0 || out_len > 255 {
+        return Err(arbiter_core::error::KeyExchangeError::new(
+            "TLS1.3-HKDF-Expand-Label",
+            "TLS 1.3 HKDF-Expand-Label length must be in 1..=255",
+        )
+        .into());
+    }
+    let full_label_len = 6_usize.saturating_add(label.len());
+    let mut hkdf_label = Vec::with_capacity(2 + 1 + full_label_len + 1 + context.len());
+    let len_u16 = u16::try_from(out_len).unwrap_or(0);
+    hkdf_label.extend_from_slice(&len_u16.to_be_bytes());
+    hkdf_label.push(u8::try_from(full_label_len).unwrap_or(0));
+    hkdf_label.extend_from_slice(b"tls13 ");
+    hkdf_label.extend_from_slice(label);
+    hkdf_label.push(u8::try_from(context.len()).unwrap_or(0));
+    hkdf_label.extend_from_slice(context);
+    hkdf_expand_multi_block(secret, &hkdf_label, out_len)
+}
+
+/// Element of the Curve25519 prime field $\mathbb{F}_p$ where $p = 2^{255} - 19$, represented as
+/// 5 radix-$2^{51}$ limbs (`u64`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Fe25519 {
+    /// 5 limbs in radix $2^{51}$.
+    limbs: [u64; 5],
+}
+
+impl Fe25519 {
+    /// Multiplicative identity `1` in $\mathbb{F}_{2^{255}-19}$.
+    const ONE: Self = Self {
+        limbs: [1, 0, 0, 0, 0],
+    };
+
+    /// Additive identity `0` in $\mathbb{F}_{2^{255}-19}$.
+    const ZERO: Self = Self {
+        limbs: [0, 0, 0, 0, 0],
+    };
+
+    /// Curve25519 Montgomery constant $a_{24} = (486662 - 2) / 4 = 121665$ per RFC 7748 §5.
+    const A24: Self = Self {
+        limbs: [121_665, 0, 0, 0, 0],
+    };
+
+    /// Decodes a 32-byte little-endian RFC 7748 `u`-coordinate into a field element (clearing bit 255).
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - 32-byte little-endian coordinate.
+    ///
+    /// # Returns
+    ///
+    /// Decoded [`Fe25519`].
+    fn from_bytes(bytes: &[u8; 32]) -> Self {
+        let mut clean = *bytes;
+        for b31 in clean.iter_mut().skip(31) {
+            *b31 &= 0x7f;
+        }
+        let load64 = |offset: usize| -> u64 {
+            let mut b8 = [0_u8; 8];
+            for (dst, &src) in b8.iter_mut().zip(clean.iter().skip(offset).take(8)) {
+                *dst = src;
+            }
+            u64::from_le_bytes(b8)
+        };
+        let mask51 = (1_u64 << 51) - 1;
+        let l0 = load64(0) & mask51;
+        let l1 = (load64(6) >> 3) & mask51;
+        let l2 = (load64(12) >> 6) & mask51;
+        let l3 = (load64(19) >> 1) & mask51;
+        let l4 = (load64(24) >> 12) & mask51;
+        Self {
+            limbs: [l0, l1, l2, l3, l4],
+        }
+    }
+
+    /// Reduces and serializes this field element into a canonical 32-byte little-endian array modulo $2^{255}-19$.
+    ///
+    /// # Returns
+    ///
+    /// Canonical 32-byte little-endian encoding.
+    fn to_bytes(self) -> [u8; 32] {
+        let mask51 = (1_u64 << 51) - 1;
+        let [mut t0, mut t1, mut t2, mut t3, mut t4] = self.limbs;
+        for _ in 0..2 {
+            let c0 = t0 >> 51;
+            t0 &= mask51;
+            t1 = t1.wrapping_add(c0);
+            let c1 = t1 >> 51;
+            t1 &= mask51;
+            t2 = t2.wrapping_add(c1);
+            let c2 = t2 >> 51;
+            t2 &= mask51;
+            t3 = t3.wrapping_add(c2);
+            let c3 = t3 >> 51;
+            t3 &= mask51;
+            t4 = t4.wrapping_add(c3);
+            let c4 = t4 >> 51;
+            t4 &= mask51;
+            t0 = t0.wrapping_add(c4.wrapping_mul(19));
+        }
+
+        // Subtract p = 2^255 - 19 conditionally
+        let mut q = t0.wrapping_add(19) >> 51;
+        q = (t1.wrapping_add(q)) >> 51;
+        q = (t2.wrapping_add(q)) >> 51;
+        q = (t3.wrapping_add(q)) >> 51;
+        q = (t4.wrapping_add(q)) >> 51;
+
+        t0 = t0.wrapping_add(q.wrapping_mul(19));
+        let c0 = t0 >> 51;
+        t0 &= mask51;
+        t1 = t1.wrapping_add(c0);
+        let c1 = t1 >> 51;
+        t1 &= mask51;
+        t2 = t2.wrapping_add(c1);
+        let c2 = t2 >> 51;
+        t2 &= mask51;
+        t3 = t3.wrapping_add(c2);
+        let c3 = t3 >> 51;
+        t3 &= mask51;
+        t4 = t4.wrapping_add(c3) & mask51;
+
+        let mut out_vec = Vec::with_capacity(32);
+        let mut acc = 0_u128;
+        let mut acc_bits = 0_u32;
+        for limb in [t0, t1, t2, t3, t4] {
+            acc |= u128::from(limb) << acc_bits;
+            acc_bits = acc_bits.saturating_add(51);
+            while acc_bits >= 8 {
+                out_vec.push((acc & 0xFF) as u8);
+                acc >>= 8;
+                acc_bits = acc_bits.saturating_sub(8);
+            }
+        }
+        out_vec.push((acc & 0x7F) as u8);
+        let mut out = [0_u8; 32];
+        for (dst, &src) in out.iter_mut().zip(out_vec.iter()) {
+            *dst = src;
+        }
+        out
+    }
+
+    /// Adds two field elements in $\mathbb{F}_{2^{255}-19}$.
+    fn add(self, rhs: Self) -> Self {
+        let [a0, a1, a2, a3, a4] = self.limbs;
+        let [b0, b1, b2, b3, b4] = rhs.limbs;
+        Self {
+            limbs: [
+                a0.wrapping_add(b0),
+                a1.wrapping_add(b1),
+                a2.wrapping_add(b2),
+                a3.wrapping_add(b3),
+                a4.wrapping_add(b4),
+            ],
+        }
+    }
+
+    /// Subtracts `rhs` from `self` modulo $2^{255}-19$ using $2p$ bias to avoid underflow.
+    fn sub(self, rhs: Self) -> Self {
+        let [a0, a1, a2, a3, a4] = self.limbs;
+        let [b0, b1, b2, b3, b4] = rhs.limbs;
+        let bias0: u64 = 0x000f_ffff_ffff_ffda;
+        let bias_rest: u64 = 0x000f_ffff_ffff_fffe;
+        let mask51 = (1_u64 << 51) - 1;
+        let mut d0 = a0.wrapping_add(bias0).wrapping_sub(b0);
+        let mut d1 = a1.wrapping_add(bias_rest).wrapping_sub(b1);
+        let mut d2 = a2.wrapping_add(bias_rest).wrapping_sub(b2);
+        let mut d3 = a3.wrapping_add(bias_rest).wrapping_sub(b3);
+        let mut d4 = a4.wrapping_add(bias_rest).wrapping_sub(b4);
+
+        let c0 = d0 >> 51;
+        d0 &= mask51;
+        d1 = d1.wrapping_add(c0);
+        let c1 = d1 >> 51;
+        d1 &= mask51;
+        d2 = d2.wrapping_add(c1);
+        let c2 = d2 >> 51;
+        d2 &= mask51;
+        d3 = d3.wrapping_add(c2);
+        let c3 = d3 >> 51;
+        d3 &= mask51;
+        d4 = d4.wrapping_add(c3);
+        let c4 = d4 >> 51;
+        d4 &= mask51;
+        d0 = d0.wrapping_add(c4.wrapping_mul(19));
+        Self {
+            limbs: [d0, d1, d2, d3, d4],
+        }
+    }
+
+    /// Multiplies two field elements modulo $2^{255}-19$ using 128-bit limb products.
+    fn mul(self, rhs: Self) -> Self {
+        let [a0, a1, a2, a3, a4] = self.limbs;
+        let [b0, b1, b2, b3, b4] = rhs.limbs;
+        let b1_19 = u128::from(b1).wrapping_mul(19);
+        let b2_19 = u128::from(b2).wrapping_mul(19);
+        let b3_19 = u128::from(b3).wrapping_mul(19);
+        let b4_19 = u128::from(b4).wrapping_mul(19);
+
+        let m0 = u128::from(a0).wrapping_mul(u128::from(b0))
+            + u128::from(a1).wrapping_mul(b4_19)
+            + u128::from(a2).wrapping_mul(b3_19)
+            + u128::from(a3).wrapping_mul(b2_19)
+            + u128::from(a4).wrapping_mul(b1_19);
+        let mut m1 = u128::from(a0).wrapping_mul(u128::from(b1))
+            + u128::from(a1).wrapping_mul(u128::from(b0))
+            + u128::from(a2).wrapping_mul(b4_19)
+            + u128::from(a3).wrapping_mul(b3_19)
+            + u128::from(a4).wrapping_mul(b2_19);
+        let mut m2 = u128::from(a0).wrapping_mul(u128::from(b2))
+            + u128::from(a1).wrapping_mul(u128::from(b1))
+            + u128::from(a2).wrapping_mul(u128::from(b0))
+            + u128::from(a3).wrapping_mul(b4_19)
+            + u128::from(a4).wrapping_mul(b3_19);
+        let mut m3 = u128::from(a0).wrapping_mul(u128::from(b3))
+            + u128::from(a1).wrapping_mul(u128::from(b2))
+            + u128::from(a2).wrapping_mul(u128::from(b1))
+            + u128::from(a3).wrapping_mul(u128::from(b0))
+            + u128::from(a4).wrapping_mul(b4_19);
+        let mut m4 = u128::from(a0).wrapping_mul(u128::from(b4))
+            + u128::from(a1).wrapping_mul(u128::from(b3))
+            + u128::from(a2).wrapping_mul(u128::from(b2))
+            + u128::from(a3).wrapping_mul(u128::from(b1))
+            + u128::from(a4).wrapping_mul(u128::from(b0));
+
+        let mask51 = (1_u128 << 51) - 1;
+        let mut r0 = u64::try_from(m0 & mask51).unwrap_or(0);
+        m1 += m0 >> 51;
+        let mut r1 = u64::try_from(m1 & mask51).unwrap_or(0);
+        m2 += m1 >> 51;
+        let r2 = u64::try_from(m2 & mask51).unwrap_or(0);
+        m3 += m2 >> 51;
+        let r3 = u64::try_from(m3 & mask51).unwrap_or(0);
+        m4 += m3 >> 51;
+        let r4 = u64::try_from(m4 & mask51).unwrap_or(0);
+        let carry = u64::try_from(m4 >> 51).unwrap_or(0);
+        r0 = r0.wrapping_add(carry.wrapping_mul(19));
+        let c0 = r0 >> 51;
+        r0 &= (1_u64 << 51) - 1;
+        r1 = r1.wrapping_add(c0);
+
+        Self {
+            limbs: [r0, r1, r2, r3, r4],
+        }
+    }
+
+    /// Squares this field element modulo $2^{255}-19$.
+    fn square(self) -> Self {
+        self.mul(self)
+    }
+
+    /// Computes the multiplicative inverse $z^{p-2} = z^{2^{255}-21} \pmod{2^{255}-19}$ via Fermat's Little Theorem.
+    fn invert(self) -> Self {
+        let mut result = Self::ONE;
+        let mut base = self;
+        // p - 2 = 2^255 - 21 = (2^255 - 1) - 20 = (2^255 - 1) - (16 + 4): bits 0..=254 are 1 except bits 2 and 4.
+        for bit_idx in 0..255_u32 {
+            let is_one = bit_idx != 2 && bit_idx != 4;
+            if is_one {
+                result = result.mul(base);
+            }
+            base = base.square();
+        }
+        result
+    }
+
+    /// Constant-time conditional swap of `(a, b)` controlled by `swap_bit` (`0` or `1`).
+    fn cswap(swap_bit: u64, a: &mut Self, b: &mut Self) {
+        let mask = 0_u64.wrapping_sub(swap_bit);
+        for (la, lb) in a.limbs.iter_mut().zip(b.limbs.iter_mut()) {
+            let diff = (*la ^ *lb) & mask;
+            *la ^= diff;
+            *lb ^= diff;
+        }
+    }
+}
+
+/// Evaluates the RFC 7748 Section 5 `X25519(k, u)` Montgomery ladder scalar multiplication over
+/// $\mathbb{F}_{2^{255}-19}$ in constant time.
+///
+/// # Arguments
+///
+/// * `scalar` - 32-byte secret scalar (clamped internally per RFC 7748 §5).
+/// * `u_coord` - 32-byte little-endian `u`-coordinate point (e.g., `[9, 0, ...]` basepoint).
+///
+/// # Returns
+///
+/// 32-byte little-endian output `u`-coordinate.
+pub fn x25519_scalarmult(scalar: &[u8; 32], u_coord: &[u8; 32]) -> [u8; 32] {
+    let mut clamped = *scalar;
+    for b0 in clamped.iter_mut().take(1) {
+        *b0 &= 248;
+    }
+    for b31 in clamped.iter_mut().skip(31) {
+        *b31 &= 127;
+        *b31 |= 64;
+    }
+
+    let x_1 = Fe25519::from_bytes(u_coord);
+    let mut x_2 = Fe25519::ONE;
+    let mut z_2 = Fe25519::ZERO;
+    let mut x_3 = x_1;
+    let mut z_3 = Fe25519::ONE;
+    let mut swap = 0_u64;
+
+    for bit_pos in (0..255_usize).rev() {
+        let byte_idx = bit_pos >> 3;
+        let bit_idx = bit_pos & 7;
+        let k_t = u64::from((clamped.get(byte_idx).copied().unwrap_or(0) >> bit_idx) & 1);
+        swap ^= k_t;
+        Fe25519::cswap(swap, &mut x_2, &mut x_3);
+        Fe25519::cswap(swap, &mut z_2, &mut z_3);
+        swap = k_t;
+
+        let sum_2 = x_2.add(z_2);
+        let aa = sum_2.square();
+        let diff_2 = x_2.sub(z_2);
+        let bb = diff_2.square();
+        let e_fe = aa.sub(bb);
+        let sum_3 = x_3.add(z_3);
+        let diff_3 = x_3.sub(z_3);
+        let da = diff_3.mul(sum_2);
+        let cb = sum_3.mul(diff_2);
+        x_3 = da.add(cb).square();
+        z_3 = x_1.mul(da.sub(cb).square());
+        x_2 = aa.mul(bb);
+        z_2 = e_fe.mul(aa.add(Fe25519::A24.mul(e_fe)));
+    }
+    Fe25519::cswap(swap, &mut x_2, &mut x_3);
+    Fe25519::cswap(swap, &mut z_2, &mut z_3);
+    x_2.mul(z_2.invert()).to_bytes()
+}
+
+/// Computes the RFC 7748 Curve25519 public key `X25519(secret_scalar, 9)` from a 32-byte secret key.
+///
+/// # Arguments
+///
+/// * `secret_scalar` - 32-byte secret scalar.
+///
+/// # Returns
+///
+/// 32-byte RFC 7748 public key.
+pub fn x25519_basepoint_public_key(secret_scalar: &[u8; 32]) -> [u8; 32] {
+    let basepoint: [u8; 32] = [
+        9, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0,
+    ];
+    x25519_scalarmult(secret_scalar, &basepoint)
+}
+
+/// Performs RFC 7748 `X25519` Diffie-Hellman shared secret derivation with low-order / all-zero output rejection.
+///
+/// # Arguments
+///
+/// * `local_secret` - 32-byte local secret scalar.
+/// * `peer_public` - 32-byte peer public key.
+///
+/// # Returns
+///
+/// 32-byte [`ZeroizingSecretKey`] containing the raw `X25519` shared secret.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::KeyExchange`] if the resulting shared secret is the all-zero low-order point.
+pub fn x25519_diffie_hellman(
+    local_secret: &[u8; 32],
+    peer_public: &[u8; 32],
+) -> ArbiterResult<ZeroizingSecretKey> {
+    let shared = x25519_scalarmult(local_secret, peer_public);
+    let mut acc = 0_u8;
+    for &b in &shared {
+        acc |= b;
+    }
+    if acc == 0 {
+        return Err(arbiter_core::error::KeyExchangeError::new(
+            "X25519",
+            "rejected low-order X25519 public point producing all-zero shared secret",
+        )
+        .into());
+    }
+    Ok(ZeroizingSecretKey::new(shared))
+}
+
+#[cfg(test)]
+mod phase1_crypto_tests {
+    use super::*;
+
+    #[test]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+    fn test_nist_aes256_gcm_and_rfc7748_x25519_vectors() {
+        // FIPS 197 Appendix C.3 AES-256 test vector
+        let fips_key: [u8; 32] = [
+            0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+            0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b,
+            0x1c, 0x1d, 0x1e, 0x1f,
+        ];
+        let fips_pt: [u8; 16] = [
+            0x00, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+            0xee, 0xff,
+        ];
+        let expected_ct: [u8; 16] = [
+            0x8e, 0xa2, 0xb7, 0xca, 0x51, 0x67, 0x45, 0xbf, 0xea, 0xfc, 0x49, 0x90, 0x4b, 0x49,
+            0x60, 0x89,
+        ];
+        let rks = aes256_expand_key(&fips_key);
+        assert_eq!(aes256_encrypt_block(&fips_pt, &rks), expected_ct);
+
+        // NIST SP 800-38D AES-256-GCM seal & open round-trip + tamper rejection
+        let gcm_nonce = [0x07_u8; 12];
+        let aad = b"arbiter-spiffe-aad-v1";
+        let plaintext = b"multi-block-aes-256-gcm-secret-payload-for-zero-trust-mtls-transport";
+        let (ct, tag) = aes256_gcm_seal(&fips_key, &gcm_nonce, aad, plaintext);
+        assert_eq!(
+            aes256_gcm_open(&fips_key, &gcm_nonce, aad, &ct, &tag),
+            Ok(plaintext.to_vec())
+        );
+        assert!(aes256_gcm_open(&fips_key, &gcm_nonce, b"wrong-aad", &ct, &tag).is_err());
+
+        let sec_id = SecretId::new("sec-aes256-gcm").unwrap_or_default();
+        let mut gcm_env = seal_secret_aes256_gcm(sec_id, &fips_key, gcm_nonce, aad, plaintext);
+        let unsealed_buf = unseal_secret_aes256_gcm(&gcm_env, &fips_key, aad).unwrap_or_default();
+        assert_eq!(unsealed_buf.as_slice(), plaintext);
+        assert!(unseal_secret_aes256_gcm(&gcm_env, &fips_key, b"wrong-aad").is_err());
+        gcm_env.auth_tag.fill(0xFF);
+        assert!(unseal_secret_aes256_gcm(&gcm_env, &fips_key, aad).is_err());
+
+        // RFC 5869 multi-block HKDF-Expand & TLS 1.3 HKDF-Expand-Label
+        assert!(hkdf_expand_multi_block(&fips_key, b"info", 0).is_err());
+        assert!(hkdf_expand_multi_block(&fips_key, b"info", 9000).is_err());
+        let okm96 = hkdf_expand_multi_block(&fips_key, b"info", 96).unwrap_or_default();
+        assert_eq!(okm96.len(), 96);
+        assert!(tls13_hkdf_expand_label(&fips_key, b"quic key", b"", 0).is_err());
+        assert!(tls13_hkdf_expand_label(&fips_key, b"quic key", b"", 300).is_err());
+        let quic_key =
+            tls13_hkdf_expand_label(&fips_key, b"quic key", b"ctx", 32).unwrap_or_default();
+        assert_eq!(quic_key.len(), 32);
+
+        // RFC 7748 Section 6.1 X25519 Official Test Vector
+        let rfc_scalar: [u8; 32] = [
+            0xa5, 0x46, 0xe3, 0x6b, 0xf0, 0x52, 0x7c, 0x9d, 0x3b, 0x16, 0x15, 0x4b, 0x82, 0x46,
+            0x5e, 0xdd, 0x62, 0x14, 0x4c, 0x0a, 0xc1, 0xfc, 0x5a, 0x18, 0x50, 0x6a, 0x22, 0x44,
+            0xba, 0x44, 0x9a, 0xc4,
+        ];
+        let rfc_u: [u8; 32] = [
+            0xe6, 0xdb, 0x68, 0x67, 0x58, 0x30, 0x30, 0xdb, 0x35, 0x94, 0xc1, 0xa4, 0x24, 0xb1,
+            0x5f, 0x7c, 0x72, 0x66, 0x24, 0xec, 0x26, 0xb3, 0x35, 0x3b, 0x10, 0xa9, 0x03, 0xa6,
+            0xd0, 0xab, 0x1c, 0x4c,
+        ];
+        let expected_out: [u8; 32] = [
+            0xc3, 0xda, 0x55, 0x37, 0x9d, 0xe9, 0xc6, 0x90, 0x8e, 0x94, 0xea, 0x4d, 0xf2, 0x8d,
+            0x08, 0x4f, 0x32, 0xec, 0xcf, 0x03, 0x49, 0x1c, 0x71, 0xf7, 0x54, 0xb4, 0x07, 0x55,
+            0x77, 0xa2, 0x85, 0x52,
+        ];
+        assert_eq!(x25519_scalarmult(&rfc_scalar, &rfc_u), expected_out);
+
+        // RFC 7748 Section 6.1 Alice-Bob Diffie-Hellman Test Vector
+        let initiator_secret: [u8; 32] = [
+            0x77, 0x07, 0x6d, 0x0a, 0x73, 0x18, 0xa5, 0x7d, 0x3c, 0x16, 0xc1, 0x72, 0x51, 0xb2,
+            0x66, 0x45, 0xdf, 0x4c, 0x2f, 0x87, 0xeb, 0xc0, 0x99, 0x2a, 0xb1, 0x77, 0xfb, 0xa5,
+            0x1d, 0xb9, 0x2c, 0x2a,
+        ];
+        let responder_secret: [u8; 32] = [
+            0x5d, 0xab, 0x08, 0x7e, 0x62, 0x4a, 0x8a, 0x4b, 0x79, 0xe1, 0x7f, 0x8b, 0x83, 0x80,
+            0x0e, 0xe6, 0x6f, 0x3b, 0xb1, 0x29, 0x26, 0x18, 0xb6, 0xfd, 0x1c, 0x2f, 0x8b, 0x27,
+            0xff, 0x88, 0xe0, 0xeb,
+        ];
+        let initiator_public = x25519_basepoint_public_key(&initiator_secret);
+        let responder_public = x25519_basepoint_public_key(&responder_secret);
+        let shared_a = x25519_diffie_hellman(&initiator_secret, &responder_public).ok();
+        let shared_b = x25519_diffie_hellman(&responder_secret, &initiator_public).ok();
+        assert!(shared_a.is_some());
+        assert_eq!(shared_a, shared_b);
+        assert!(x25519_diffie_hellman(&initiator_secret, &[0_u8; 32]).is_err());
+
+        // HashChainedAuditLog append, verify_chain, persist_to_file, load_and_verify_from_file, and tamper detection
+        let mut audit = HashChainedAuditLog::new();
+        assert_eq!(audit.verify_chain(), Ok(0));
+        let e1 = audit.append_event(
+            10,
+            "spiffe://arbiter.internal/master/m1",
+            "SetQuota",
+            "quota:prod",
+            true,
+        );
+        assert_eq!(e1.sequence, 1);
+        let e2 = audit.append_event(
+            12,
+            "spiffe://arbiter.internal/node/a1",
+            "DrainAgent",
+            "agent:a1",
+            false,
+        );
+        assert_eq!(e2.sequence, 2);
+        assert_eq!(audit.verify_chain(), Ok(2));
+
+        let audit_path = std::env::temp_dir().join("arbiter_test_security_audit.ndjson");
+        assert_eq!(audit.persist_to_file(&audit_path), Ok(2));
+        let loaded =
+            HashChainedAuditLog::load_and_verify_from_file(&audit_path).unwrap_or_default();
+        assert_eq!(loaded, audit);
+
+        let mut tampered = audit;
+        for first_entry in tampered.entries.iter_mut().take(1) {
+            "tampered-resource".clone_into(&mut first_entry.target_resource);
+        }
+        assert!(tampered.verify_chain().is_err());
+        assert_eq!(tampered.persist_to_file(&audit_path), Ok(2));
+        assert!(HashChainedAuditLog::load_and_verify_from_file(&audit_path).is_err());
+
+        let _ = std::fs::write(&audit_path, "\n{not-json}\n");
+        assert!(HashChainedAuditLog::load_and_verify_from_file(&audit_path).is_err());
+        let _ = std::fs::remove_file(&audit_path);
+
+        let bad_dir = std::path::Path::new("/nonexistent_dir_arbiter_audit/audit.ndjson");
+        assert!(loaded.persist_to_file(bad_dir).is_err());
+        assert!(HashChainedAuditLog::load_and_verify_from_file(bad_dir).is_err());
+        assert_eq!(sha256_digest(b"abc").len(), 32);
+
+        // ring::aead ChaCha20-Poly1305 & AES-256-GCM seal and open round-trip + tamper rejection
+        for use_aes in [false, true] {
+            let (r_ct, r_tag) =
+                ring_aead_seal(use_aes, &fips_key, gcm_nonce, aad, plaintext).unwrap_or_default();
+            assert_eq!(
+                ring_aead_open(use_aes, &fips_key, gcm_nonce, aad, &r_ct, &r_tag),
+                Ok(plaintext.to_vec())
+            );
+            assert!(
+                ring_aead_open(use_aes, &fips_key, gcm_nonce, b"wrong-aad", &r_ct, &r_tag).is_err()
+            );
+        }
+
+        // LiveSpireUdsTransport connecting to an already-existing external SpireMockAgentServer UDS
+        #[cfg(unix)]
+        {
+            let ext_auth = SvidAuthority::new("arbiter.internal", fips_key, 100);
+            let ext_uds = std::env::temp_dir().join("arbiter_test_spire_existing_uds.sock");
+            let ext_uds_str = ext_uds.to_string_lossy().into_owned();
+            let ext_check =
+                SpireMockAgentServer::bind(&ext_uds_str, ext_auth.clone()).map(|ext_srv| {
+                    let _ = ext_srv.listener.set_nonblocking(false);
+                    let srv_h = std::thread::spawn(move || ext_srv.poll_once(40));
+                    let mut tr_ext = LiveSpireUdsTransport::new(ext_auth);
+                    let svid_ext = tr_ext.fetch_workload_svid(
+                        &ext_uds_str,
+                        "spiffe://arbiter.internal/node/a1",
+                        40,
+                    );
+                    assert!(svid_ext.is_ok());
+                    let _ = srv_h.join();
+                });
+            assert!(ext_check.is_ok());
         }
     }
 }

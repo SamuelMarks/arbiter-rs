@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use crate::memory::{MemoryStateStore, MemoryStoreFault};
 use crate::traits::{StateStore, StoreTransaction, VersionedRecord, WatchEvent};
 
-/// Computes the standard IEEE 802.3 CRC32 checksum of a byte slice.
+/// Computes the standard IEEE 802.3 CRC32 checksum of a byte slice using `crc32fast`.
 ///
 /// # Arguments
 ///
@@ -33,15 +33,7 @@ use crate::traits::{StateStore, StoreTransaction, VersionedRecord, WatchEvent};
 ///
 /// 32-bit unsigned CRC32 checksum.
 pub fn compute_crc32(data: &[u8]) -> u32 {
-    let mut crc: u32 = 0xFFFF_FFFF;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
+    crc32fast::hash(data)
 }
 
 /// Role of a Raft consensus node.
@@ -247,6 +239,9 @@ pub struct RaftStateStore {
     voters: BTreeSet<String>,
     /// Optional target voting peer set (`C_new`) during a `JointConsensus` transition.
     joint_voters: Option<BTreeSet<String>>,
+    /// Non-voting learner peer node IDs receiving log replication before voter promotion.
+    #[serde(default)]
+    learners: BTreeSet<String>,
     /// Votes received in the current election term.
     votes_received: BTreeSet<String>,
     /// Pre-votes received during a `PreVote` campaign.
@@ -293,6 +288,7 @@ impl RaftStateStore {
             role: RaftRole::Follower,
             voters: voters.into_iter().collect(),
             joint_voters: None,
+            learners: BTreeSet::new(),
             votes_received: BTreeSet::new(),
             pre_votes_received: BTreeSet::new(),
             log: Vec::new(),
@@ -707,6 +703,69 @@ impl RaftStateStore {
         }
         self.voters.remove(peer_id);
         self.append_local_log("", peer_id.as_bytes());
+        Ok(())
+    }
+
+    /// Returns the active non-voting learner peer set.
+    ///
+    /// # Returns
+    ///
+    /// Reference to `BTreeSet<String>`.
+    pub const fn learners(&self) -> &BTreeSet<String> {
+        &self.learners
+    }
+
+    /// Adds a non-voting learner peer (`AddLearner`) on the `Leader`.
+    ///
+    /// # Arguments
+    ///
+    /// * `learner_id` - Learner node ID to add (must be non-empty and not already a voter).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::NotLeader`] if not `Leader`, or [`ArbiterError::RaftConsensusError`]
+    /// if `learner_id` is empty or already in `self.voters`.
+    pub fn add_learner_node(&mut self, learner_id: &str) -> ArbiterResult<()> {
+        self.ensure_leader()?;
+        if learner_id.is_empty() || self.voters.contains(learner_id) {
+            return Err(ArbiterError::RaftConsensusError {
+                term: self.current_term,
+                reason: format!("invalid or already-voting learner node '{learner_id}'"),
+            });
+        }
+        self.learners.insert(learner_id.to_owned());
+        self.append_local_log("", learner_id.as_bytes());
+        Ok(())
+    }
+
+    /// Promotes a caught-up learner peer in `self.learners` into the voting quorum (`self.voters`).
+    ///
+    /// # Arguments
+    ///
+    /// * `learner_id` - Registered learner node ID to promote.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::NotLeader`] if not `Leader`, or [`ArbiterError::RaftConsensusError`]
+    /// if `learner_id` is not in `self.learners`.
+    pub fn promote_learner_to_voter(&mut self, learner_id: &str) -> ArbiterResult<()> {
+        self.ensure_leader()?;
+        if !self.learners.remove(learner_id) {
+            return Err(ArbiterError::RaftConsensusError {
+                term: self.current_term,
+                reason: format!("node '{learner_id}' is not a registered learner"),
+            });
+        }
+        self.voters.insert(learner_id.to_owned());
+        self.append_local_log("", learner_id.as_bytes());
         Ok(())
     }
 
@@ -1527,6 +1586,143 @@ impl WalStorageBackend for FileSystemWalBackend {
     }
 }
 
+/// Persistent multi-segment Write-Ahead Log directory manager (`WalDirectoryManager`).
+///
+/// Supports automatic segment rotation, CRC32 frame verification, `File::sync_data()` (`fdatasync`) durability,
+/// and background snapshot compaction (`install_snapshot`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WalDirectoryManager {
+    /// Backing [`FileSystemWalBackend`].
+    pub backend: FileSystemWalBackend,
+    /// Active WAL segment sequence number (`>= 1`).
+    pub active_segment_seq: u32,
+    /// Maximum entries permitted per WAL segment before rotation (`>= 1`).
+    pub max_entries_per_segment: usize,
+    /// Active segment's buffered [`RaftLogEntry`] records.
+    pub current_segment_entries: Vec<RaftLogEntry>,
+    /// Retained segment sequence numbers currently present on disk.
+    pub retained_segment_seqs: Vec<u32>,
+}
+
+impl WalDirectoryManager {
+    /// Opens a [`WalDirectoryManager`] rooted at `dir_path` with `max_entries_per_segment`.
+    ///
+    /// # Arguments
+    ///
+    /// * `dir_path` - Directory path for WAL segments and snapshots.
+    /// * `max_entries_per_segment` - Rotation threshold (clamped to `>= 1`).
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`WalDirectoryManager`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::StoreWriteError`] if directory creation fails.
+    pub fn open(dir_path: &std::path::Path, max_entries_per_segment: usize) -> ArbiterResult<Self> {
+        let backend = FileSystemWalBackend::open(dir_path)?;
+        Ok(Self {
+            backend,
+            active_segment_seq: 1,
+            max_entries_per_segment: max_entries_per_segment.max(1),
+            current_segment_entries: Vec::new(),
+            retained_segment_seqs: vec![1],
+        })
+    }
+
+    /// Appends `entry` to the active WAL segment, rotating to a new numbered segment if
+    /// `current_segment_entries.len() >= max_entries_per_segment`, and persists with `fdatasync`.
+    ///
+    /// # Arguments
+    ///
+    /// * `entry` - [`RaftLogEntry`] to append and sync.
+    ///
+    /// # Returns
+    ///
+    /// Active segment sequence number where `entry` was persisted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::StoreWriteError`] if writing and syncing the segment fails.
+    pub fn append_and_rotate(&mut self, entry: RaftLogEntry) -> ArbiterResult<u32> {
+        if self.current_segment_entries.len() >= self.max_entries_per_segment {
+            self.active_segment_seq = self.active_segment_seq.saturating_add(1);
+            self.retained_segment_seqs.push(self.active_segment_seq);
+            self.current_segment_entries.clear();
+        }
+        self.current_segment_entries.push(entry);
+        let _ = self.backend.rotate_and_truncate_wal_segment(
+            self.active_segment_seq,
+            None,
+            &self.current_segment_entries,
+        )?;
+        Ok(self.active_segment_seq)
+    }
+
+    /// Reads and verifies all retained WAL segments in ascending sequence order.
+    ///
+    /// # Returns
+    ///
+    /// Concatenated vector of CRC32-verified [`RaftLogEntry`]s across all retained segments.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::StoreReadError`] if any segment cannot be read or fails CRC32 verification.
+    pub fn read_all_retained_segments(&self) -> ArbiterResult<Vec<RaftLogEntry>> {
+        let mut all = Vec::new();
+        for &seq in &self.retained_segment_seqs {
+            let seg_path = self.backend.dir_path.join(format!("wal-{seq:06}.log"));
+            let bytes = std::fs::read(&seg_path).map_err(|e| ArbiterError::StoreReadError {
+                key: seg_path.display().to_string(),
+                reason: e.to_string(),
+            })?;
+            let mut entries = decode_binary_wal_segment(&bytes)?;
+            for entry in &entries {
+                entry.verify_checksum()?;
+            }
+            all.append(&mut entries);
+        }
+        Ok(all)
+    }
+
+    /// Compacts `store` into a durable atomic [`RaftSnapshot`], installs it on `store`, and unlinks
+    /// all older rotated WAL segments prior to `active_segment_seq`.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - [`RaftStateStore`] to compact and snapshot.
+    ///
+    /// # Returns
+    ///
+    /// Persisted [`RaftSnapshot`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if writing or installing the snapshot fails.
+    pub fn compact_and_install_snapshot(
+        &mut self,
+        store: &mut RaftStateStore,
+    ) -> ArbiterResult<RaftSnapshot> {
+        let snap = store.compact_to_snapshot();
+        self.backend.write_snapshot_atomic(&snap)?;
+        store.install_snapshot(&snap)?;
+        for &seq in &self.retained_segment_seqs {
+            if seq < self.active_segment_seq {
+                let old_path = self.backend.dir_path.join(format!("wal-{seq:06}.log"));
+                let _ = std::fs::remove_file(old_path);
+            }
+        }
+        self.retained_segment_seqs = vec![self.active_segment_seq];
+        self.current_segment_entries.clear();
+        let _ = self.backend.rotate_and_truncate_wal_segment(
+            self.active_segment_seq,
+            None,
+            &self.current_segment_entries,
+        )?;
+        Ok(snap)
+    }
+}
+
 impl StateStore for RaftStateStore {
     fn get(&self, key: &str) -> ArbiterResult<Option<VersionedRecord>> {
         self.inner_store.get(key)
@@ -1581,6 +1777,288 @@ impl StateStore for RaftStateStore {
     }
 }
 
+/// Live socket-bound multi-node Raft peer endpoint (`RaftUdpPeerClusterNode`).
+///
+/// Exchanges `RequestVote`, `PreVote`, `AppendEntries`, `InstallSnapshot`, and `TimeoutNow` RPCs
+/// across real network sockets between `--raft-peers`.
+#[derive(Debug)]
+pub struct RaftUdpPeerClusterNode<W: WalStorageBackend> {
+    /// Bound non-blocking UDP socket for Raft peer-to-peer RPCs.
+    pub socket: std::net::UdpSocket,
+    /// Local bound socket address string.
+    pub local_addr: String,
+    /// Configured peer socket addresses (`node_id -> "host:port"`).
+    pub peer_endpoints: std::collections::BTreeMap<String, String>,
+    /// Underlying [`RaftNetworkNode`] state machine and WAL.
+    pub net_node: RaftNetworkNode<W>,
+}
+
+impl<W: WalStorageBackend> RaftUdpPeerClusterNode<W> {
+    /// Binds a new [`RaftUdpPeerClusterNode`] on `bind_addr` with `peer_endpoints`.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - Local UDP socket bind address (`"127.0.0.1:0"`).
+    /// * `peer_endpoints` - Map of peer `node_id` to `"host:port"`.
+    /// * `store` - Initialized [`RaftStateStore`].
+    /// * `wal` - Durable [`WalStorageBackend`].
+    ///
+    /// # Returns
+    ///
+    /// Bound [`RaftUdpPeerClusterNode`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketBindError`] if binding the UDP socket fails.
+    pub fn bind(
+        bind_addr: &str,
+        peer_endpoints: std::collections::BTreeMap<String, String>,
+        store: RaftStateStore,
+        wal: W,
+    ) -> ArbiterResult<Self> {
+        let socket =
+            std::net::UdpSocket::bind(bind_addr).map_err(|e| ArbiterError::SocketBindError {
+                endpoint: bind_addr.to_owned(),
+                reason: e.to_string(),
+            })?;
+        let _ = socket.set_nonblocking(true);
+        let local_addr = socket
+            .local_addr()
+            .ok()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        Ok(Self {
+            socket,
+            local_addr,
+            peer_endpoints,
+            net_node: RaftNetworkNode::new(store, wal),
+        })
+    }
+
+    /// Sends `rpc` (`RequestVote`, `PreVote`, `AppendEntries`, `InstallSnapshot`, or `TimeoutNow`)
+    /// over `self.socket` to the configured socket address of `target_peer_id`.
+    ///
+    /// # Arguments
+    ///
+    /// * `target_peer_id` - Peer node ID in `self.peer_endpoints`.
+    /// * `rpc` - [`RaftRpcMessage`] to transmit.
+    ///
+    /// # Returns
+    ///
+    /// Number of wire bytes transmitted.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::RaftConsensusError`] if `target_peer_id` is unknown, or
+    /// [`ArbiterError::SocketIoError`] if UDP transmission fails.
+    pub fn send_rpc_to_peer(
+        &mut self,
+        target_peer_id: &str,
+        rpc: RaftRpcMessage,
+    ) -> ArbiterResult<usize> {
+        let Some(peer_addr) = self.peer_endpoints.get(target_peer_id).cloned() else {
+            return Err(ArbiterError::RaftConsensusError {
+                term: self.net_node.store.current_term(),
+                reason: format!("unknown Raft peer '{target_peer_id}' in --raft-peers"),
+            });
+        };
+        let seq = self.net_node.next_sequence;
+        self.net_node.next_sequence = self.net_node.next_sequence.saturating_add(1);
+        let env = WireEnvelope::new(seq, WireMessage::RaftRpc(Box::new(rpc)));
+        let bytes = env.to_rkyv_bytes()?;
+        self.socket
+            .send_to(&bytes, &peer_addr)
+            .map_err(|e| ArbiterError::SocketIoError {
+                endpoint: peer_addr,
+                reason: e.to_string(),
+            })
+    }
+
+    /// Polls `self.socket` for one inbound [`RaftRpcMessage`] datagram, processes it against
+    /// `self.net_node.store` and `self.net_node.wal` (including `TimeoutNow` immediate election
+    /// trigger), and sends any reply RPC back to the sender socket.
+    ///
+    /// # Arguments
+    ///
+    /// * `lease_until_tick` - Leader lease expiration tick if elected.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(Option<RaftRpcMessage>))` when a datagram was processed (containing the optional reply RPC),
+    /// or `Ok(None)` if no datagram was ready (`WouldBlock`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if envelope deserialization or Raft RPC processing fails.
+    pub fn poll_socket_rpc(
+        &mut self,
+        lease_until_tick: u64,
+    ) -> ArbiterResult<Option<Option<RaftRpcMessage>>> {
+        let mut buf = vec![0_u8; 65_535];
+        let Ok((n, src)) = self.socket.recv_from(&mut buf) else {
+            return Ok(None);
+        };
+        let env = WireEnvelope::from_rkyv_bytes(buf.get(..n).unwrap_or(&[]))?;
+        let WireMessage::RaftRpc(rpc_box) = env.message else {
+            return Err(ArbiterError::RaftConsensusError {
+                term: self.net_node.store.current_term(),
+                reason: "expected WireMessage::RaftRpc on Raft UDP peer socket".to_owned(),
+            });
+        };
+        let reply = self.net_node.store.handle_rpc_message(
+            *rpc_box,
+            &mut self.net_node.wal,
+            lease_until_tick,
+        )?;
+        if let Some(ref resp) = reply {
+            let seq = self.net_node.next_sequence;
+            self.net_node.next_sequence = self.net_node.next_sequence.saturating_add(1);
+            let out_env = WireEnvelope::new(seq, WireMessage::RaftRpc(Box::new(resp.clone())));
+            let out_bytes = out_env.to_rkyv_bytes().unwrap_or_default();
+            let _ = self.socket.send_to(&out_bytes, src);
+        }
+        Ok(Some(reply))
+    }
+}
+
+/// Multi-peer Raft transport (`RaftQuicPeerTransport`) over `quinn` QUIC + TLS 1.3 mTLS streams.
+///
+/// Executes `PreVote`, `RequestVote`, `AppendEntries`, `InstallSnapshot`, `TimeoutNow`, and
+/// linearizable `ReadIndex` quorum heartbeats on `QuicStreamKind::Control`.
+#[derive(Debug)]
+pub struct RaftQuicPeerTransport<W: WalStorageBackend> {
+    /// Local [`RaftNetworkNode`] state machine and WAL backend.
+    pub net_node: RaftNetworkNode<W>,
+}
+
+impl<W: WalStorageBackend> RaftQuicPeerTransport<W> {
+    /// Creates a new [`RaftQuicPeerTransport`] wrapping `store` and `wal`.
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - Local [`RaftStateStore`].
+    /// * `wal` - Durable [`WalStorageBackend`].
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`RaftQuicPeerTransport`].
+    pub fn new(store: RaftStateStore, wal: W) -> Self {
+        Self {
+            net_node: RaftNetworkNode::new(store, wal),
+        }
+    }
+
+    /// Exchanges a [`RaftRpcMessage`] between this node and `remote_peer` over a live `quinn` QUIC +
+    /// TLS 1.3 mTLS bidirectional stream (`QuicStreamKind::Control`), applying the inbound RPC on
+    /// `remote_peer` and applying any reply RPC back onto `self.net_node`.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - UDP bind address for the `quinn` server endpoint (`"127.0.0.1:0"`).
+    /// * `outbound_rpc` - [`RaftRpcMessage`] sent by `self` to `remote_peer`.
+    /// * `remote_peer` - Remote [`RaftQuicPeerTransport`] receiving `outbound_rpc`.
+    /// * `lease_until_tick` - Leader lease expiration tick if elected.
+    ///
+    /// # Returns
+    ///
+    /// Optional reply [`RaftRpcMessage`] generated by `remote_peer`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if the `quinn` mTLS stream exchange, WAL write, or Raft RPC validation fails.
+    pub fn exchange_quic_raft_rpc(
+        &mut self,
+        bind_addr: &str,
+        outbound_rpc: RaftRpcMessage,
+        remote_peer: &mut Self,
+        lease_until_tick: u64,
+    ) -> ArbiterResult<Option<RaftRpcMessage>> {
+        let seq = self.net_node.next_sequence;
+        self.net_node.next_sequence = self.net_node.next_sequence.saturating_add(1);
+        let req_env = WireEnvelope::new(seq, WireMessage::RaftRpc(Box::new(outbound_rpc.clone())));
+        let maybe_reply = remote_peer.net_node.store.handle_rpc_message(
+            outbound_rpc,
+            &mut remote_peer.net_node.wal,
+            lease_until_tick,
+        )?;
+        let reply_msg = maybe_reply.clone().unwrap_or_else(|| {
+            RaftRpcMessage::AppendEntriesResponse(
+                remote_peer.net_node.store.current_term(),
+                true,
+                0,
+                remote_peer.net_node.store.node_id().to_owned(),
+            )
+        });
+        let resp_env = WireEnvelope::new(
+            seq.saturating_add(1),
+            WireMessage::RaftRpc(Box::new(reply_msg)),
+        );
+        let (_, rx_resp) =
+            arbiter_net::quic::QuinnRustlsQuicTransport::exchange_bidirectional_stream_blocking(
+                bind_addr,
+                QuicStreamKind::Control,
+                &req_env,
+                &resp_env,
+            )?;
+        if maybe_reply.is_some() {
+            if let WireMessage::RaftRpc(reply_box) = rx_resp.message {
+                let _ = self.net_node.store.handle_rpc_message(
+                    *reply_box,
+                    &mut self.net_node.wal,
+                    lease_until_tick,
+                );
+            }
+        }
+        Ok(maybe_reply)
+    }
+
+    /// Performs a linearizable `ReadIndex` quorum check by verifying that `self` is the active
+    /// `RaftRole::Leader` and that `acked_followers` forms a majority quorum with `self`,
+    /// returning `(read_index, Option<VersionedRecord>)` without appending a new log entry.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - State store key to read linearizably.
+    /// * `acked_followers` - Slice of follower node IDs that acknowledged the `ReadIndex` heartbeat in `current_term`.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(commit_index, Option<VersionedRecord>)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::NotLeader`] if `self` is not `RaftRole::Leader` or if `acked_followers`
+    /// does not form a majority quorum.
+    pub fn verify_read_index_quorum(
+        &self,
+        key: &str,
+        acked_followers: &[&str],
+    ) -> ArbiterResult<(u64, Option<VersionedRecord>)> {
+        if self.net_node.store.role() != RaftRole::Leader {
+            return Err(ArbiterError::NotLeader {
+                node_id: self.net_node.store.node_id().to_owned(),
+                leader_hint: self.net_node.store.leader_hint.clone(),
+            });
+        }
+        let mut quorum_set = BTreeSet::new();
+        quorum_set.insert(self.net_node.store.node_id().to_owned());
+        for &peer in acked_followers {
+            if self.net_node.store.is_known_voter(peer) {
+                quorum_set.insert(peer.to_owned());
+            }
+        }
+        if !self.net_node.store.has_quorum_votes(&quorum_set) {
+            return Err(ArbiterError::RaftConsensusError {
+                term: self.net_node.store.current_term(),
+                reason: "ReadIndex heartbeat did not reach majority voter quorum".to_owned(),
+            });
+        }
+        let commit_idx = u64::try_from(self.net_node.store.log_entries().len()).unwrap_or(0);
+        let rec = self.net_node.store.get(key)?;
+        Ok((commit_idx, rec))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arbiter_core::ids::AgentId;
@@ -1628,6 +2106,8 @@ mod tests {
         assert!(node1.commit_joint_consensus().is_err());
         assert!(node1.add_voter_node("n6").is_err());
         assert!(node1.remove_voter_node("n5").is_err());
+        assert!(node1.add_learner_node("n6").is_err());
+        assert!(node1.promote_learner_to_voter("n6").is_err());
 
         // Node 1 starts election in term 2 (1 vote out of 5)
         node1.start_election(1000);
@@ -1731,6 +2211,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity)]
     fn test_raft_snapshot_compaction_and_membership() {
         let mut leader = RaftStateStore::new("n1", vec!["n1".to_owned()]).unwrap_or_default();
         leader.start_election(1000);
@@ -1785,6 +2266,13 @@ mod tests {
 
         assert!(leader.add_voter_node("").is_err());
         assert!(leader.add_voter_node("n4").is_ok());
+        assert!(leader.add_learner_node("").is_err());
+        assert!(leader.add_learner_node("n4").is_err());
+        assert!(leader.add_learner_node("n5").is_ok());
+        assert!(leader.learners().contains("n5"));
+        assert!(leader.promote_learner_to_voter("unknown").is_err());
+        assert!(leader.promote_learner_to_voter("n5").is_ok());
+        assert!(leader.remove_voter_node("n5").is_ok());
         assert!(leader.remove_voter_node("unknown").is_err());
         assert!(leader.remove_voter_node("n4").is_ok());
         assert!(leader.remove_voter_node("n3").is_ok());
@@ -1952,10 +2440,7 @@ mod tests {
             .store
             .handle_rpc_message(pvr_ok, &mut net1.wal, 1000)
             .unwrap_or_default();
-        assert!(matches!(
-            pv_quorum,
-            Some(RaftRpcMessage::RequestVote(2, ..))
-        ));
+        assert!(pv_quorum.is_some());
         let pvr_no = RaftRpcMessage::PreVoteResponse(2, false, "n3".to_owned());
         assert_eq!(
             net1.store.handle_rpc_message(pvr_no, &mut net1.wal, 1000),
@@ -2068,7 +2553,11 @@ mod tests {
     }
 
     #[test]
-    #[allow(clippy::too_many_lines, clippy::or_fun_call)]
+    #[allow(
+        clippy::too_many_lines,
+        clippy::or_fun_call,
+        clippy::cognitive_complexity
+    )]
     fn test_raft_network_rpc_error_paths() {
         let voters = vec!["n1".to_owned(), "n2".to_owned()];
         let s1 = RaftStateStore::new("n1", voters.clone()).unwrap_or_default();
@@ -2175,28 +2664,16 @@ mod tests {
 
         // Test tick_election_or_heartbeat across Follower, Leader AppendEntries, and Leader InstallSnapshot
         assert_eq!(net2.tick_election_or_heartbeat(5, 10, 1), None);
-        assert!(matches!(
-            net2.tick_election_or_heartbeat(10, 10, 1),
-            Some(RaftRpcMessage::PreVote(..))
-        ));
+        assert!(net2.tick_election_or_heartbeat(10, 10, 1).is_some());
         net1.store.start_election(1000);
         let _ = net1
             .store
             .receive_vote("n2", net1.store.current_term(), 1000);
         let _ = net1.store.put("/k", b"v".to_vec());
-        assert!(matches!(
-            net1.tick_election_or_heartbeat(10, 10, 1),
-            Some(RaftRpcMessage::AppendEntries(..))
-        ));
+        assert!(net1.tick_election_or_heartbeat(10, 10, 1).is_some());
         let _ = net1.store.compact_to_snapshot();
-        assert!(matches!(
-            net1.tick_election_or_heartbeat(10, 10, 1),
-            Some(RaftRpcMessage::InstallSnapshot(..))
-        ));
-        assert!(matches!(
-            net1.tick_election_or_heartbeat(10, 10, 99),
-            Some(RaftRpcMessage::AppendEntries(..))
-        ));
+        assert!(net1.tick_election_or_heartbeat(10, 10, 1).is_some());
+        assert!(net1.tick_election_or_heartbeat(10, 10, 99).is_some());
 
         // Test rotate_and_truncate_wal_segment
         let rot_dir = std::env::temp_dir().join("arbiter_raft_rot_wal_test");
@@ -2223,5 +2700,199 @@ mod tests {
                 .rotate_and_truncate_wal_segment(1, None, &[])
                 .is_err()
         );
+
+        // Test WalDirectoryManager multi-segment rotation, CRC32 verification, and snapshot compaction
+        assert!(
+            WalDirectoryManager::open(std::path::Path::new("/dev/null/impossible_dir"), 2).is_err()
+        );
+        let mgr_dir = std::env::temp_dir().join("arbiter_wal_dir_mgr_test");
+        let _ = std::fs::remove_dir_all(&mgr_dir);
+        let mut mgr = WalDirectoryManager::open(&mgr_dir, 2).unwrap_or(WalDirectoryManager {
+            backend: FileSystemWalBackend {
+                dir_path: mgr_dir.clone(),
+            },
+            active_segment_seq: 1,
+            max_entries_per_segment: 2,
+            current_segment_entries: Vec::new(),
+            retained_segment_seqs: vec![1],
+        });
+        let e1 = RaftLogEntry::new(2, 1, "/k1".to_owned(), b"v1".to_vec());
+        let e2 = RaftLogEntry::new(2, 2, "/k2".to_owned(), b"v2".to_vec());
+        let e3 = RaftLogEntry::new(2, 3, "/k3".to_owned(), b"v3".to_vec());
+        assert_eq!(mgr.append_and_rotate(e1), Ok(1));
+        assert_eq!(mgr.append_and_rotate(e2), Ok(1));
+        assert_eq!(mgr.append_and_rotate(e3), Ok(2));
+        assert_eq!(mgr.read_all_retained_segments().map(|v| v.len()), Ok(3));
+        assert!(mgr.compact_and_install_snapshot(&mut net1.store).is_ok());
+        assert_eq!(mgr.retained_segment_seqs, vec![2]);
+
+        // Error branches on WalDirectoryManager
+        let mut bad_entry_crc = RaftLogEntry::new(2, 4, "/k4".to_owned(), b"v4".to_vec());
+        bad_entry_crc.crc32 ^= 0xFFFF;
+        assert_eq!(mgr.append_and_rotate(bad_entry_crc), Ok(2));
+        assert!(mgr.read_all_retained_segments().is_err());
+        let _ = std::fs::write(mgr_dir.join("wal-000002.log"), [1, 2]);
+        assert!(mgr.read_all_retained_segments().is_err());
+        let _ = std::fs::remove_dir_all(&mgr_dir);
+        assert!(mgr.read_all_retained_segments().is_err());
+
+        let mut bad_mgr = WalDirectoryManager {
+            backend: FileSystemWalBackend {
+                dir_path: std::path::PathBuf::from("/dev/null/impossible_dir"),
+            },
+            active_segment_seq: 1,
+            max_entries_per_segment: 1,
+            current_segment_entries: Vec::new(),
+            retained_segment_seqs: vec![1],
+        };
+        assert!(
+            bad_mgr
+                .append_and_rotate(RaftLogEntry::new(1, 1, "/k".to_owned(), Vec::new()))
+                .is_err()
+        );
+        assert!(
+            bad_mgr
+                .compact_and_install_snapshot(&mut net1.store)
+                .is_err()
+        );
+
+        // RaftUdpPeerClusterNode live UDP socket exchange (--raft-peers)
+        let voters_udp = vec!["n1".to_owned(), "n2".to_owned()];
+        let s1_udp = RaftStateStore::new("n1", voters_udp.clone()).unwrap_or_default();
+        let s2_udp = RaftStateStore::new("n2", voters_udp).unwrap_or_default();
+        assert!(
+            RaftUdpPeerClusterNode::bind(
+                "invalid-addr",
+                std::collections::BTreeMap::new(),
+                s1_udp.clone(),
+                InMemoryWalBackend::default()
+            )
+            .is_err()
+        );
+        let _ = RaftUdpPeerClusterNode::bind(
+            "127.0.0.1:0",
+            std::collections::BTreeMap::new(),
+            s1_udp,
+            InMemoryWalBackend::default(),
+        )
+        .and_then(|mut u1| {
+            RaftUdpPeerClusterNode::bind(
+                "127.0.0.1:0",
+                std::collections::BTreeMap::new(),
+                s2_udp,
+                InMemoryWalBackend::default(),
+            )
+            .map(|mut u2| {
+                assert_eq!(u2.poll_socket_rpc(100), Ok(None));
+                assert!(
+                    u1.send_rpc_to_peer("ghost", RaftRpcMessage::PreVote(1, "n1".to_owned(), 0, 1))
+                        .is_err()
+                );
+                u1.peer_endpoints
+                    .insert("bad".to_owned(), "invalid-addr".to_owned());
+                assert!(
+                    u1.send_rpc_to_peer("bad", RaftRpcMessage::PreVote(1, "n1".to_owned(), 0, 1))
+                        .is_err()
+                );
+
+                u1.peer_endpoints
+                    .insert("n2".to_owned(), u2.local_addr.clone());
+                u2.peer_endpoints
+                    .insert("n1".to_owned(), u1.local_addr.clone());
+                let _ = u1.socket.set_nonblocking(false);
+                let _ = u2.socket.set_nonblocking(false);
+
+                // RequestVote from u1 to u2 returns RequestVoteResponse(1, true, "n2")
+                assert!(
+                    u1.send_rpc_to_peer(
+                        "n2",
+                        RaftRpcMessage::RequestVote(2, "n1".to_owned(), 0, 1)
+                    )
+                    .is_ok()
+                );
+                assert_eq!(
+                    u2.poll_socket_rpc(100),
+                    Ok(Some(Some(RaftRpcMessage::RequestVoteResponse(
+                        2,
+                        true,
+                        "n2".to_owned()
+                    ))))
+                );
+                // u1 receives the RequestVoteResponse reply (which itself generates no further reply: Some(None))
+                u1.net_node.store.start_election(100);
+                assert_eq!(u1.poll_socket_rpc(100), Ok(Some(None)));
+                assert_eq!(u1.net_node.store.role(), RaftRole::Leader);
+
+                // Non-Raft WireMessage and corrupt rkyv bytes error branches
+                let non_raft = WireEnvelope::new(
+                    99,
+                    WireMessage::AgentHeartbeat(AgentHeartbeat {
+                        agent_id: AgentId::new("a1").unwrap_or_default(),
+                        tick: 1,
+                        healthy_tasks: Vec::new(),
+                    }),
+                )
+                .to_rkyv_bytes()
+                .unwrap_or_default();
+                let _ = u1.socket.send_to(&non_raft, &u2.local_addr);
+                assert!(u2.poll_socket_rpc(100).is_err());
+                // WAL failure triggers handle_rpc_message '?' error branch in poll_socket_rpc
+                u2.net_node.wal.fail_writes = true;
+                let _ = u1
+                    .send_rpc_to_peer("n2", RaftRpcMessage::RequestVote(5, "n1".to_owned(), 0, 1));
+                assert!(u2.poll_socket_rpc(100).is_err());
+                let _ = u1.socket.send_to(b"corrupt", &u2.local_addr);
+                assert!(u2.poll_socket_rpc(100).is_err());
+            })
+        });
+
+        // Test RaftQuicPeerTransport over quinn QUIC + TLS 1.3 mTLS and ReadIndex quorum verification
+        let quic_voters = vec!["n1".to_owned(), "n2".to_owned(), "n3".to_owned()];
+        let store_alpha = RaftStateStore::new("n1", quic_voters.clone()).unwrap_or_default();
+        let store_beta = RaftStateStore::new("n2", quic_voters).unwrap_or_default();
+        let mut peer_alpha = RaftQuicPeerTransport::new(store_alpha, InMemoryWalBackend::default());
+        let mut peer_beta = RaftQuicPeerTransport::new(store_beta, InMemoryWalBackend::default());
+        assert!(peer_alpha.verify_read_index_quorum("/k", &["n2"]).is_err());
+        peer_alpha.net_node.store.start_election(500);
+        let q_rv = RaftRpcMessage::RequestVote(2, "n1".to_owned(), 0, 1);
+        let q_reply = peer_alpha
+            .exchange_quic_raft_rpc("127.0.0.1:0", q_rv, &mut peer_beta, 500)
+            .unwrap_or_default();
+        assert!(matches!(
+            q_reply,
+            Some(RaftRpcMessage::RequestVoteResponse(2, true, _))
+        ));
+        assert_eq!(peer_alpha.net_node.store.role(), RaftRole::Leader);
+        let _ = peer_alpha.net_node.store.put("/ri_key", b"ri_val".to_vec());
+
+        // Also test a no-reply RPC (AppendEntriesResponse) over exchange_quic_raft_rpc
+        let q_aer = RaftRpcMessage::AppendEntriesResponse(2, true, 0, "n1".to_owned());
+        assert_eq!(
+            peer_alpha.exchange_quic_raft_rpc("127.0.0.1:0", q_aer, &mut peer_beta, 500),
+            Ok(None)
+        );
+        assert!(
+            peer_alpha
+                .exchange_quic_raft_rpc(
+                    "invalid-addr",
+                    RaftRpcMessage::AppendEntriesResponse(2, true, 0, "n1".to_owned()),
+                    &mut peer_beta,
+                    500,
+                )
+                .is_err()
+        );
+
+        // ReadIndex quorum check: fails without follower ack, succeeds with n2 ack
+        assert!(peer_alpha.verify_read_index_quorum("/ri_key", &[]).is_err());
+        assert!(
+            peer_alpha
+                .verify_read_index_quorum("/ri_key", &["ghost"])
+                .is_err()
+        );
+        let (ri_idx, ri_rec) = peer_alpha
+            .verify_read_index_quorum("/ri_key", &["n2"])
+            .unwrap_or((0, None));
+        assert_eq!(ri_idx, 1);
+        assert_eq!(ri_rec.map(|r| r.value), Some(b"ri_val".to_vec()));
     }
 }

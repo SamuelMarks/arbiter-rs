@@ -16,6 +16,39 @@ derive_more = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rkyv = { workspace = true }
+rustls = { workspace = true }
+rustls-pki-types = { workspace = true }
+quinn = { workspace = true }
+http = { workspace = true }
+http-body-util = { workspace = true }
+h2 = { workspace = true }
+hmac = { workspace = true }
+base16ct = { workspace = true }
+base64 = { workspace = true }
+tokio = { workspace = true }
+tokio-tungstenite = { workspace = true }
+prost = { workspace = true }
+prost-types = { workspace = true }
+tonic = { workspace = true }
+ed25519-dalek = { workspace = true }
+rcgen = { workspace = true }
+der = { workspace = true }
+ring = { workspace = true }
+crc32fast = { workspace = true }
+tokio-postgres = { workspace = true }
+flate2 = { workspace = true }
+zstd = { workspace = true }
+tar = { workspace = true }
+zip = { workspace = true }
+lzma-rs = { workspace = true }
+chacha20poly1305 = { workspace = true }
+rusqlite = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
+libloading = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+nix = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

@@ -17,6 +17,8 @@ arbiter-store = { workspace = true }
 arbiter-master = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+ratatui = { workspace = true }
+crossterm = { workspace = true }
 
 [dev-dependencies]
 arbiter-proto = { workspace = true }

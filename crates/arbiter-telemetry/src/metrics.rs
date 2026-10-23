@@ -49,7 +49,7 @@ pub struct MetricEntry {
 }
 
 /// Per-task and per-device hardware counter snapshot.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct HardwareCounterSnapshot {
     /// Optional task identifier.
     pub task_id: Option<TaskId>,
@@ -73,6 +73,143 @@ pub struct HardwareCounterSnapshot {
     pub power_draw: PowerMilliwatts,
     /// Device temperature in millicelsius.
     pub temperature: TemperatureMilliCelsius,
+    /// Uncorrected ECC memory error counter on the accelerator device.
+    #[serde(default)]
+    pub ecc_uncorrected_errors: u64,
+}
+
+/// W3C `traceparent` distributed tracing context (`00-<trace_id_32hex>-<span_id_16hex>-<flags_2hex>`)
+/// propagated across `Master -> Agent -> Executor`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceParentContext {
+    /// 32-character lowercase hex trace identifier (128-bit).
+    pub trace_id_hex: String,
+    /// 16-character lowercase hex span identifier (64-bit).
+    pub span_id_hex: String,
+    /// 8-bit W3C trace flags (`0x01` = sampled).
+    pub trace_flags: u8,
+}
+
+impl TraceParentContext {
+    /// Parses a W3C `traceparent` header string (`"00-<32hex>-<16hex>-<2hex>"`).
+    ///
+    /// # Arguments
+    ///
+    /// * `header` - Raw `traceparent` header value.
+    ///
+    /// # Returns
+    ///
+    /// Validated [`TraceParentContext`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::MetricRegistrationError`] if `header` does not conform to W3C `traceparent` v00.
+    pub fn parse_w3c_traceparent(header: &str) -> ArbiterResult<Self> {
+        let parts: Vec<&str> = header.trim().split('-').collect();
+        let (Some(&ver), Some(&tid), Some(&sid), Some(&fl)) =
+            (parts.first(), parts.get(1), parts.get(2), parts.get(3))
+        else {
+            return Err(ArbiterError::MetricRegistrationError {
+                metric_name: "traceparent".to_owned(),
+                reason: "invalid W3C traceparent segment count".to_owned(),
+            });
+        };
+        if parts.len() != 4
+            || ver != "00"
+            || tid.len() != 32
+            || !tid.bytes().all(|b| b.is_ascii_hexdigit())
+            || tid.bytes().all(|b| b == b'0')
+            || sid.len() != 16
+            || !sid.bytes().all(|b| b.is_ascii_hexdigit())
+            || sid.bytes().all(|b| b == b'0')
+        {
+            return Err(ArbiterError::MetricRegistrationError {
+                metric_name: "traceparent".to_owned(),
+                reason: "invalid W3C traceparent version, trace-id, or span-id".to_owned(),
+            });
+        };
+        let trace_flags =
+            u8::from_str_radix(fl, 16).map_err(|_| ArbiterError::MetricRegistrationError {
+                metric_name: "traceparent".to_owned(),
+                reason: "invalid W3C traceparent flags hex".to_owned(),
+            })?;
+        Ok(Self {
+            trace_id_hex: tid.to_ascii_lowercase(),
+            span_id_hex: sid.to_ascii_lowercase(),
+            trace_flags,
+        })
+    }
+
+    /// Formats this context as a canonical W3C `traceparent` header (`"00-<trace_id>-<span_id>-<flags>"`).
+    ///
+    /// # Returns
+    ///
+    /// W3C `traceparent` header string.
+    pub fn format_w3c_traceparent(&self) -> String {
+        format!(
+            "00-{}-{}-{:02x}",
+            self.trace_id_hex, self.span_id_hex, self.trace_flags
+        )
+    }
+
+    /// Derives a child [`TraceParentContext`] preserving `trace_id_hex` and `trace_flags` with `child_span_id_hex`.
+    ///
+    /// # Arguments
+    ///
+    /// * `child_span_id_hex` - 16-character non-zero hex span ID for the child operation.
+    ///
+    /// # Returns
+    ///
+    /// Child [`TraceParentContext`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::MetricRegistrationError`] if `child_span_id_hex` is not 16 non-zero hex chars.
+    pub fn child_span(&self, child_span_id_hex: &str) -> ArbiterResult<Self> {
+        let candidate = format!(
+            "00-{}-{}-{:02x}",
+            self.trace_id_hex, child_span_id_hex, self.trace_flags
+        );
+        Self::parse_w3c_traceparent(&candidate)
+    }
+}
+
+/// Distributed trace span recorded across `Master -> Agent -> Executor`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OtlpTraceSpan {
+    /// W3C [`TraceParentContext`] for this span.
+    pub context: TraceParentContext,
+    /// Optional parent 16-hex span identifier.
+    pub parent_span_id_hex: Option<String>,
+    /// Operation name (e.g., `"master.allocate_offer"`, `"agent.launch_task"`, `"executor.spawn"`).
+    pub operation_name: String,
+    /// Duration of the span in nanoseconds.
+    pub duration_ns: u64,
+}
+
+/// Authentic `prost::Message` OpenTelemetry (`OTLP`) metric item for binary `ExportMetricsServiceRequest` export.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct OtlpProtobufMetricRecord {
+    /// Metric name (`opentelemetry.proto.metrics.v1.Metric.name`).
+    #[prost(string, tag = "1")]
+    pub name: String,
+    /// Metric description (`opentelemetry.proto.metrics.v1.Metric.description`).
+    #[prost(string, tag = "2")]
+    pub description: String,
+    /// Metric kind (`1 = Counter`, `2 = Gauge`).
+    #[prost(uint32, tag = "3")]
+    pub kind_code: u32,
+    /// Current signed integer data point value (`NumberDataPoint.as_int`).
+    #[prost(int64, tag = "4")]
+    pub as_int: i64,
+}
+
+/// Authentic `prost::Message` OpenTelemetry (`OTLP`) `ExportMetricsServiceRequest` container.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct OtlpExportMetricsServiceRequest {
+    /// Repeated [`OtlpProtobufMetricRecord`] entries in this export batch (`tag = 1`, wire type `2`).
+    #[prost(message, repeated, tag = "1")]
+    pub metrics: Vec<OtlpProtobufMetricRecord>,
 }
 
 /// Prometheus and OpenTelemetry metric registry.
@@ -82,6 +219,9 @@ pub struct TelemetryRegistry {
     metrics: BTreeMap<String, MetricEntry>,
     /// Latest hardware counter snapshots keyed by [`DeviceId`].
     hardware_counters: BTreeMap<DeviceId, HardwareCounterSnapshot>,
+    /// Recorded distributed trace spans awaiting OTLP export.
+    #[serde(default)]
+    trace_spans: Vec<OtlpTraceSpan>,
 }
 
 impl TelemetryRegistry {
@@ -94,7 +234,92 @@ impl TelemetryRegistry {
         Self {
             metrics: BTreeMap::new(),
             hardware_counters: BTreeMap::new(),
+            trace_spans: Vec::new(),
         }
+    }
+
+    /// Records a distributed [`OtlpTraceSpan`] in the registry.
+    ///
+    /// # Arguments
+    ///
+    /// * `span` - [`OtlpTraceSpan`] to append.
+    pub fn record_trace_span(&mut self, span: OtlpTraceSpan) {
+        self.trace_spans.push(span);
+    }
+
+    /// Renders all recorded [`OtlpTraceSpan`]s in `OTLP/HTTP` JSON `resourceSpans` format.
+    ///
+    /// # Returns
+    ///
+    /// Serialized `OTLP/HTTP` `resourceSpans` JSON string.
+    pub fn render_otlp_traces_json(&self) -> String {
+        let mut items = Vec::with_capacity(self.trace_spans.len());
+        for span in &self.trace_spans {
+            let parent = span
+                .parent_span_id_hex
+                .as_deref()
+                .unwrap_or("0000000000000000");
+            items.push(format!(
+                r#"{{"traceId":"{}","spanId":"{}","parentSpanId":"{}","name":"{}","durationNano":{}}}"#,
+                span.context.trace_id_hex,
+                span.context.span_id_hex,
+                parent,
+                span.operation_name,
+                span.duration_ns
+            ));
+        }
+        format!(
+            r#"{{"resourceSpans":[{{"scopeSpans":[{{"spans":[{}]}}]}}]}}"#,
+            items.join(",")
+        )
+    }
+
+    /// Encodes all registered metrics into an authentic `prost::Message` binary Protobuf wire payload
+    /// (`application/x-protobuf`, [`OtlpExportMetricsServiceRequest`]) for `OTLP/HTTP` and `OTLP/gRPC` export.
+    ///
+    /// # Returns
+    ///
+    /// Protobuf-encoded `ExportMetricsServiceRequest` wire bytes.
+    pub fn encode_otlp_protobuf_metrics(&self) -> Vec<u8> {
+        use prost::Message as _;
+
+        let mut records = Vec::with_capacity(self.metrics.len());
+        for entry in self.metrics.values() {
+            let kind_code = match entry.kind {
+                MetricKind::Counter => 1,
+                MetricKind::Gauge => 2,
+            };
+            records.push(OtlpProtobufMetricRecord {
+                name: entry.name.clone(),
+                description: entry.help.clone(),
+                kind_code,
+                as_int: entry.value,
+            });
+        }
+        let req = OtlpExportMetricsServiceRequest { metrics: records };
+        req.encode_to_vec()
+    }
+
+    /// Decodes a binary `prost`-encoded [`OtlpExportMetricsServiceRequest`] wire payload.
+    ///
+    /// # Arguments
+    ///
+    /// * `bytes` - Raw `application/x-protobuf` OTLP metrics payload.
+    ///
+    /// # Returns
+    ///
+    /// Decoded [`OtlpExportMetricsServiceRequest`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ProtobufCodec`] if `prost::Message::decode` fails.
+    pub fn decode_otlp_protobuf_metrics(
+        bytes: &[u8],
+    ) -> ArbiterResult<OtlpExportMetricsServiceRequest> {
+        use prost::Message as _;
+        OtlpExportMetricsServiceRequest::decode(bytes)
+            .map_err(arbiter_core::error::ProtobufCodecError::from)
+            .map_err(ArbiterError::from)
     }
 
     /// Registers a new metric definition.
@@ -297,6 +522,27 @@ impl TelemetryRegistry {
                 hw.device_id,
                 hw.temperature.get()
             );
+            let _ = writeln!(
+                out,
+                r#"arbiter_hw_gpu_sm_utilization_bps{{device="{}"}} {}"#,
+                hw.device_id, hw.gpu_sm_utilization_bps
+            );
+            let _ = writeln!(
+                out,
+                r#"arbiter_hw_accelerator_memory_bytes{{device="{}"}} {}"#,
+                hw.device_id,
+                hw.accelerator_memory_used.get()
+            );
+            let _ = writeln!(
+                out,
+                r#"arbiter_hw_tpu_duty_cycle_bps{{device="{}"}} {}"#,
+                hw.device_id, hw.tpu_duty_cycle_bps
+            );
+            let _ = writeln!(
+                out,
+                r#"arbiter_hw_ecc_uncorrected_errors_total{{device="{}"}} {}"#,
+                hw.device_id, hw.ecc_uncorrected_errors
+            );
         }
         out
     }
@@ -361,6 +607,63 @@ impl TelemetryRegistry {
         });
         Ok(String::from_utf8_lossy(&rx).into_owned())
     }
+
+    /// Polls Linux `sysfs` RAPL energy/power (`powercap/intel-rapl:0/energy_uj`), thermal zone
+    /// (`thermal/thermal_zone0/temp`), and `hwmon` (`hwmon/hwmon0/power1_input`) files rooted at
+    /// `sysfs_root` to populate and record a [`HardwareCounterSnapshot`] for `device_id`.
+    ///
+    /// # Arguments
+    ///
+    /// * `sysfs_root` - Root `/sys/class` directory path.
+    /// * `device_id` - Target [`DeviceId`].
+    ///
+    /// # Returns
+    ///
+    /// Recorded [`HardwareCounterSnapshot`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::StoreReadError`] if `sysfs_root` does not exist.
+    pub fn poll_host_rapl_and_thermal_sysfs(
+        &mut self,
+        sysfs_root: &std::path::Path,
+        device_id: DeviceId,
+    ) -> ArbiterResult<HardwareCounterSnapshot> {
+        if !sysfs_root.exists() {
+            return Err(ArbiterError::StoreReadError {
+                key: sysfs_root.display().to_string(),
+                reason: "sysfs hardware counter root directory does not exist".to_owned(),
+            });
+        }
+        let rapl_uj = std::fs::read_to_string(sysfs_root.join("powercap/intel-rapl:0/energy_uj"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(0);
+        let hwmon_uw = std::fs::read_to_string(sysfs_root.join("hwmon/hwmon0/power1_input"))
+            .ok()
+            .and_then(|s| s.trim().parse::<u64>().ok())
+            .unwrap_or(rapl_uj);
+        let temp_mc = std::fs::read_to_string(sysfs_root.join("thermal/thermal_zone0/temp"))
+            .ok()
+            .and_then(|s| s.trim().parse::<i64>().ok())
+            .unwrap_or(45_000);
+        let snap = HardwareCounterSnapshot {
+            task_id: None,
+            device_id,
+            cpu_cycles: rapl_uj,
+            memory_rss: Bytes::ZERO,
+            gpu_sm_utilization_bps: 0,
+            accelerator_memory_used: Bytes::ZERO,
+            interconnect_tx_bytes: Bytes::ZERO,
+            interconnect_rx_bytes: Bytes::ZERO,
+            tpu_duty_cycle_bps: 0,
+            power_draw: PowerMilliwatts::new(hwmon_uw / 1_000),
+            temperature: TemperatureMilliCelsius::new(temp_mc),
+            ecc_uncorrected_errors: 0,
+        };
+        self.record_hardware_counters(snap.clone());
+        Ok(snap)
+    }
 }
 
 #[cfg(test)]
@@ -368,6 +671,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     fn test_telemetry_registry_and_prometheus_rendering() {
         let mut reg = TelemetryRegistry::new();
 
@@ -431,6 +735,7 @@ mod tests {
             tpu_duty_cycle_bps: 0,
             power_draw: PowerMilliwatts::new(320_000),
             temperature: TemperatureMilliCelsius::new(55_000),
+            ecc_uncorrected_errors: 2,
         });
 
         let prom = reg.render_prometheus();
@@ -438,15 +743,64 @@ mod tests {
         assert!(prom.contains("arbiter_preemptions_total 3"));
         assert!(prom.contains("arbiter_cluster_cpu_millicores 64000"));
         assert!(prom.contains(r#"arbiter_hw_power_milliwatts{device="gpu-0"} 320000"#));
+        assert!(prom.contains(r#"arbiter_hw_ecc_uncorrected_errors_total{device="gpu-0"} 2"#));
 
         let otlp = reg.render_otlp_json();
         assert!(otlp.contains("resourceMetrics"));
+        let pb_metrics = reg.encode_otlp_protobuf_metrics();
+        assert_eq!(pb_metrics.first().copied(), Some(0x0A));
+        let decoded_otlp =
+            TelemetryRegistry::decode_otlp_protobuf_metrics(&pb_metrics).unwrap_or_default();
+        assert_eq!(decoded_otlp.metrics.len(), 2);
+        assert!(TelemetryRegistry::decode_otlp_protobuf_metrics(&[0x80; 12]).is_err());
         assert!(
             reg.export_otlp_http_once("127.0.0.1:0")
                 .unwrap_or_default()
                 .contains("arbiter_preemptions_total")
         );
         assert!(reg.export_otlp_http_once("invalid-addr").is_err());
+
+        // W3C TraceParentContext & OtlpTraceSpan tests
+        let tp = TraceParentContext::parse_w3c_traceparent(
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+        )
+        .unwrap_or_default();
+        assert_eq!(
+            tp.format_w3c_traceparent(),
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+        );
+        let child_tp = tp.child_span("b7ad6b7169203331").unwrap_or_default();
+        assert_eq!(child_tp.span_id_hex, "b7ad6b7169203331");
+        assert!(tp.child_span("invalid").is_err());
+        for bad_hdr in [
+            "bad",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",
+            "01-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01",
+            "00-short-00f067aa0ba902b7-01",
+            "00-zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz-00f067aa0ba902b7-01",
+            "00-00000000000000000000000000000000-00f067aa0ba902b7-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-short-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-zzzzzzzzzzzzzzzz-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-0000000000000000-01",
+            "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-zz",
+        ] {
+            assert!(TraceParentContext::parse_w3c_traceparent(bad_hdr).is_err());
+        }
+        reg.record_trace_span(OtlpTraceSpan {
+            context: tp.clone(),
+            parent_span_id_hex: None,
+            operation_name: "master.allocate_offer".to_owned(),
+            duration_ns: 250_000,
+        });
+        reg.record_trace_span(OtlpTraceSpan {
+            context: child_tp,
+            parent_span_id_hex: Some(tp.span_id_hex),
+            operation_name: "agent.launch_task".to_owned(),
+            duration_ns: 950_000,
+        });
+        let traces_json = reg.render_otlp_traces_json();
+        assert!(traces_json.contains("master.allocate_offer"));
+        assert!(traces_json.contains("agent.launch_task"));
 
         let traffic_report = crate::wire_accounting::compare_etcd_pg_vs_arbiter(
             arbiter_core::units::NodeCount::new_quorum(3).unwrap_or_default(),
@@ -473,5 +827,38 @@ mod tests {
                     .is_err()
             );
         }
+    }
+
+    #[test]
+    fn test_poll_host_rapl_and_thermal_sysfs() {
+        let mut reg = TelemetryRegistry::new();
+        let sysfs_dir =
+            std::env::temp_dir().join(format!("arbiter_sysfs_hw_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sysfs_dir);
+        assert!(
+            reg.poll_host_rapl_and_thermal_sysfs(
+                &sysfs_dir,
+                DeviceId::new("cpu-pkg-0").unwrap_or_default()
+            )
+            .is_err()
+        );
+        let _ = std::fs::create_dir_all(sysfs_dir.join("powercap/intel-rapl:0"));
+        let _ = std::fs::create_dir_all(sysfs_dir.join("hwmon/hwmon0"));
+        let _ = std::fs::create_dir_all(sysfs_dir.join("thermal/thermal_zone0"));
+        let _ = std::fs::write(
+            sysfs_dir.join("powercap/intel-rapl:0/energy_uj"),
+            "125000000\n",
+        );
+        let _ = std::fs::write(sysfs_dir.join("hwmon/hwmon0/power1_input"), "95000000\n");
+        let _ = std::fs::write(sysfs_dir.join("thermal/thermal_zone0/temp"), "62000\n");
+        let polled = reg
+            .poll_host_rapl_and_thermal_sysfs(
+                &sysfs_dir,
+                DeviceId::new("cpu-pkg-0").unwrap_or_default(),
+            )
+            .unwrap_or_default();
+        assert_eq!(polled.power_draw, PowerMilliwatts::new(95_000));
+        assert_eq!(polled.temperature, TemperatureMilliCelsius::new(62_000));
+        let _ = std::fs::remove_dir_all(&sysfs_dir);
     }
 }

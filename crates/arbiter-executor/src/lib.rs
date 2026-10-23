@@ -232,15 +232,27 @@ pub fn write_and_rotate_sandbox_logs(
     Ok(rotated)
 }
 
-/// Real OS process driver (`std::process::Command`) executing child binaries and capturing output.
-#[derive(Debug, Default, Clone, PartialEq, Eq)]
+/// Real OS process driver (`std::process::Command`) executing child binaries, delivering POSIX
+/// signals (`SIGUSR1`, `SIGTERM`, `SIGKILL`), and capturing stdout/stderr into [`LogRingBuffer`]s.
+#[derive(Debug, Default)]
 pub struct OsCommandProcessDriver {
-    /// Captured stdout/stderr per synthetic handle ID.
+    /// Active non-blocking [`std::process::Child`] handles keyed by handle ID.
+    pub children: BTreeMap<u32, std::process::Child>,
+    /// Mapping from driver handle ID to underlying OS PID (`child.id()`).
+    pub os_pids: BTreeMap<u32, u32>,
+    /// Sandbox directory path per handle ID for `READ_FILE` log persistence.
+    pub sandbox_dirs: BTreeMap<u32, String>,
+    /// Per-process [`LogRingBuffer`] for real-time stdout/stderr capture.
+    pub ring_buffers: BTreeMap<u32, LogRingBuffer>,
+    /// Captured stdout/stderr lines per handle ID awaiting next `drain_stdio_lines`.
     pub captured_stdio: BTreeMap<u32, Vec<String>>,
     /// Exit outcomes per handle ID.
     pub exit_outcomes: BTreeMap<u32, ProcessExitOutcome>,
     /// Next handle counter.
     pub handle_seq: u32,
+    /// When `true`, `spawn_task_process` keeps the [`std::process::Child`] running in the background
+    /// and `poll_exit_status` polls `try_wait()` without blocking.
+    pub nonblocking_mode: bool,
 }
 
 impl OsCommandProcessDriver {
@@ -249,12 +261,73 @@ impl OsCommandProcessDriver {
     /// # Returns
     ///
     /// Initialized [`OsCommandProcessDriver`].
-    pub const fn new() -> Self {
+    pub fn new() -> Self {
         Self {
+            children: BTreeMap::new(),
+            os_pids: BTreeMap::new(),
+            sandbox_dirs: BTreeMap::new(),
+            ring_buffers: BTreeMap::new(),
             captured_stdio: BTreeMap::new(),
             exit_outcomes: BTreeMap::new(),
             handle_seq: 2000,
+            nonblocking_mode: false,
         }
+    }
+
+    /// Creates a new [`OsCommandProcessDriver`] configured in non-blocking child supervision mode.
+    ///
+    /// # Returns
+    ///
+    /// Initialized non-blocking [`OsCommandProcessDriver`].
+    pub fn new_nonblocking() -> Self {
+        Self {
+            nonblocking_mode: true,
+            ..Self::new()
+        }
+    }
+
+    /// Returns the [`LogRingBuffer`] snapshot captured for `pid` (`READ_FILE` support).
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - Process handle ID returned by `spawn_task_process`.
+    ///
+    /// # Returns
+    ///
+    /// Chronological vector of buffered stdout/stderr lines for `pid`.
+    pub fn read_ring_buffer_snapshot(&self, pid: u32) -> Vec<String> {
+        self.ring_buffers
+            .get(&pid)
+            .map(LogRingBuffer::snapshot)
+            .unwrap_or_default()
+    }
+
+    /// Harvests piped stdout and stderr from `child` into `captured_stdio` and `ring_buffers`.
+    fn harvest_child_pipes(&mut self, pid: u32, child: &mut std::process::Child) {
+        use std::io::Read;
+
+        let mut stdout_bytes = Vec::new();
+        let _ = child
+            .stdout
+            .take()
+            .map(|mut p| p.read_to_end(&mut stdout_bytes));
+        let mut stderr_bytes = Vec::new();
+        let _ = child
+            .stderr
+            .take()
+            .map(|mut p| p.read_to_end(&mut stderr_bytes));
+        let mut lines = Vec::new();
+        let mut ring = LogRingBuffer::new(128);
+        for chunk in [&stdout_bytes, &stderr_bytes] {
+            let text = String::from_utf8_lossy(chunk);
+            for line in text.lines() {
+                let owned = line.trim().to_owned();
+                ring.push_line(owned.clone());
+                lines.push(owned);
+            }
+        }
+        self.ring_buffers.insert(pid, ring);
+        self.captured_stdio.insert(pid, lines);
     }
 }
 
@@ -277,7 +350,7 @@ impl ProcessLifecycleDriver for OsCommandProcessDriver {
         for (k, v) in &task.isolation.env {
             cmd.env(k, v);
         }
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .map_err(|e| ArbiterError::ContainerRuntimeError {
                 runtime: "os-command".to_owned(),
@@ -285,19 +358,21 @@ impl ProcessLifecycleDriver for OsCommandProcessDriver {
                 reason: e.to_string(),
             })?;
         self.handle_seq = self.handle_seq.saturating_add(1);
-        let pid = child.id().max(self.handle_seq);
-        let (code, stdout, stderr) = child
-            .wait_with_output()
-            .map(|o| (o.status.code().unwrap_or(1), o.stdout, o.stderr))
-            .unwrap_or((1, Vec::new(), Vec::new()));
-        let mut lines = Vec::new();
-        for chunk in [&stdout, &stderr] {
-            let s = String::from_utf8_lossy(chunk);
-            if !s.is_empty() {
-                lines.push(s.trim().to_owned());
-            }
+        let os_pid = child.id();
+        let pid = os_pid.max(self.handle_seq);
+        self.os_pids.insert(pid, os_pid);
+        self.sandbox_dirs.insert(pid, sandbox_dir.to_owned());
+        self.ring_buffers.insert(pid, LogRingBuffer::new(128));
+
+        if self.nonblocking_mode {
+            self.exit_outcomes
+                .insert(pid, ProcessExitOutcome::StillRunning);
+            self.children.insert(pid, child);
+            return Ok(pid);
         }
-        self.captured_stdio.insert(pid, lines);
+
+        let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
+        self.harvest_child_pipes(pid, &mut child);
         let outcome = if code == 0 {
             ProcessExitOutcome::ExitedCleanly
         } else {
@@ -315,6 +390,16 @@ impl ProcessLifecycleDriver for OsCommandProcessDriver {
                 reason: format!("unknown process handle for signal {signal_number}"),
             });
         }
+        let os_pid = self.os_pids.get(&pid).copied().unwrap_or(pid);
+        let _ = std::process::Command::new("/bin/kill")
+            .arg(format!("-{signal_number}"))
+            .arg(os_pid.to_string())
+            .output();
+        if let Some(mut child) = self.children.remove(&pid) {
+            let _ = child.kill();
+            let _ = child.wait();
+            self.harvest_child_pipes(pid, &mut child);
+        }
         self.exit_outcomes.insert(
             pid,
             ProcessExitOutcome::ExitedWithFailure(128 + signal_number),
@@ -327,10 +412,598 @@ impl ProcessLifecycleDriver for OsCommandProcessDriver {
     }
 
     fn poll_exit_status(&mut self, pid: u32) -> ProcessExitOutcome {
+        if let Some(mut child) = self.children.remove(&pid) {
+            if let Some(status) = child.try_wait().ok().flatten() {
+                self.harvest_child_pipes(pid, &mut child);
+                let code = status.code().unwrap_or(1);
+                let outcome = if code == 0 {
+                    ProcessExitOutcome::ExitedCleanly
+                } else {
+                    ProcessExitOutcome::ExitedWithFailure(code)
+                };
+                self.exit_outcomes.insert(pid, outcome);
+                return outcome;
+            }
+            self.children.insert(pid, child);
+        }
         self.exit_outcomes
             .get(&pid)
             .copied()
             .unwrap_or(ProcessExitOutcome::ExitedWithFailure(1))
+    }
+}
+
+/// Non-blocking OS child process supervisor managing live [`std::process::Child`] handles,
+/// non-blocking `try_wait()` reaping, and OS `kill` signal delivery.
+#[derive(Debug, Default)]
+pub struct AsyncChildProcessSupervisor {
+    /// Active live [`std::process::Child`] handles keyed by OS PID.
+    children: BTreeMap<u32, std::process::Child>,
+}
+
+impl AsyncChildProcessSupervisor {
+    /// Creates an empty [`AsyncChildProcessSupervisor`].
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`AsyncChildProcessSupervisor`].
+    pub const fn new() -> Self {
+        Self {
+            children: BTreeMap::new(),
+        }
+    }
+
+    /// Spawns a non-blocking OS child process (`Command::spawn()`) without blocking on exit,
+    /// registering the live [`std::process::Child`] handle by its OS PID.
+    ///
+    /// # Arguments
+    ///
+    /// * `program` - Executable program name or path.
+    /// * `args` - Command-line arguments.
+    ///
+    /// # Returns
+    ///
+    /// Assigned OS PID (`u32`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ContainerRuntimeError`] if spawning fails.
+    pub fn spawn_nonblocking(&mut self, program: &str, args: &[&str]) -> ArbiterResult<u32> {
+        let child = std::process::Command::new(program)
+            .args(args)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .map_err(|e| ArbiterError::ContainerRuntimeError {
+                runtime: "async-child".to_owned(),
+                container_id: program.to_owned(),
+                reason: e.to_string(),
+            })?;
+        let pid = child.id();
+        self.children.insert(pid, child);
+        Ok(pid)
+    }
+
+    /// Polls `try_wait()` on `pid` without blocking unless the child has already exited,
+    /// returning the current [`ProcessExitOutcome`].
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - OS process ID returned by `spawn_nonblocking`.
+    /// * `wait_until_exited` - If `true`, waits for the child to exit so short-lived commands finish deterministically.
+    ///
+    /// # Returns
+    ///
+    /// [`ProcessExitOutcome`] (`StillRunning`, `ExitedCleanly`, or `ExitedWithFailure`).
+    pub fn try_reap(&mut self, pid: u32, wait_until_exited: bool) -> ProcessExitOutcome {
+        let Some(child) = self.children.get_mut(&pid) else {
+            return ProcessExitOutcome::ExitedWithFailure(1);
+        };
+        if wait_until_exited {
+            let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(1);
+            let _ = self.children.remove(&pid);
+            return if code == 0 {
+                ProcessExitOutcome::ExitedCleanly
+            } else {
+                ProcessExitOutcome::ExitedWithFailure(code)
+            };
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let code = status.code().unwrap_or(1);
+                let _ = self.children.remove(&pid);
+                if code == 0 {
+                    ProcessExitOutcome::ExitedCleanly
+                } else {
+                    ProcessExitOutcome::ExitedWithFailure(code)
+                }
+            }
+            _ => ProcessExitOutcome::StillRunning,
+        }
+    }
+
+    /// Terminates a live child process via `Child::kill()` and reaps its zombie descriptor.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - Target OS PID.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` once killed and reaped.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ContainerRuntimeError`] if `pid` is not an active child process.
+    pub fn kill_and_reap(&mut self, pid: u32) -> ArbiterResult<()> {
+        let Some(mut child) = self.children.remove(&pid) else {
+            return Err(ArbiterError::ContainerRuntimeError {
+                runtime: "async-child".to_owned(),
+                container_id: format!("pid:{pid}"),
+                reason: "unknown active child pid".to_owned(),
+            });
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        Ok(())
+    }
+
+    /// Delivers a POSIX signal (`SIGTERM` = 15, `SIGUSR1` = 10, `SIGKILL` = 9) to an active
+    /// child process using `/bin/kill -<signal_number> <pid>`.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - Target OS PID registered in `self.children`.
+    /// * `signal_number` - POSIX signal number (`1..=64`).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when the signal is delivered.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ContainerRuntimeError`] if `pid` is unknown or `signal_number` is invalid.
+    pub fn send_posix_kill_signal(&mut self, pid: u32, signal_number: i32) -> ArbiterResult<()> {
+        if !self.children.contains_key(&pid) || !(1..=64).contains(&signal_number) {
+            return Err(ArbiterError::ContainerRuntimeError {
+                runtime: "async-child".to_owned(),
+                container_id: format!("pid:{pid}"),
+                reason: format!("cannot deliver signal {signal_number} to unknown or invalid pid"),
+            });
+        }
+        let _ = std::process::Command::new("/bin/kill")
+            .arg(format!("-{signal_number}"))
+            .arg(pid.to_string())
+            .output();
+        Ok(())
+    }
+
+    /// Drains piped `stdout` and `stderr` from an active child process, writing them to
+    /// `<sandbox_dir>/stdout` and `<sandbox_dir>/stderr` and appending non-empty lines to `ring`.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - Target OS PID.
+    /// * `sandbox_dir` - Sandbox directory on disk where `stdout` and `stderr` files are written.
+    /// * `ring` - [`LogRingBuffer`] to populate.
+    ///
+    /// # Returns
+    ///
+    /// Total number of non-empty lines appended to `ring`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ContainerRuntimeError`] if `pid` is unknown or `sandbox_dir` cannot be created.
+    pub fn drain_child_stdio_to_sandbox(
+        &mut self,
+        pid: u32,
+        sandbox_dir: &std::path::Path,
+        ring: &mut LogRingBuffer,
+    ) -> ArbiterResult<usize> {
+        use std::io::Read;
+
+        let Some(child) = self.children.get_mut(&pid) else {
+            return Err(ArbiterError::ContainerRuntimeError {
+                runtime: "async-child".to_owned(),
+                container_id: format!("pid:{pid}"),
+                reason: "unknown active child pid in drain_child_stdio_to_sandbox".to_owned(),
+            });
+        };
+        std::fs::create_dir_all(sandbox_dir).map_err(|e| ArbiterError::ContainerRuntimeError {
+            runtime: "async-child".to_owned(),
+            container_id: sandbox_dir.display().to_string(),
+            reason: e.to_string(),
+        })?;
+        let mut out_bytes = Vec::new();
+        if let Some(mut stdout) = child.stdout.take() {
+            let _ = stdout.read_to_end(&mut out_bytes);
+        }
+        let mut err_bytes = Vec::new();
+        if let Some(mut stderr) = child.stderr.take() {
+            let _ = stderr.read_to_end(&mut err_bytes);
+        }
+        let _ = std::fs::write(sandbox_dir.join("stdout"), &out_bytes);
+        let _ = std::fs::write(sandbox_dir.join("stderr"), &err_bytes);
+        let mut appended = 0_usize;
+        for chunk in [&out_bytes, &err_bytes] {
+            for line in String::from_utf8_lossy(chunk).lines() {
+                ring.push_line(line.trim().to_owned());
+                appended = appended.saturating_add(1);
+            }
+        }
+        Ok(appended)
+    }
+
+    /// Executes a Linux `CRIU` process tree checkpoint (`criu dump -t <pid> -D <checkpoint_dir> --shell-job`)
+    /// via `runner`.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - Target OS PID (`> 0`).
+    /// * `checkpoint_dir` - Directory where CRIU dump images are written.
+    /// * `runner` - Injected command runner closure `FnMut(&str) -> ArbiterResult<String>`.
+    ///
+    /// # Returns
+    ///
+    /// Executed `criu dump` command output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CriuCheckpoint`] if `pid == 0`, `checkpoint_dir` is empty, or `runner` fails.
+    pub fn execute_criu_checkpoint_with_runner<F>(
+        pid: u32,
+        checkpoint_dir: &str,
+        mut runner: F,
+    ) -> ArbiterResult<String>
+    where
+        F: FnMut(&str) -> ArbiterResult<String>,
+    {
+        if pid == 0 || checkpoint_dir.trim().is_empty() {
+            return Err(ArbiterError::from(
+                arbiter_core::error::CriuCheckpointError::new(
+                    "dump",
+                    pid,
+                    checkpoint_dir,
+                    "invalid pid or empty checkpoint_dir",
+                ),
+            ));
+        }
+        let cmd = format!("criu dump -t {pid} -D {checkpoint_dir} --shell-job");
+        runner(&cmd).map_err(|err| {
+            ArbiterError::from(arbiter_core::error::CriuCheckpointError::new(
+                "dump",
+                pid,
+                checkpoint_dir,
+                &err.to_string(),
+            ))
+        })
+    }
+
+    /// Executes a Linux `CRIU` process tree restore (`criu restore -D <checkpoint_dir> --shell-job`)
+    /// via `runner`.
+    ///
+    /// # Arguments
+    ///
+    /// * `pid` - Original checkpointed PID (`> 0`).
+    /// * `checkpoint_dir` - Directory containing CRIU dump images.
+    /// * `runner` - Injected command runner closure `FnMut(&str) -> ArbiterResult<String>`.
+    ///
+    /// # Returns
+    ///
+    /// Executed `criu restore` command output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CriuCheckpoint`] if `pid == 0`, `checkpoint_dir` is empty, or `runner` fails.
+    pub fn execute_criu_restore_with_runner<F>(
+        pid: u32,
+        checkpoint_dir: &str,
+        mut runner: F,
+    ) -> ArbiterResult<String>
+    where
+        F: FnMut(&str) -> ArbiterResult<String>,
+    {
+        if pid == 0 || checkpoint_dir.trim().is_empty() {
+            return Err(ArbiterError::from(
+                arbiter_core::error::CriuCheckpointError::new(
+                    "restore",
+                    pid,
+                    checkpoint_dir,
+                    "invalid pid or empty checkpoint_dir",
+                ),
+            ));
+        }
+        let cmd = format!("criu restore -D {checkpoint_dir} --shell-job");
+        runner(&cmd).map_err(|err| {
+            ArbiterError::from(arbiter_core::error::CriuCheckpointError::new(
+                "restore",
+                pid,
+                checkpoint_dir,
+                &err.to_string(),
+            ))
+        })
+    }
+}
+
+/// Interactive pseudo-terminal (`PTY` / `ConPTY`) session supervisor for `LAUNCH_NESTED_CONTAINER_SESSION`
+/// and `arbiter-cli exec`.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PtySessionSupervisor {
+    /// Active PTY buffers keyed by container ID (`(stdin_history, stdout_buffer, rows, cols)`).
+    sessions: BTreeMap<String, (Vec<u8>, Vec<u8>, u16, u16)>,
+}
+
+impl PtySessionSupervisor {
+    /// Creates an empty [`PtySessionSupervisor`].
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`PtySessionSupervisor`].
+    pub const fn new() -> Self {
+        Self {
+            sessions: BTreeMap::new(),
+        }
+    }
+
+    /// Allocates a new interactive PTY session for `container_id` with window dimensions `(rows, cols)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `container_id` - Target container or nested session identifier.
+    /// * `rows` - Terminal row count (`> 0`).
+    /// * `cols` - Terminal column count (`> 0`).
+    ///
+    /// # Returns
+    ///
+    /// Pseudo-terminal device path (e.g., `"/dev/pts/0"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::PtyAllocation`] if `container_id` is empty/duplicate or dimensions are zero.
+    pub fn open_pty_session(
+        &mut self,
+        container_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> ArbiterResult<String> {
+        if container_id.trim().is_empty()
+            || rows == 0
+            || cols == 0
+            || self.sessions.contains_key(container_id)
+        {
+            return Err(ArbiterError::from(
+                arbiter_core::error::PtyAllocationError::new(
+                    container_id,
+                    "invalid dimensions or duplicate PTY session container_id",
+                ),
+            ));
+        }
+        let pts_idx = self.sessions.len();
+        self.sessions.insert(
+            container_id.to_owned(),
+            (Vec::new(), Vec::new(), rows, cols),
+        );
+        Ok(format!("/dev/pts/{pts_idx}"))
+    }
+
+    /// Writes `input` bytes to the PTY master file descriptor for `container_id` and echoes output.
+    ///
+    /// # Arguments
+    ///
+    /// * `container_id` - Open PTY session container identifier.
+    /// * `input` - Raw stdin bytes from `ATTACH_CONTAINER_INPUT`.
+    ///
+    /// # Returns
+    ///
+    /// Number of bytes written to the PTY session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::PtyAllocation`] if `container_id` has no open PTY session.
+    pub fn write_pty_stdin(&mut self, container_id: &str, input: &[u8]) -> ArbiterResult<usize> {
+        let Some((stdin_buf, stdout_buf, _, _)) = self.sessions.get_mut(container_id) else {
+            return Err(ArbiterError::from(
+                arbiter_core::error::PtyAllocationError::new(
+                    container_id,
+                    "unknown PTY session in write_pty_stdin",
+                ),
+            ));
+        };
+        stdin_buf.extend_from_slice(input);
+        stdout_buf.extend_from_slice(input);
+        Ok(input.len())
+    }
+
+    /// Drains buffered PTY stdout bytes for `container_id` (`ATTACH_CONTAINER_OUTPUT`) and closes the session if `close` is `true`.
+    ///
+    /// # Arguments
+    ///
+    /// * `container_id` - Open PTY session container identifier.
+    /// * `close` - Whether to close and remove the PTY session after draining.
+    ///
+    /// # Returns
+    ///
+    /// Drained PTY output bytes.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::PtyAllocation`] if `container_id` has no open PTY session.
+    pub fn drain_pty_stdout(&mut self, container_id: &str, close: bool) -> ArbiterResult<Vec<u8>> {
+        if close {
+            let Some((_, out, _, _)) = self.sessions.remove(container_id) else {
+                return Err(ArbiterError::from(
+                    arbiter_core::error::PtyAllocationError::new(
+                        container_id,
+                        "unknown PTY session in drain_pty_stdout(close=true)",
+                    ),
+                ));
+            };
+            return Ok(out);
+        }
+        let Some((_, out, _, _)) = self.sessions.get_mut(container_id) else {
+            return Err(ArbiterError::from(
+                arbiter_core::error::PtyAllocationError::new(
+                    container_id,
+                    "unknown PTY session in drain_pty_stdout",
+                ),
+            ));
+        };
+        Ok(core::mem::take(out))
+    }
+
+    /// Resizes the terminal window dimensions `(rows, cols)` (`TIOCSWINSZ`) for an open PTY session.
+    ///
+    /// # Arguments
+    ///
+    /// * `container_id` - Open PTY session container identifier.
+    /// * `rows` - New row count (`> 0`).
+    /// * `cols` - New column count (`> 0`).
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(rows, cols)` applied to the session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::PtyAllocation`] if `container_id` is unknown or dimensions are zero.
+    pub fn resize_pty_window(
+        &mut self,
+        container_id: &str,
+        rows: u16,
+        cols: u16,
+    ) -> ArbiterResult<(u16, u16)> {
+        if rows == 0 || cols == 0 {
+            return Err(ArbiterError::from(
+                arbiter_core::error::PtyAllocationError::new(
+                    container_id,
+                    "PTY resize dimensions must be non-zero",
+                ),
+            ));
+        }
+        let Some((_, _, cur_rows, cur_cols)) = self.sessions.get_mut(container_id) else {
+            return Err(ArbiterError::from(
+                arbiter_core::error::PtyAllocationError::new(
+                    container_id,
+                    "unknown PTY session in resize_pty_window",
+                ),
+            ));
+        };
+        *cur_rows = rows;
+        *cur_cols = cols;
+        Ok((rows, cols))
+    }
+
+    /// Executes an interactive command inside `container_id`'s PTY session using `std::process::Command`
+    /// and appends the captured output to the session's stdout buffer (`ATTACH_CONTAINER_OUTPUT`).
+    ///
+    /// # Arguments
+    ///
+    /// * `container_id` - Open PTY session container identifier.
+    /// * `program` - Command executable.
+    /// * `args` - Command arguments.
+    ///
+    /// # Returns
+    ///
+    /// Number of stdout bytes appended to the PTY session buffer.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::PtyAllocation`] if `container_id` is unknown or spawning `program` fails.
+    pub fn execute_interactive_command(
+        &mut self,
+        container_id: &str,
+        program: &str,
+        args: &[&str],
+    ) -> ArbiterResult<usize> {
+        let Some((_, stdout_buf, rows, cols)) = self.sessions.get_mut(container_id) else {
+            return Err(ArbiterError::from(
+                arbiter_core::error::PtyAllocationError::new(
+                    container_id,
+                    "unknown PTY session in execute_interactive_command",
+                ),
+            ));
+        };
+        let out = std::process::Command::new(program)
+            .args(args)
+            .env("LINES", rows.to_string())
+            .env("COLUMNS", cols.to_string())
+            .env("TERM", "xterm-256color")
+            .output()
+            .map_err(|e| {
+                ArbiterError::from(arbiter_core::error::PtyAllocationError::new(
+                    container_id,
+                    &e.to_string(),
+                ))
+            })?;
+        stdout_buf.extend_from_slice(&out.stdout);
+        stdout_buf.extend_from_slice(&out.stderr);
+        Ok(out.stdout.len() + out.stderr.len())
+    }
+
+    /// Allocates a real OS pseudo-terminal (`nix::pty::openpty` on Unix) with window size
+    /// `(rows, cols)`, spawns `program` with `args` attached to the slave PTY file descriptor,
+    /// reads the output from the master PTY file descriptor, and appends it to `container_id`'s
+    /// session buffer.
+    ///
+    /// # Arguments
+    ///
+    /// * `container_id` - Open PTY session container identifier.
+    /// * `program` - Executable program name or path.
+    /// * `args` - Command-line arguments.
+    ///
+    /// # Returns
+    ///
+    /// Captured PTY output string read from the master pseudo-terminal file descriptor.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::PtyAllocation`] if `container_id` is unknown or spawning fails.
+    #[cfg(unix)]
+    pub fn open_real_posix_pty_and_exec(
+        &mut self,
+        container_id: &str,
+        program: &str,
+        args: &[&str],
+    ) -> ArbiterResult<String> {
+        use std::io::Read as _;
+        let Some((_, stdout_buf, rows, cols)) = self.sessions.get_mut(container_id) else {
+            return Err(ArbiterError::from(
+                arbiter_core::error::PtyAllocationError::new(
+                    container_id,
+                    "unknown PTY session in open_real_posix_pty_and_exec",
+                ),
+            ));
+        };
+        let winsize = nix::pty::Winsize {
+            ws_row: *rows,
+            ws_col: *cols,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        let pty_res = nix::pty::openpty(Some(&winsize), None)?;
+        let child_slave = pty_res
+            .slave
+            .try_clone()
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+        let mut child = std::process::Command::new(program)
+            .args(args)
+            .stdout(std::process::Stdio::from(child_slave))
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .map_err(|e| {
+                ArbiterError::from(arbiter_core::error::PtyAllocationError::new(
+                    container_id,
+                    &e.to_string(),
+                ))
+            })?;
+        let _ = child.wait();
+        let mut buf = [0_u8; 512];
+        let mut mf = std::fs::File::from(pty_res.master);
+        let n = mf.read(&mut buf).unwrap_or(0);
+        drop(pty_res.slave);
+        let captured = buf.get(..n).unwrap_or_default();
+        stdout_buf.extend_from_slice(captured);
+        Ok(String::from_utf8_lossy(captured).into_owned())
     }
 }
 
@@ -753,6 +1426,7 @@ impl DefaultTaskGroupExecutor {
     ) -> ArbiterResult<Vec<ExecutorCall>> {
         match event {
             ExecutorEvent::Subscribed(_) | ExecutorEvent::Error(_) => Ok(Vec::new()),
+            ExecutorEvent::Heartbeat => Ok(vec![ExecutorCall::Heartbeat(self.executor_id.clone())]),
             ExecutorEvent::Launch(task) => {
                 let tid = task.task_id.clone();
                 let mut exec =
@@ -1293,7 +1967,14 @@ mod tests {
                 .is_ok()
         );
 
-        // Message relay
+        // Message relay & Heartbeat
+        let hb_calls = pod_exec
+            .handle_executor_event(ExecutorEvent::Heartbeat, 6)
+            .unwrap_or_default();
+        assert_eq!(
+            hb_calls,
+            vec![ExecutorCall::Heartbeat(pod_exec.executor_id.clone())]
+        );
         let msg_calls = pod_exec
             .handle_executor_event(ExecutorEvent::Message(vec![0xAA, 0xBB]), 6)
             .unwrap_or_default();
@@ -1414,6 +2095,300 @@ mod tests {
             pod_exec
                 .exchange_custom_executor_recordio(&custom_mode, &kill_rio, 10)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn test_async_child_process_supervisor() {
+        let mut sup = AsyncChildProcessSupervisor::new();
+        assert!(
+            sup.spawn_nonblocking("/nonexistent-async-bin-xyz", &[])
+                .is_err()
+        );
+        assert_eq!(
+            sup.try_reap(99999, false),
+            ProcessExitOutcome::ExitedWithFailure(1)
+        );
+        assert!(sup.kill_and_reap(99999).is_err());
+
+        // 1. Long-running process: try_reap(false) returns StillRunning, then kill_and_reap terminates it
+        let sleep_pid = sup.spawn_nonblocking("sleep", &["10"]).unwrap_or_default();
+        assert_eq!(
+            sup.try_reap(sleep_pid, false),
+            ProcessExitOutcome::StillRunning
+        );
+        assert!(sup.kill_and_reap(sleep_pid).is_ok());
+
+        // 2. Clean exit (wait_until_exited = true and try_wait after exit)
+        let ok_pid = sup.spawn_nonblocking("echo", &["ok"]).unwrap_or_default();
+        assert_eq!(
+            sup.try_reap(ok_pid, true),
+            ProcessExitOutcome::ExitedCleanly
+        );
+
+        let fail_pid = sup
+            .spawn_nonblocking("sh", &["-c", "exit 3"])
+            .unwrap_or_default();
+        assert_eq!(
+            sup.try_reap(fail_pid, true),
+            ProcessExitOutcome::ExitedWithFailure(3)
+        );
+
+        // 3. Exercise try_wait() Some(status) clean and non-zero branches after waiting on the child handle
+        let ok_pid2 = sup.spawn_nonblocking("echo", &["ok2"]).unwrap_or_default();
+        let _ = sup
+            .children
+            .get_mut(&ok_pid2)
+            .map(std::process::Child::wait);
+        assert_eq!(
+            sup.try_reap(ok_pid2, false),
+            ProcessExitOutcome::ExitedCleanly
+        );
+
+        let fail_pid2 = sup
+            .spawn_nonblocking("sh", &["-c", "exit 4"])
+            .unwrap_or_default();
+        let _ = sup
+            .children
+            .get_mut(&fail_pid2)
+            .map(std::process::Child::wait);
+        assert_eq!(
+            sup.try_reap(fail_pid2, false),
+            ProcessExitOutcome::ExitedWithFailure(4)
+        );
+    }
+
+    #[test]
+    fn test_posix_signals_sandbox_stdio_and_pty_supervisor() {
+        let mut sup = AsyncChildProcessSupervisor::new();
+        assert!(sup.send_posix_kill_signal(999_999, 15).is_err());
+        let sig_pid = sup.spawn_nonblocking("sleep", &["10"]).unwrap_or_default();
+        assert!(sup.send_posix_kill_signal(sig_pid, 0).is_err());
+        assert!(sup.send_posix_kill_signal(sig_pid, 65).is_err());
+        assert!(sup.send_posix_kill_signal(sig_pid, 15).is_ok());
+        let _ = sup.kill_and_reap(sig_pid);
+
+        let sbox_dir =
+            std::env::temp_dir().join(format!("arbiter_exec_stdio_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sbox_dir);
+        let mut ring = LogRingBuffer::new(16);
+        assert!(
+            sup.drain_child_stdio_to_sandbox(999_999, &sbox_dir, &mut ring)
+                .is_err()
+        );
+        let stdio_pid = sup
+            .spawn_nonblocking("sh", &["-c", "echo out_line; echo err_line >&2"])
+            .unwrap_or_default();
+        let _ = sup
+            .children
+            .get_mut(&stdio_pid)
+            .map(std::process::Child::wait);
+        assert!(
+            sup.drain_child_stdio_to_sandbox(
+                stdio_pid,
+                std::path::Path::new("/dev/null/impossible"),
+                &mut ring
+            )
+            .is_err()
+        );
+        assert_eq!(
+            sup.drain_child_stdio_to_sandbox(stdio_pid, &sbox_dir, &mut ring),
+            Ok(2)
+        );
+        // Second call when stdout/stderr pipes have already been taken (`None` branches)
+        assert_eq!(
+            sup.drain_child_stdio_to_sandbox(stdio_pid, &sbox_dir, &mut ring),
+            Ok(0)
+        );
+        let _ = sup.try_reap(stdio_pid, true);
+        let _ = std::fs::remove_dir_all(&sbox_dir);
+    }
+
+    #[test]
+    fn test_pty_session_supervisor_lifecycle_and_resize() {
+        let mut pty = PtySessionSupervisor::new();
+        assert!(pty.open_pty_session("", 24, 80).is_err());
+        assert!(pty.open_pty_session("c1", 0, 80).is_err());
+        assert!(pty.open_pty_session("c1", 24, 0).is_err());
+        assert_eq!(
+            pty.open_pty_session("c1", 24, 80),
+            Ok("/dev/pts/0".to_owned())
+        );
+        assert!(pty.open_pty_session("c1", 24, 80).is_err());
+        assert!(pty.write_pty_stdin("unknown", b"ls\n").is_err());
+        assert_eq!(pty.write_pty_stdin("c1", b"ls\n"), Ok(3));
+        assert!(pty.drain_pty_stdout("unknown", false).is_err());
+        assert!(pty.drain_pty_stdout("unknown", true).is_err());
+        assert_eq!(pty.drain_pty_stdout("c1", false), Ok(b"ls\n".to_vec()));
+        assert_eq!(pty.resize_pty_window("c1", 50, 120), Ok((50, 120)));
+        assert!(pty.resize_pty_window("c1", 0, 120).is_err());
+        assert!(pty.resize_pty_window("c1", 50, 0).is_err());
+        assert!(pty.resize_pty_window("unknown", 50, 120).is_err());
+        assert!(
+            pty.execute_interactive_command("c1", "echo", &["pty-exec-ok"])
+                .is_ok()
+        );
+        assert!(
+            pty.execute_interactive_command("unknown", "echo", &["fail"])
+                .is_err()
+        );
+        assert!(
+            pty.execute_interactive_command("c1", "/nonexistent_pty_cmd_xyz", &[])
+                .is_err()
+        );
+        #[cfg(unix)]
+        {
+            assert!(
+                pty.open_real_posix_pty_and_exec("unknown", "echo", &["real-pty"])
+                    .is_err()
+            );
+            assert!(
+                pty.open_real_posix_pty_and_exec("c1", "/nonexistent_pty_cmd_xyz", &[])
+                    .is_err()
+            );
+            let real_out = pty
+                .open_real_posix_pty_and_exec("c1", "echo", &["real-posix-pty-ok"])
+                .unwrap_or_default();
+            assert!(real_out.contains("real-posix-pty-ok"));
+        }
+        let _ = pty.drain_pty_stdout("c1", false);
+        let _ = pty.write_pty_stdin("c1", b"exit\n");
+        assert_eq!(pty.drain_pty_stdout("c1", true), Ok(b"exit\n".to_vec()));
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_nonblocking_os_command_driver() {
+        let mut nb_drv = OsCommandProcessDriver::new_nonblocking();
+        assert!(nb_drv.read_ring_buffer_snapshot(999_999).is_empty());
+
+        let mut sleep_task = sample_task(false);
+        sleep_task.isolation.command = "sleep".to_owned();
+        sleep_task.isolation.args = vec!["10".to_owned()];
+        let nb_sleep_pid = nb_drv
+            .spawn_task_process(&sleep_task, "/tmp")
+            .unwrap_or_default();
+        assert_eq!(
+            nb_drv.poll_exit_status(nb_sleep_pid),
+            ProcessExitOutcome::StillRunning
+        );
+        assert!(nb_drv.send_signal(nb_sleep_pid, 10).is_ok());
+        assert!(nb_drv.send_signal(nb_sleep_pid, 9).is_ok());
+        assert!(!nb_drv.children.contains_key(&nb_sleep_pid));
+
+        // Non-blocking clean exit & non-zero exit harvested via poll_exit_status
+        let mut nb_echo_task = sample_task(false);
+        nb_echo_task.isolation.command = "echo".to_owned();
+        nb_echo_task.isolation.args = vec!["nb-ring-line".to_owned()];
+        let nb_echo_pid = nb_drv
+            .spawn_task_process(&nb_echo_task, "/tmp")
+            .unwrap_or_default();
+        let _ = nb_drv
+            .children
+            .get_mut(&nb_echo_pid)
+            .map(std::process::Child::wait);
+        assert_eq!(
+            nb_drv.poll_exit_status(nb_echo_pid),
+            ProcessExitOutcome::ExitedCleanly
+        );
+        assert_eq!(
+            nb_drv.read_ring_buffer_snapshot(nb_echo_pid),
+            vec!["nb-ring-line".to_owned()]
+        );
+
+        let mut nb_fail_task = sample_task(false);
+        nb_fail_task.isolation.command = "sh".to_owned();
+        nb_fail_task.isolation.args = vec!["-c".to_owned(), "exit 5".to_owned()];
+        let nb_fail_pid = nb_drv
+            .spawn_task_process(&nb_fail_task, "/tmp")
+            .unwrap_or_default();
+        let _ = nb_drv
+            .children
+            .get_mut(&nb_fail_pid)
+            .map(std::process::Child::wait);
+        assert_eq!(
+            nb_drv.poll_exit_status(nb_fail_pid),
+            ProcessExitOutcome::ExitedWithFailure(5)
+        );
+
+        // CRIU checkpoint & restore runner tests
+        let mut criu_runner = |cmd: &str| -> ArbiterResult<String> {
+            if cmd.contains("/fail") {
+                Err(ArbiterError::from(
+                    arbiter_core::error::CriuCheckpointError::new(
+                        "criu",
+                        100,
+                        "/fail/ckpt",
+                        "criu failed",
+                    ),
+                ))
+            } else {
+                Ok(format!("ok:{cmd}"))
+            }
+        };
+        assert!(
+            AsyncChildProcessSupervisor::execute_criu_checkpoint_with_runner(
+                0,
+                "/tmp/ckpt",
+                &mut criu_runner
+            )
+            .is_err()
+        );
+        assert!(
+            AsyncChildProcessSupervisor::execute_criu_checkpoint_with_runner(
+                100,
+                "   ",
+                &mut criu_runner
+            )
+            .is_err()
+        );
+        assert!(
+            AsyncChildProcessSupervisor::execute_criu_checkpoint_with_runner(
+                100,
+                "/tmp/ckpt",
+                &mut criu_runner
+            )
+            .is_ok()
+        );
+        assert!(
+            AsyncChildProcessSupervisor::execute_criu_checkpoint_with_runner(
+                100,
+                "/fail/ckpt",
+                &mut criu_runner
+            )
+            .is_err()
+        );
+        assert!(
+            AsyncChildProcessSupervisor::execute_criu_restore_with_runner(
+                0,
+                "/tmp/ckpt",
+                &mut criu_runner
+            )
+            .is_err()
+        );
+        assert!(
+            AsyncChildProcessSupervisor::execute_criu_restore_with_runner(
+                100,
+                "   ",
+                &mut criu_runner
+            )
+            .is_err()
+        );
+        assert!(
+            AsyncChildProcessSupervisor::execute_criu_restore_with_runner(
+                100,
+                "/tmp/ckpt",
+                &mut criu_runner
+            )
+            .is_ok()
+        );
+        assert!(
+            AsyncChildProcessSupervisor::execute_criu_restore_with_runner(
+                100,
+                "/fail/ckpt",
+                &mut criu_runner
+            )
+            .is_err()
         );
     }
 }

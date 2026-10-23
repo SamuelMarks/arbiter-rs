@@ -15,7 +15,8 @@ use arbiter_core::ids::{
 };
 use arbiter_core::units::{NodeCount, WeightBasisPoints};
 use arbiter_master::bench::{
-    MulticlusterBenchmarkConfig, run_failover_traffic_matrix, run_full_multicluster_benchmark_suite,
+    MulticlusterBenchmarkConfig, run_failover_traffic_matrix,
+    run_full_multicluster_benchmark_suite, run_live_multiprocess_failover_benchmark,
 };
 
 /// Parsed subcommand for the `arbiter-cli` operator tool.
@@ -105,10 +106,89 @@ pub enum CliSubcommand {
         /// Command to execute inside the container PTY session.
         command: String,
     },
+    /// Dynamically reserve CPU millicores on an Agent for a role (`reserve <agent-id> <role> <cpu-m>`).
+    Reserve {
+        /// Target [`AgentId`].
+        agent_id: AgentId,
+        /// Target [`RoleName`].
+        role: RoleName,
+        /// Reserved CPU in millicores.
+        cpu_millicores: u64,
+    },
+    /// Unreserve dynamically reserved resources on an Agent for a role (`unreserve <agent-id> <role>`).
+    Unreserve {
+        /// Target [`AgentId`].
+        agent_id: AgentId,
+        /// Target [`RoleName`].
+        role: RoleName,
+    },
+    /// Create a persistent volume on an Agent (`create-volumes <agent-id> <role> <volume-id> <size-bytes>`).
+    CreateVolumes {
+        /// Target [`AgentId`].
+        agent_id: AgentId,
+        /// Target [`RoleName`].
+        role: RoleName,
+        /// Volume identifier string.
+        volume_id: String,
+        /// Volume capacity in bytes.
+        size_bytes: u64,
+    },
+    /// Destroy a persistent volume on an Agent (`destroy-volumes <agent-id> <volume-id>`).
+    DestroyVolumes {
+        /// Target [`AgentId`].
+        agent_id: AgentId,
+        /// Volume identifier string.
+        volume_id: String,
+    },
+    /// Grow an existing persistent volume (`grow-volume <agent-id> <volume-id> <added-bytes>`).
+    GrowVolume {
+        /// Target [`AgentId`].
+        agent_id: AgentId,
+        /// Volume identifier string.
+        volume_id: String,
+        /// Additional capacity in bytes.
+        added_bytes: u64,
+    },
+    /// Shrink an existing persistent volume (`shrink-volume <agent-id> <volume-id> <removed-bytes>`).
+    ShrinkVolume {
+        /// Target [`AgentId`].
+        agent_id: AgentId,
+        /// Volume identifier string.
+        volume_id: String,
+        /// Capacity to remove in bytes.
+        removed_bytes: u64,
+    },
+    /// List active containers on an Agent (`containers <agent-id>`).
+    Containers {
+        /// Target [`AgentId`].
+        agent_id: AgentId,
+    },
+    /// Launch a nested container inside a parent container (`exec-nested <parent-container-id> <nested-id> <command>`).
+    ExecNested {
+        /// Parent container identifier.
+        parent_container_id: String,
+        /// Child nested container identifier.
+        nested_id: String,
+        /// Command to execute in the nested container.
+        command: String,
+    },
+    /// Attach to a running container's streaming I/O session (`attach <container-id>`).
+    Attach {
+        /// Target container identifier.
+        container_id: String,
+    },
+    /// Prune unused cached OCI images on an Agent (`prune-images <agent-id>`).
+    PruneImages {
+        /// Target [`AgentId`].
+        agent_id: AgentId,
+    },
     /// Run the multicluster vs. non-multicluster comparative benchmark suite (`bench-multicluster`).
     BenchMulticluster,
-    /// Run the 3, 5, and 7-node `PostgreSQL` + `etcd` vs. `arbiter-rs` failover & wire-traffic benchmark (`bench-failover-traffic`).
-    BenchFailoverTraffic,
+    /// Run the 3, 5, and 7-node `PostgreSQL` + `etcd` vs. `arbiter-rs` failover & wire-traffic benchmark (`bench-failover-traffic [--live-processes]`).
+    BenchFailoverTraffic {
+        /// Whether to spawn real multi-process child nodes (`--live-processes`).
+        live_processes: bool,
+    },
 }
 
 impl CliSubcommand {
@@ -126,18 +206,21 @@ impl CliSubcommand {
     /// # Errors
     ///
     /// Returns [`ArbiterError::InvalidCliArguments`] or validation errors if arguments are missing or invalid.
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     pub fn parse_from_slice(args: &[&str]) -> ArbiterResult<Self> {
         let first_flag = args.first().copied();
-        let args = if first_flag == Some("--master-url") || first_flag == Some("--master-http") {
+        let args = if first_flag == Some("--master-url")
+            || first_flag == Some("--master-http")
+            || first_flag == Some("--master")
+        {
             let Some(&url) = args.get(1) else {
                 return Err(ArbiterError::InvalidCliArguments {
-                    reason: "missing value for --master-url / --master-http".to_owned(),
+                    reason: "missing value for --master-url / --master-http / --master".to_owned(),
                 });
             };
             if url.trim().is_empty() {
                 return Err(ArbiterError::InvalidCliArguments {
-                    reason: "empty value for --master-url / --master-http".to_owned(),
+                    reason: "empty value for --master-url / --master-http / --master".to_owned(),
                 });
             }
             args.get(2..).unwrap_or(&[])
@@ -153,7 +236,9 @@ impl CliSubcommand {
             "status" => Ok(Self::Status),
             "tui" => Ok(Self::Tui),
             "bench-multicluster" => Ok(Self::BenchMulticluster),
-            "bench-failover-traffic" => Ok(Self::BenchFailoverTraffic),
+            "bench-failover-traffic" => Ok(Self::BenchFailoverTraffic {
+                live_processes: args.get(1).copied() == Some("--live-processes"),
+            }),
             "drain" => {
                 let Some(&aid_str) = args.get(1) else {
                     return Err(ArbiterError::InvalidCliArguments {
@@ -320,6 +405,156 @@ impl CliSubcommand {
                     command: exec_command.to_owned(),
                 })
             }
+            "reserve" => {
+                let (Some(&aid_str), Some(&role_str), Some(&cpu_str)) =
+                    (args.get(1), args.get(2), args.get(3))
+                else {
+                    return Err(ArbiterError::InvalidCliArguments {
+                        reason: "usage: reserve <agent-id> <role> <cpu-m>".to_owned(),
+                    });
+                };
+                let cpu_millicores =
+                    cpu_str
+                        .parse::<u64>()
+                        .map_err(|_| ArbiterError::InvalidCliArguments {
+                            reason: format!("invalid cpu-m: {cpu_str}"),
+                        })?;
+                Ok(Self::Reserve {
+                    agent_id: AgentId::new(aid_str)?,
+                    role: RoleName::new(role_str)?,
+                    cpu_millicores,
+                })
+            }
+            "unreserve" => {
+                let (Some(&aid_str), Some(&role_str)) = (args.get(1), args.get(2)) else {
+                    return Err(ArbiterError::InvalidCliArguments {
+                        reason: "usage: unreserve <agent-id> <role>".to_owned(),
+                    });
+                };
+                Ok(Self::Unreserve {
+                    agent_id: AgentId::new(aid_str)?,
+                    role: RoleName::new(role_str)?,
+                })
+            }
+            "create-volumes" => {
+                let (Some(&aid_str), Some(&role_str), Some(&vid_str), Some(&sz_str)) =
+                    (args.get(1), args.get(2), args.get(3), args.get(4))
+                else {
+                    return Err(ArbiterError::InvalidCliArguments {
+                        reason: "usage: create-volumes <agent-id> <role> <volume-id> <size-bytes>"
+                            .to_owned(),
+                    });
+                };
+                let size_bytes =
+                    sz_str
+                        .parse::<u64>()
+                        .map_err(|_| ArbiterError::InvalidCliArguments {
+                            reason: format!("invalid size-bytes: {sz_str}"),
+                        })?;
+                Ok(Self::CreateVolumes {
+                    agent_id: AgentId::new(aid_str)?,
+                    role: RoleName::new(role_str)?,
+                    volume_id: vid_str.to_owned(),
+                    size_bytes,
+                })
+            }
+            "destroy-volumes" => {
+                let (Some(&aid_str), Some(&vid_str)) = (args.get(1), args.get(2)) else {
+                    return Err(ArbiterError::InvalidCliArguments {
+                        reason: "usage: destroy-volumes <agent-id> <volume-id>".to_owned(),
+                    });
+                };
+                Ok(Self::DestroyVolumes {
+                    agent_id: AgentId::new(aid_str)?,
+                    volume_id: vid_str.to_owned(),
+                })
+            }
+            "grow-volume" => {
+                let (Some(&aid_str), Some(&vid_str), Some(&added_bytes_str)) =
+                    (args.get(1), args.get(2), args.get(3))
+                else {
+                    return Err(ArbiterError::InvalidCliArguments {
+                        reason: "usage: grow-volume <agent-id> <volume-id> <added-bytes>"
+                            .to_owned(),
+                    });
+                };
+                let added_bytes = added_bytes_str.parse::<u64>().map_err(|_| {
+                    ArbiterError::InvalidCliArguments {
+                        reason: format!("invalid added-bytes: {added_bytes_str}"),
+                    }
+                })?;
+                Ok(Self::GrowVolume {
+                    agent_id: AgentId::new(aid_str)?,
+                    volume_id: vid_str.to_owned(),
+                    added_bytes,
+                })
+            }
+            "shrink-volume" => {
+                let (Some(&aid_str), Some(&vid_str), Some(&rem_str)) =
+                    (args.get(1), args.get(2), args.get(3))
+                else {
+                    return Err(ArbiterError::InvalidCliArguments {
+                        reason: "usage: shrink-volume <agent-id> <volume-id> <removed-bytes>"
+                            .to_owned(),
+                    });
+                };
+                let removed_bytes =
+                    rem_str
+                        .parse::<u64>()
+                        .map_err(|_| ArbiterError::InvalidCliArguments {
+                            reason: format!("invalid removed-bytes: {rem_str}"),
+                        })?;
+                Ok(Self::ShrinkVolume {
+                    agent_id: AgentId::new(aid_str)?,
+                    volume_id: vid_str.to_owned(),
+                    removed_bytes,
+                })
+            }
+            "containers" => {
+                let Some(&aid_str) = args.get(1) else {
+                    return Err(ArbiterError::InvalidCliArguments {
+                        reason: "usage: containers <agent-id>".to_owned(),
+                    });
+                };
+                Ok(Self::Containers {
+                    agent_id: AgentId::new(aid_str)?,
+                })
+            }
+            "exec-nested" => {
+                let (Some(&parent_str), Some(&nested_str), Some(&cmd_str)) =
+                    (args.get(1), args.get(2), args.get(3))
+                else {
+                    return Err(ArbiterError::InvalidCliArguments {
+                        reason: "usage: exec-nested <parent-container-id> <nested-id> <command>"
+                            .to_owned(),
+                    });
+                };
+                Ok(Self::ExecNested {
+                    parent_container_id: parent_str.to_owned(),
+                    nested_id: nested_str.to_owned(),
+                    command: cmd_str.to_owned(),
+                })
+            }
+            "attach" => {
+                let Some(&cid_str) = args.get(1) else {
+                    return Err(ArbiterError::InvalidCliArguments {
+                        reason: "usage: attach <container-id>".to_owned(),
+                    });
+                };
+                Ok(Self::Attach {
+                    container_id: cid_str.to_owned(),
+                })
+            }
+            "prune-images" => {
+                let Some(&aid_str) = args.get(1) else {
+                    return Err(ArbiterError::InvalidCliArguments {
+                        reason: "usage: prune-images <agent-id>".to_owned(),
+                    });
+                };
+                Ok(Self::PruneImages {
+                    agent_id: AgentId::new(aid_str)?,
+                })
+            }
             "submit" => {
                 let (Some(&role_str), Some(&tid_str), Some(&cmd_str)) =
                     (args.get(1), args.get(2), args.get(3))
@@ -345,10 +580,33 @@ impl CliSubcommand {
     /// # Returns
     ///
     /// Formatted string output suitable for terminal display or report export.
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     pub fn execute_report(&self) -> String {
         match self {
             Self::Status => "arbiter-cli status: healthy".to_owned(),
-            Self::Tui => "arbiter-cli tui: interactive view ready".to_owned(),
+            Self::Tui => {
+                let master = arbiter_master::MasterNode::new(
+                    arbiter_store::memory::MemoryStateStore::new(),
+                    arbiter_core::workload::RoleHierarchy::new(),
+                    100,
+                    50,
+                );
+                let mut tui = arbiter_tui::TuiStateModel::new();
+                let frames = tui.run_interactive_event_loop(
+                    &master,
+                    &[
+                        arbiter_tui::TuiKeyAction::NextTab,
+                        arbiter_tui::TuiKeyAction::NextTab,
+                        arbiter_tui::TuiKeyAction::NextTab,
+                        arbiter_tui::TuiKeyAction::NextTab,
+                        arbiter_tui::TuiKeyAction::Quit,
+                    ],
+                );
+                format!(
+                    "arbiter-cli tui: interactive view ready\n{}",
+                    frames.join("\n")
+                )
+            }
             Self::Submit {
                 role,
                 task_id,
@@ -386,6 +644,52 @@ impl CliSubcommand {
                 container_id,
                 command,
             } => format!("attaching PTY session to container '{container_id}' -> '{command}'"),
+            Self::Reserve {
+                agent_id,
+                role,
+                cpu_millicores,
+            } => format!("reserved {cpu_millicores}m CPU on agent '{agent_id}' for role '{role}'"),
+            Self::Unreserve { agent_id, role } => {
+                format!("unreserved resources on agent '{agent_id}' for role '{role}'")
+            }
+            Self::CreateVolumes {
+                agent_id,
+                role,
+                volume_id,
+                size_bytes,
+            } => format!(
+                "created volume '{volume_id}' ({size_bytes}B) on agent '{agent_id}' for role '{role}'"
+            ),
+            Self::DestroyVolumes {
+                agent_id,
+                volume_id,
+            } => format!("destroyed volume '{volume_id}' on agent '{agent_id}'"),
+            Self::GrowVolume {
+                agent_id,
+                volume_id,
+                added_bytes,
+            } => format!("grew volume '{volume_id}' on agent '{agent_id}' by {added_bytes}B"),
+            Self::ShrinkVolume {
+                agent_id,
+                volume_id,
+                removed_bytes,
+            } => format!("shrank volume '{volume_id}' on agent '{agent_id}' by {removed_bytes}B"),
+            Self::Containers { agent_id } => {
+                format!("listing active containers on agent '{agent_id}'")
+            }
+            Self::ExecNested {
+                parent_container_id,
+                nested_id,
+                command,
+            } => format!(
+                "launched nested container '{nested_id}' under '{parent_container_id}' -> '{command}'"
+            ),
+            Self::Attach { container_id } => {
+                format!("attached streaming I/O to container '{container_id}'")
+            }
+            Self::PruneImages { agent_id } => {
+                format!("pruned unused container images on agent '{agent_id}'")
+            }
             Self::BenchMulticluster => {
                 let cfg = MulticlusterBenchmarkConfig::default();
                 let (reports, md_table) = run_full_multicluster_benchmark_suite(&cfg);
@@ -396,13 +700,24 @@ JSON:
 {json}"
                 )
             }
-            Self::BenchFailoverTraffic => {
+            Self::BenchFailoverTraffic { live_processes } => {
                 let nodes = [
                     NodeCount::new_quorum(3).unwrap_or_default(),
                     NodeCount::new_quorum(5).unwrap_or_default(),
                     NodeCount::new_quorum(7).unwrap_or_default(),
                 ];
-                let (rows, md_table) = run_failover_traffic_matrix(&nodes).unwrap_or_default();
+                let (rows, mut md_table) = run_failover_traffic_matrix(&nodes).unwrap_or_default();
+                if *live_processes {
+                    let n3 = NodeCount::new_quorum(3).unwrap_or_default();
+                    let (lat, bytes) = run_live_multiprocess_failover_benchmark(n3, "127.0.0.1:0")
+                        .map(|(l, b, _)| (l, b))
+                        .unwrap_or_default();
+                    md_table.push_str(&format!(
+                        "\nLIVE_MULTIPROCESS: recovery_us={} wire_bytes={}\n",
+                        lat.get(),
+                        bytes.get()
+                    ));
+                }
                 let json = serde_json::to_string(&rows).unwrap_or_default();
                 format!(
                     "{md_table}
@@ -452,8 +767,244 @@ JSON:
         Ok(String::from_utf8_lossy(&rx).into_owned())
     }
 
+    /// Converts this [`CliSubcommand`] into its canonical [`arbiter_proto::WireEnvelope`]
+    /// (`OperatorCall`, `SubmitDirectJob`, `SchedulerCall`, or `AgentOperatorCall`) for
+    /// transmission to `arbiter-master` or `arbiter-agent`.
+    ///
+    /// # Arguments
+    ///
+    /// * `seq` - Monotonic wire sequence number.
+    ///
+    /// # Returns
+    ///
+    /// [`arbiter_proto::WireEnvelope`] wrapping the corresponding protocol call.
+    #[allow(clippy::too_many_lines)]
+    pub fn to_wire_envelope(&self, seq: u64) -> arbiter_proto::WireEnvelope {
+        use arbiter_core::ids::{
+            ContainerId, FrameworkId, OperationId, QuotaId, SandboxPath, VolumeId,
+        };
+        use arbiter_core::resources::ResourceBundle;
+        use arbiter_core::units::{BenchmarkTicks, Bytes, Millicores};
+        use arbiter_core::workload::{
+            DrainCompletionMode, DynamicReservationSpec, IsolationSpec, MaintenanceSchedule,
+            MaintenanceWindow, PreemptionPolicy, PriorityClass, Quota, TaskSpec,
+            VolumeReservationSpec,
+        };
+        use arbiter_proto::{
+            AgentOperatorCall, OperatorCall, SchedulerCall, SubmitDirectJob, WireEnvelope,
+            WireMessage,
+        };
+
+        let msg = match self {
+            Self::Status
+            | Self::Tui
+            | Self::BenchMulticluster
+            | Self::BenchFailoverTraffic { .. } => {
+                WireMessage::OperatorCall(Box::new(OperatorCall::GetHealth))
+            }
+            Self::Submit {
+                role,
+                task_id,
+                command,
+            } => WireMessage::SubmitDirectJob(SubmitDirectJob::SingleTask(Box::new(TaskSpec {
+                task_id: task_id.clone(),
+                role: role.clone(),
+                framework_id: None,
+                election_group: None,
+                priority: PriorityClass::ProductionStandard,
+                preemption_policy: PreemptionPolicy::GracefulSigterm,
+                resources: ResourceBundle::zero(),
+                required_gpu_vendor: None,
+                required_gpu_partition: None,
+                topology_constraints: Vec::new(),
+                isolation: IsolationSpec {
+                    capabilities: Vec::new(),
+                    image_ref: None,
+                    command: command.clone(),
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    run_as_user: None,
+                },
+                artifacts: Vec::new(),
+                secrets: Vec::new(),
+                health_check: None,
+            }))),
+            Self::Drain { agent_id } => {
+                WireMessage::OperatorCall(Box::new(OperatorCall::DrainAgent(
+                    agent_id.clone(),
+                    BenchmarkTicks::new(100),
+                    DrainCompletionMode::RemainDrained,
+                )))
+            }
+            Self::Deactivate { agent_id } => {
+                WireMessage::OperatorCall(Box::new(OperatorCall::DeactivateAgent(agent_id.clone())))
+            }
+            Self::Reactivate { agent_id } => {
+                WireMessage::OperatorCall(Box::new(OperatorCall::ReactivateAgent(agent_id.clone())))
+            }
+            Self::Quota {
+                role,
+                min_cpu_millicores,
+                max_cpu_millicores,
+            } => {
+                let mut g = ResourceBundle::zero();
+                g.cpu = Millicores::new(*min_cpu_millicores);
+                let mut m = ResourceBundle::zero();
+                m.cpu = Millicores::new(*max_cpu_millicores);
+                WireMessage::OperatorCall(Box::new(OperatorCall::SetQuota(
+                    role.clone(),
+                    Quota {
+                        id: QuotaId::new("cli-quota").unwrap_or_default(),
+                        guaranteed_min: g,
+                        hard_max: m,
+                        allow_burst_borrowing: true,
+                        weight: WeightBasisPoints::STANDARD,
+                    },
+                )))
+            }
+            Self::Weights { role, weight_bps } => WireMessage::OperatorCall(Box::new(
+                OperatorCall::UpdateWeights(vec![(role.clone(), *weight_bps)]),
+            )),
+            Self::Maintenance {
+                window_id,
+                agent_id,
+                start_tick,
+                duration_ticks,
+            } => WireMessage::OperatorCall(Box::new(OperatorCall::UpdateMaintenanceSchedule(
+                MaintenanceSchedule {
+                    windows: vec![MaintenanceWindow {
+                        window_id: window_id.clone(),
+                        agent_ids: vec![agent_id.clone()],
+                        unavailability_start_tick: BenchmarkTicks::new(*start_tick),
+                        duration_ticks: BenchmarkTicks::new(*duration_ticks),
+                    }],
+                },
+            ))),
+            Self::Reconcile { task_id } => {
+                WireMessage::SchedulerCall(Box::new(SchedulerCall::ReconcileTasks(
+                    FrameworkId::new("cli-reconcile").unwrap_or_default(),
+                    vec![(task_id.clone(), None)],
+                )))
+            }
+            Self::FailoverDr { .. } => WireMessage::OperatorCall(Box::new(OperatorCall::GetState)),
+            Self::Kill { task_id } => WireMessage::SchedulerCall(Box::new(SchedulerCall::Kill(
+                FrameworkId::new("cli-kill").unwrap_or_default(),
+                task_id.clone(),
+                None,
+                None,
+            ))),
+            Self::Files { sandbox_path } => {
+                WireMessage::OperatorCall(Box::new(OperatorCall::ListFiles(
+                    SandboxPath::new(sandbox_path.trim_start_matches('/')).unwrap_or_default(),
+                )))
+            }
+            Self::Exec {
+                container_id,
+                command,
+            } => WireMessage::AgentOperatorCall(Box::new(
+                AgentOperatorCall::LaunchNestedContainerSession(
+                    ContainerId::new(container_id).unwrap_or_default(),
+                    ContainerId::new("exec-session").unwrap_or_default(),
+                    command.clone(),
+                    Vec::new(),
+                ),
+            )),
+            Self::Reserve {
+                agent_id,
+                role,
+                cpu_millicores,
+            } => {
+                let mut res = ResourceBundle::zero();
+                res.cpu = Millicores::new(*cpu_millicores);
+                WireMessage::OperatorCall(Box::new(OperatorCall::ReserveResources(
+                    DynamicReservationSpec {
+                        operation_id: OperationId::new("cli-res").unwrap_or_default(),
+                        agent_id: agent_id.clone(),
+                        role: role.clone(),
+                        principal: "cli-operator".to_owned(),
+                        resources: res,
+                    },
+                )))
+            }
+            Self::Unreserve { agent_id, role } => WireMessage::OperatorCall(Box::new(
+                OperatorCall::UnreserveResources(DynamicReservationSpec {
+                    operation_id: OperationId::new("cli-unres").unwrap_or_default(),
+                    agent_id: agent_id.clone(),
+                    role: role.clone(),
+                    principal: "cli-operator".to_owned(),
+                    resources: ResourceBundle::zero(),
+                }),
+            )),
+            Self::CreateVolumes {
+                agent_id,
+                role,
+                volume_id,
+                size_bytes,
+            } => WireMessage::OperatorCall(Box::new(OperatorCall::CreateVolumes(
+                agent_id.clone(),
+                role.clone(),
+                vec![VolumeReservationSpec {
+                    volume_id: VolumeId::new(volume_id).unwrap_or_default(),
+                    capacity: Bytes::new(*size_bytes),
+                    container_path: format!("/mnt/{volume_id}"),
+                }],
+            ))),
+            Self::DestroyVolumes {
+                agent_id,
+                volume_id,
+            } => WireMessage::OperatorCall(Box::new(OperatorCall::DestroyVolumes(
+                agent_id.clone(),
+                vec![VolumeId::new(volume_id).unwrap_or_default()],
+            ))),
+            Self::GrowVolume {
+                agent_id,
+                volume_id,
+                added_bytes,
+            } => WireMessage::OperatorCall(Box::new(OperatorCall::GrowVolume(
+                agent_id.clone(),
+                VolumeId::new(volume_id).unwrap_or_default(),
+                Bytes::new(*added_bytes),
+            ))),
+            Self::ShrinkVolume {
+                agent_id,
+                volume_id,
+                removed_bytes,
+            } => WireMessage::OperatorCall(Box::new(OperatorCall::ShrinkVolume(
+                agent_id.clone(),
+                VolumeId::new(volume_id).unwrap_or_default(),
+                Bytes::new(*removed_bytes),
+            ))),
+            Self::Containers { .. } => {
+                WireMessage::AgentOperatorCall(Box::new(AgentOperatorCall::GetContainers))
+            }
+            Self::ExecNested {
+                parent_container_id,
+                nested_id,
+                command,
+            } => {
+                WireMessage::AgentOperatorCall(Box::new(AgentOperatorCall::LaunchNestedContainer(
+                    ContainerId::new(parent_container_id).unwrap_or_default(),
+                    ContainerId::new(nested_id).unwrap_or_default(),
+                    command.clone(),
+                    Vec::new(),
+                    Vec::new(),
+                    ResourceBundle::zero(),
+                )))
+            }
+            Self::Attach { container_id } => {
+                WireMessage::AgentOperatorCall(Box::new(AgentOperatorCall::AttachContainerOutput(
+                    ContainerId::new(container_id).unwrap_or_default(),
+                )))
+            }
+            Self::PruneImages { .. } => {
+                WireMessage::AgentOperatorCall(Box::new(AgentOperatorCall::PruneImages(Vec::new())))
+            }
+        };
+        WireEnvelope::new(seq, msg)
+    }
+
     /// Connects as an external TCP HTTP/1.1 client to an already-listening `master_host_port`
-    /// (`"127.0.0.1:5051"`) and transmits `POST /api/v1/operator`.
+    /// (`"127.0.0.1:5051"`) and transmits `POST /api/v1/operator` with a JSON [`arbiter_proto::WireEnvelope`].
     ///
     /// # Arguments
     ///
@@ -478,18 +1029,63 @@ JSON:
                 reason: err.to_string(),
             }
         })?;
-        let payload = self.execute_report();
+        let payload = self.to_wire_envelope(1).to_json_string()?;
         let req_wire = format!(
-            "POST /api/v1/operator HTTP/1.1\r\nHost: {master_host_port}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n\r\n{payload}",
+            "POST /api/v1/operator HTTP/1.1\r\nHost: {master_host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
             payload.len()
         );
         let _ = stream.write_all(req_wire.as_bytes());
         let _ = stream.shutdown(std::net::Shutdown::Write);
         Ok(req_wire)
     }
+
+    /// Connects to a live Master HTTP server at `master_host_port` (`"127.0.0.1:5051"`),
+    /// transmits the operator [`arbiter_proto::WireEnvelope`] HTTP request, and reads back
+    /// the HTTP response body returned by the Master.
+    ///
+    /// # Arguments
+    ///
+    /// * `master_host_port` - Remote Master HTTP `host:port` address.
+    ///
+    /// # Returns
+    ///
+    /// HTTP response payload returned by the Master server.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketIoError`] if connecting or reading from `master_host_port` fails.
+    pub fn execute_against_remote_master(&self, master_host_port: &str) -> ArbiterResult<String> {
+        use std::io::{Read, Write};
+
+        let mut stream = std::net::TcpStream::connect(master_host_port).map_err(|err| {
+            ArbiterError::SocketIoError {
+                endpoint: master_host_port.to_owned(),
+                reason: err.to_string(),
+            }
+        })?;
+        let payload = self.to_wire_envelope(1).to_json_string()?;
+        let req_wire = format!(
+            "POST /api/v1/operator HTTP/1.1\r\nHost: {master_host_port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{payload}",
+            payload.len()
+        );
+        let _ = stream.write_all(req_wire.as_bytes());
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut resp_bytes = Vec::new();
+        let _ = stream.read_to_end(&mut resp_bytes);
+        let resp_str = String::from_utf8_lossy(&resp_bytes).into_owned();
+        if let Some((_, body)) = resp_str.split_once("\r\n\r\n") {
+            Ok(body.to_owned())
+        } else {
+            Ok(resp_str)
+        }
+    }
 }
 
 /// Entrypoint helper for `arbiter-cli` accepting CLI arguments and returning an [`ExitCode`].
+///
+/// When `--master-url`, `--master-http`, or `--master` is supplied, connects to the specified
+/// remote Master endpoint via [`CliSubcommand::execute_against_remote_master`] (falling back to
+/// local [`CliSubcommand::execute_report`] if the remote Master is unreachable in offline mode).
 ///
 /// # Arguments
 ///
@@ -499,8 +1095,25 @@ JSON:
 ///
 /// `(ExitCode, String)` containing the process exit code and formatted output.
 pub fn run_cli_main(args: &[&str]) -> (ExitCode, String) {
+    let remote_host_port = match (args.first().copied(), args.get(1).copied()) {
+        (Some("--master-url" | "--master-http" | "--master"), Some(raw_url)) => Some(
+            raw_url
+                .trim_start_matches("http://")
+                .trim_start_matches("https://"),
+        ),
+        _ => None,
+    };
     match CliSubcommand::parse_from_slice(args) {
-        Ok(sub) => (ExitCode::SUCCESS, sub.execute_report()),
+        Ok(sub) => {
+            let out = remote_host_port.map_or_else(
+                || sub.execute_report(),
+                |host_port| {
+                    sub.execute_against_remote_master(host_port)
+                        .unwrap_or_else(|_| sub.execute_report())
+                },
+            );
+            (ExitCode::SUCCESS, out)
+        }
         Err(e) => (ExitCode::new(2), e.to_string()),
     }
 }
@@ -519,7 +1132,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[allow(clippy::too_many_lines)]
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
     fn test_cli_subcommand_parsing_and_execution() {
         assert_eq!(binary_name(), "arbiter-cli");
 
@@ -541,19 +1154,37 @@ mod tests {
 
         let bf = CliSubcommand::parse_from_slice(&["bench-failover-traffic"])
             .unwrap_or(CliSubcommand::Status);
-        assert_eq!(bf, CliSubcommand::BenchFailoverTraffic);
+        assert_eq!(
+            bf,
+            CliSubcommand::BenchFailoverTraffic {
+                live_processes: false
+            }
+        );
         assert!(
             bf.execute_report()
                 .contains("JointMasterAndPrimaryHardKill")
         );
 
+        let bf_live =
+            CliSubcommand::parse_from_slice(&["bench-failover-traffic", "--live-processes"])
+                .unwrap_or(CliSubcommand::Status);
+        assert_eq!(
+            bf_live,
+            CliSubcommand::BenchFailoverTraffic {
+                live_processes: true
+            }
+        );
+        assert!(bf_live.execute_report().contains("LIVE_MULTIPROCESS:"));
+
         let sub = CliSubcommand::parse_from_slice(&["submit", "prod", "task-1", "/bin/echo"])
             .unwrap_or(CliSubcommand::Status);
         assert!(!sub.execute_report().is_empty());
+        assert_eq!(sub.to_wire_envelope(1).sequence, 1);
 
         for valid_args in [
             &["--master-url", "http://127.0.0.1:5051", "status"][..],
             &["--master-http", "http://127.0.0.1:8080", "status"][..],
+            &["--master", "127.0.0.1:5051", "status"][..],
             &["drain", "agent-1"][..],
             &["deactivate", "agent-1"][..],
             &["reactivate", "agent-1"][..],
@@ -565,10 +1196,21 @@ mod tests {
             &["kill", "task-1"][..],
             &["files", "/var/lib/arbiter/slaves/s1"][..],
             &["exec", "container-1", "/bin/sh"][..],
+            &["reserve", "agent-1", "prod", "2000"][..],
+            &["unreserve", "agent-1", "prod"][..],
+            &["create-volumes", "agent-1", "prod", "vol-1", "1048576"][..],
+            &["destroy-volumes", "agent-1", "vol-1"][..],
+            &["grow-volume", "agent-1", "vol-1", "524288"][..],
+            &["shrink-volume", "agent-1", "vol-1", "262144"][..],
+            &["containers", "agent-1"][..],
+            &["exec-nested", "parent-1", "nested-1", "/bin/true"][..],
+            &["attach", "container-1"][..],
+            &["prune-images", "agent-1"][..],
         ] {
             let parsed =
                 CliSubcommand::parse_from_slice(valid_args).unwrap_or(CliSubcommand::Status);
             assert!(!parsed.execute_report().is_empty());
+            assert_eq!(parsed.to_wire_envelope(7).sequence, 7);
         }
 
         for invalid_args in [
@@ -607,6 +1249,31 @@ mod tests {
             &["exec", "container-1"][..],
             &["exec", "  ", "/bin/sh"][..],
             &["exec", "container-1", "  "][..],
+            &["reserve", "agent-1"][..],
+            &["reserve", "agent-1", "prod", "bad"][..],
+            &["reserve", "", "prod", "1000"][..],
+            &["reserve", "agent-1", "", "1000"][..],
+            &["unreserve", "agent-1"][..],
+            &["unreserve", "", "prod"][..],
+            &["unreserve", "agent-1", ""][..],
+            &["create-volumes", "agent-1"][..],
+            &["create-volumes", "agent-1", "prod", "vol-1", "bad"][..],
+            &["create-volumes", "", "prod", "vol-1", "1024"][..],
+            &["create-volumes", "agent-1", "", "vol-1", "1024"][..],
+            &["destroy-volumes", "agent-1"][..],
+            &["destroy-volumes", "", "vol-1"][..],
+            &["grow-volume", "agent-1"][..],
+            &["grow-volume", "agent-1", "vol-1", "bad"][..],
+            &["grow-volume", "", "vol-1", "1024"][..],
+            &["shrink-volume", "agent-1"][..],
+            &["shrink-volume", "agent-1", "vol-1", "bad"][..],
+            &["shrink-volume", "", "vol-1", "1024"][..],
+            &["containers"][..],
+            &["containers", ""][..],
+            &["exec-nested", "parent-1"][..],
+            &["attach"][..],
+            &["prune-images"][..],
+            &["prune-images", ""][..],
             &["submit", "prod"][..],
             &["submit", "", "task-1", "/bin/echo"][..],
             &["submit", "prod", "", "/bin/echo"][..],
@@ -617,6 +1284,26 @@ mod tests {
 
         let (code_ok, _) = run_cli_main(&["status"]);
         assert!(code_ok.is_success());
+        let (code_offline, _) = run_cli_main(&["--master-url", "http://127.0.0.1:0", "status"]);
+        assert!(code_offline.is_success());
+        let _ = std::net::TcpListener::bind("127.0.0.1:0").map(|l| {
+            let _ = l.local_addr().map(|addr| {
+                let srv = std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let _ = l.accept().map(|(mut s, _)| {
+                        let mut b = [0_u8; 512];
+                        let _ = s.read(&mut b);
+                        let _ =
+                            s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 9\r\n\r\nREMOTE_OK");
+                    });
+                });
+                let url_arg = format!("http://{addr}");
+                let (c_rem, out_rem) = run_cli_main(&["--master-url", &url_arg, "status"]);
+                assert!(c_rem.is_success());
+                assert_eq!(out_rem, "REMOTE_OK");
+                let _ = srv.join();
+            });
+        });
         let (code_err, _) = run_cli_main(&["unknown"]);
         assert!(!code_err.is_success());
 
@@ -640,6 +1327,38 @@ mod tests {
             let _ = listener.local_addr().map(|addr| {
                 let _ =
                     CliSubcommand::Status.send_http_operator_request_to_server(&addr.to_string());
+            });
+        });
+
+        assert!(
+            CliSubcommand::Status
+                .execute_against_remote_master("invalid-addr")
+                .is_err()
+        );
+        let _ = std::net::TcpListener::bind("127.0.0.1:0").map(|listener| {
+            let _ = listener.local_addr().map(|addr| {
+                let srv = std::thread::spawn(move || {
+                    use std::io::{Read, Write};
+                    let _ = listener.accept().map(|(mut s, _)| {
+                        let mut b = [0_u8; 512];
+                        let _ = s.read(&mut b);
+                        let _ = s.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nOK");
+                    });
+                    let _ = listener.accept().map(|(mut s2, _)| {
+                        let mut b = [0_u8; 512];
+                        let _ = s2.read(&mut b);
+                        let _ = s2.write_all(b"RAW_BODY");
+                    });
+                });
+                assert_eq!(
+                    CliSubcommand::Status.execute_against_remote_master(&addr.to_string()),
+                    Ok("OK".to_owned())
+                );
+                assert_eq!(
+                    CliSubcommand::Status.execute_against_remote_master(&addr.to_string()),
+                    Ok("RAW_BODY".to_owned())
+                );
+                let _ = srv.join();
             });
         });
     }

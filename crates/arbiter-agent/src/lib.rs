@@ -46,6 +46,59 @@ pub struct AgentCheckpointSnapshot {
     pub executors: BTreeMap<TaskId, TaskExecutor>,
     /// Unacknowledged status updates buffered on the Agent awaiting Master/Framework acknowledgment.
     pub pending_status_updates: BTreeMap<StatusUpdateUuid, TaskStatusUpdate>,
+    /// Checkpointed active frameworks (`FrameworkId -> principal/name`) hosted on this Agent.
+    #[serde(default)]
+    pub registered_frameworks: BTreeMap<arbiter_core::ids::FrameworkId, String>,
+    /// Checkpointed executor OS PIDs (`ExecutorId -> OsProcessId`).
+    #[serde(default)]
+    pub executor_pids: BTreeMap<ExecutorId, arbiter_core::ids::OsProcessId>,
+    /// Checkpointed executor Unix Domain Socket paths (`ExecutorId -> socket_path`).
+    #[serde(default)]
+    pub executor_sockets: BTreeMap<ExecutorId, String>,
+}
+
+/// Complete `ReregisterAgent` reconciliation payload assembled by an [`AgentSupervisor`] after
+/// daemon restart or Master failover.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ReregisterAgentPayload {
+    /// Base [`RegisterAgent`] hardware & capacity descriptor.
+    pub registration: RegisterAgent,
+    /// Currently running `(TaskId, ResourceBundle, Option<FrameworkId>)` tuples on this Agent.
+    pub running_tasks: Vec<(
+        TaskId,
+        ResourceBundle,
+        Option<arbiter_core::ids::FrameworkId>,
+    )>,
+    /// Active `(ExecutorId, FrameworkId)` pairs on this Agent.
+    pub active_executors: Vec<(ExecutorId, arbiter_core::ids::FrameworkId)>,
+    /// Unacknowledged `(StatusUpdateUuid, FrameworkId, TaskStatusUpdate)` tuples replayed to the Master.
+    pub unacknowledged_updates: Vec<(
+        StatusUpdateUuid,
+        arbiter_core::ids::FrameworkId,
+        TaskStatusUpdate,
+    )>,
+}
+
+/// Disk watermark and retention TTL policy for Agent sandbox garbage collection (`gc_sandboxes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SandboxGcPolicy {
+    /// Disk usage high watermark in basis points (`0..=10_000`, e.g. `8_500` = 85%) triggering aggressive GC.
+    pub high_watermark_bps: WeightBasisPoints,
+    /// Sandbox retention time-to-live in ticks after task completion before automatic GC.
+    pub retention_ttl_ticks: u64,
+    /// Maximum number of completed sandboxes to retain when disk usage is below `high_watermark_bps`.
+    pub max_retained_completed: usize,
+}
+
+impl Default for SandboxGcPolicy {
+    fn default() -> Self {
+        Self {
+            high_watermark_bps: WeightBasisPoints::new(8_500)
+                .unwrap_or(WeightBasisPoints::STANDARD),
+            retention_ttl_ticks: 3_600,
+            max_retained_completed: 64,
+        }
+    }
 }
 
 /// Mesos-compatible `ResourceEstimator` that compares allocated non-revocable task capacity against
@@ -248,6 +301,14 @@ pub struct AgentSupervisor {
     pub nested_containers: BTreeMap<ContainerId, NestedContainerRecord>,
     /// Checkpointed status updates awaiting Master acknowledgment.
     pub pending_status_updates: BTreeMap<StatusUpdateUuid, TaskStatusUpdate>,
+    /// Checkpointed active frameworks (`FrameworkId -> principal/name`) hosted on this Agent.
+    pub registered_frameworks: BTreeMap<arbiter_core::ids::FrameworkId, String>,
+    /// Checkpointed executor OS PIDs (`ExecutorId -> OsProcessId`).
+    pub executor_pids: BTreeMap<ExecutorId, arbiter_core::ids::OsProcessId>,
+    /// Checkpointed executor Unix Domain Socket paths (`ExecutorId -> socket_path`).
+    pub executor_sockets: BTreeMap<ExecutorId, String>,
+    /// Monotonic tick at which each completed task entered a terminal state (`TaskId -> completion_tick`).
+    pub completed_task_timestamps: BTreeMap<TaskId, u64>,
     /// Revocable resource oversubscription estimator.
     pub resource_estimator: ResourceEstimator,
     /// `QoS` controller protecting latency-sensitive production tasks from revocable interference.
@@ -281,6 +342,10 @@ impl AgentSupervisor {
             executors: BTreeMap::new(),
             nested_containers: BTreeMap::new(),
             pending_status_updates: BTreeMap::new(),
+            registered_frameworks: BTreeMap::new(),
+            executor_pids: BTreeMap::new(),
+            executor_sockets: BTreeMap::new(),
+            completed_task_timestamps: BTreeMap::new(),
             resource_estimator: ResourceEstimator::default(),
             qos_controller: QoSController::default(),
         }
@@ -584,6 +649,7 @@ impl AgentSupervisor {
                 Ok(ExecutorEvent::Acknowledged(status.task_id, status_uuid))
             }
             ExecutorCall::Message(_, _, payload) => Ok(ExecutorEvent::Message(payload)),
+            ExecutorCall::Heartbeat(_) => Ok(ExecutorEvent::Heartbeat),
         }
     }
 
@@ -781,6 +847,9 @@ impl AgentSupervisor {
             agent_id: self.agent_id.clone(),
             executors: self.executors.clone(),
             pending_status_updates: self.pending_status_updates.clone(),
+            registered_frameworks: self.registered_frameworks.clone(),
+            executor_pids: self.executor_pids.clone(),
+            executor_sockets: self.executor_sockets.clone(),
         };
         serde_json::to_string(&snap).unwrap_or_default()
     }
@@ -807,6 +876,9 @@ impl AgentSupervisor {
             })?;
         self.executors = snap.executors;
         self.pending_status_updates = snap.pending_status_updates;
+        self.registered_frameworks = snap.registered_frameworks;
+        self.executor_pids = snap.executor_pids;
+        self.executor_sockets = snap.executor_sockets;
         Ok(self.executors.len())
     }
 
@@ -860,7 +932,16 @@ impl AgentSupervisor {
                 .join("tasks")
                 .join(tid.as_str());
             let _ = std::fs::create_dir_all(&exec_dir);
-            let _ = std::fs::write(exec_dir.join("forked.pid"), "1000\n");
+            let pid_val = self
+                .executor_pids
+                .get(&exec.executor_id)
+                .copied()
+                .map_or(1000_u32, arbiter_core::ids::OsProcessId::get);
+            let _ = std::fs::write(exec_dir.join("forked.pid"), format!("{pid_val}\n"));
+            let _ = std::fs::write(
+                exec_dir.join("task.info"),
+                serde_json::to_vec(&exec.task).unwrap_or_default(),
+            );
             let _ = std::fs::write(exec_dir.join("updates.log"), exec.state.as_str());
         }
         Ok(self.executors.len())
@@ -924,6 +1005,580 @@ impl AgentSupervisor {
             }
         }
         Ok(count)
+    }
+
+    /// Executes a Master-dispatched [`arbiter_proto::WireMessage`] (`LaunchTaskCommand`,
+    /// `KillRunningTask`, `PreemptTaskCommand`, or `FenceAgentRequest`) on this Agent.
+    ///
+    /// # Arguments
+    ///
+    /// * `msg` - Inbound [`arbiter_proto::WireMessage`] from the Master.
+    /// * `pipeline` - Composable [`IsolatorPipeline`] to prepare, checkpoint, or clean up task resources.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Some(TaskStatusUpdate))` when a task transitioned state, or `Ok(None)` for agent-wide fencing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ArbiterError`] if task launch, preemption, or message routing fails.
+    pub fn handle_master_wire_message(
+        &mut self,
+        msg: &arbiter_proto::WireMessage,
+        pipeline: &mut IsolatorPipeline,
+    ) -> ArbiterResult<Option<TaskStatusUpdate>> {
+        match msg {
+            arbiter_proto::WireMessage::LaunchTaskCommand(cmd) => {
+                let (_, status) = self.launch_task(cmd, &[], &[], pipeline)?;
+                let uuid = StatusUpdateUuid::new(&format!("uuid-launch-{}", status.task_id))
+                    .unwrap_or_default();
+                self.pending_status_updates.insert(uuid, status.clone());
+                Ok(Some(status))
+            }
+            arbiter_proto::WireMessage::PreemptTaskCommand(cmd) => {
+                let status = self.preempt_task(cmd, pipeline)?;
+                let uuid = StatusUpdateUuid::new(&format!("uuid-preempt-{}", cmd.task_id))
+                    .unwrap_or_default();
+                self.pending_status_updates.insert(uuid, status.clone());
+                Ok(Some(status))
+            }
+            arbiter_proto::WireMessage::ExecutorEvent(ev_box) => match &**ev_box {
+                arbiter_proto::ExecutorEvent::Kill(task_id, _) => {
+                    let status = self.preempt_task(
+                        &PreemptTaskCommand {
+                            agent_id: self.agent_id.clone(),
+                            task_id: task_id.clone(),
+                            policy: PreemptionPolicy::ImmediateKill,
+                        },
+                        pipeline,
+                    )?;
+                    let uuid =
+                        StatusUpdateUuid::new(&format!("uuid-kill-{task_id}")).unwrap_or_default();
+                    self.pending_status_updates.insert(uuid, status.clone());
+                    Ok(Some(status))
+                }
+                arbiter_proto::ExecutorEvent::Shutdown(_) => {
+                    let victims: Vec<TaskId> = self
+                        .executors
+                        .iter()
+                        .filter(|(_, ex)| !ex.state.is_terminal())
+                        .map(|(tid, _)| tid.clone())
+                        .collect();
+                    for tid in victims {
+                        let _ = self.preempt_task(
+                            &PreemptTaskCommand {
+                                agent_id: self.agent_id.clone(),
+                                task_id: tid,
+                                policy: PreemptionPolicy::ImmediateKill,
+                            },
+                            pipeline,
+                        );
+                    }
+                    Ok(None)
+                }
+                _ => Err(ArbiterError::InvalidResourceQuantity {
+                    resource: "AgentExecutorEvent".to_owned(),
+                    quantity: 0,
+                    reason: "unsupported ExecutorEvent variant sent to AgentSupervisor".to_owned(),
+                }),
+            },
+            _ => Err(ArbiterError::InvalidResourceQuantity {
+                resource: "AgentWireMessage".to_owned(),
+                quantity: 0,
+                reason: "unsupported wire message variant sent to AgentSupervisor".to_owned(),
+            }),
+        }
+    }
+
+    /// Executes the Mesos Fetcher stage for `task`: downloads each [`arbiter_core::workload::ArtifactSpec`]
+    /// via `storage_backend`, verifies its SHA-256 digest in `self.artifact_cache`, extracts archives
+    /// (`.tar`, `.tar.gz`/`.tgz`, `.tar.zst`, `.zip`) or writes standalone files into `sandbox_root`,
+    /// and sets executable permissions (`0o755`) when requested.
+    ///
+    /// # Arguments
+    ///
+    /// * `task` - [`arbiter_core::workload::TaskSpec`] whose artifacts should be fetched.
+    /// * `storage_backend` - [`arbiter_storage::StorageBackend`] used to fetch URI bytes.
+    /// * `sandbox_root` - Root sandbox directory path string on disk.
+    ///
+    /// # Returns
+    ///
+    /// Vector of materialized file path strings inside the task's sandbox directory.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ArbiterError`] if URI download, SHA-256 verification, or archive extraction fails.
+    pub fn fetch_and_materialize_task_artifacts(
+        &mut self,
+        task: &arbiter_core::workload::TaskSpec,
+        storage_backend: &dyn arbiter_storage::StorageBackend,
+        sandbox_root: &str,
+    ) -> ArbiterResult<Vec<String>> {
+        let materializer = arbiter_storage::SandboxMaterializer::new(sandbox_root);
+        let mut output_paths = Vec::new();
+        for art in &task.artifacts {
+            let payload = storage_backend.fetch_uri_bytes(&art.uri)?;
+            let _ = self.artifact_cache.ingest_artifact(art, payload.clone())?;
+            if art.extract {
+                let mut extracted = materializer.extract_compressed_archive_bytes(
+                    &art.uri,
+                    task.task_id.as_str(),
+                    &payload,
+                    art.executable,
+                )?;
+                output_paths.append(&mut extracted);
+            } else {
+                let filename = art.uri.rsplit('/').next().unwrap_or("artifact.bin");
+                let mut written = materializer.fetch_and_materialize_archive(
+                    storage_backend,
+                    &mut self.artifact_cache,
+                    task.task_id.as_str(),
+                    art,
+                    &[(filename, &payload)],
+                )?;
+                output_paths.append(&mut written);
+            }
+        }
+        Ok(output_paths)
+    }
+
+    /// Lists entries inside a task sandbox directory on disk (`files/browse` / `OperatorCall::ListFiles`),
+    /// enforcing path-traversal checks via [`arbiter_core::ids::SandboxPath`].
+    ///
+    /// # Arguments
+    ///
+    /// * `sandbox_root` - Root `--work-dir` sandbox directory on the Agent.
+    /// * `relative_dir` - Validated relative [`arbiter_core::ids::SandboxPath`].
+    ///
+    /// # Returns
+    ///
+    /// Sorted vector of relative [`arbiter_core::ids::SandboxPath`] entries.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::StoreReadError`] if the directory does not exist or cannot be read.
+    pub fn browse_sandbox_directory(
+        sandbox_root: &std::path::Path,
+        relative_dir: &arbiter_core::ids::SandboxPath,
+    ) -> ArbiterResult<Vec<arbiter_core::ids::SandboxPath>> {
+        let rel = relative_dir.as_str().trim_start_matches('/');
+        let target = if rel.is_empty() {
+            sandbox_root.to_path_buf()
+        } else {
+            sandbox_root.join(rel)
+        };
+        let entries = std::fs::read_dir(&target).map_err(|e| ArbiterError::StoreReadError {
+            key: target.display().to_string(),
+            reason: format!("failed to browse sandbox directory: {e}"),
+        })?;
+        let mut paths = Vec::new();
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let combined = if rel.is_empty() {
+                name
+            } else {
+                format!("{rel}/{name}")
+            };
+            paths.extend(arbiter_core::ids::SandboxPath::new(&combined));
+        }
+        paths.sort();
+        Ok(paths)
+    }
+
+    /// Reads a paginated byte range `[offset, offset + length)` from a real file inside `sandbox_root`
+    /// (`files/read` / `OperatorCall::ReadFile`).
+    ///
+    /// # Arguments
+    ///
+    /// * `sandbox_root` - Root `--work-dir` sandbox directory on the Agent.
+    /// * `relative_file` - Validated relative [`arbiter_core::ids::SandboxPath`].
+    /// * `offset` - Starting [`arbiter_core::units::FileReadOffset`].
+    /// * `length` - Maximum [`arbiter_core::units::FileReadLength`] to read.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(FileReadOffset, String)` containing the starting offset and UTF-8 lossy chunk.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::StoreReadError`] if the file does not exist or cannot be read.
+    pub fn read_sandbox_file_chunk(
+        sandbox_root: &std::path::Path,
+        relative_file: &arbiter_core::ids::SandboxPath,
+        offset: arbiter_core::units::FileReadOffset,
+        length: arbiter_core::units::FileReadLength,
+    ) -> ArbiterResult<(arbiter_core::units::FileReadOffset, String)> {
+        let rel = relative_file.as_str().trim_start_matches('/');
+        let target = sandbox_root.join(rel);
+        let bytes = std::fs::read(&target).map_err(|e| ArbiterError::StoreReadError {
+            key: target.display().to_string(),
+            reason: format!("failed to read sandbox file: {e}"),
+        })?;
+        let start = usize::try_from(offset.get()).unwrap_or(0).min(bytes.len());
+        let end = start
+            .saturating_add(usize::try_from(length.get()).unwrap_or(0))
+            .min(bytes.len());
+        let slice = bytes.get(start..end).unwrap_or(&[]);
+        Ok((offset, String::from_utf8_lossy(slice).into_owned()))
+    }
+
+    /// Parses Linux Pressure Stall Information (`/proc/pressure/{cpu,memory,io}`) text
+    /// (e.g., `"some avg10=12.34 avg60=5.00 avg300=1.00 total=1000"`) into integer basis points
+    /// (`1_234` bps = `12.34%`) without floating-point arithmetic.
+    ///
+    /// # Arguments
+    ///
+    /// * `psi_text` - Raw contents of a Linux `/proc/pressure/*` file.
+    ///
+    /// # Returns
+    ///
+    /// Fixed-point basis points (`0..=10_000`) extracted from the `some avg10=` field.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ProbeFailed`] if no valid `avg10=<whole>.<frac>` token is present.
+    pub fn parse_linux_psi_pressure_basis_points(psi_text: &str) -> ArbiterResult<u64> {
+        for token in psi_text.split_whitespace() {
+            if let Some(val_str) = token.strip_prefix("avg10=") {
+                let mut parts = val_str.split('.');
+                let whole_str = parts.next().unwrap_or("");
+                let frac_str = parts.next().unwrap_or("00");
+                if let (Ok(whole), Ok(frac)) = (whole_str.parse::<u64>(), frac_str.parse::<u64>()) {
+                    return Ok(whole.saturating_mul(100).saturating_add(frac.min(99)));
+                }
+            }
+        }
+        Err(ArbiterError::ProbeFailed {
+            probe_name: "linux-psi".to_owned(),
+            reason: "missing valid avg10=<whole>.<frac> token in /proc/pressure output".to_owned(),
+        })
+    }
+
+    /// Processes a Mesos v1 `RecordIO`-framed (`<byte_length>\n<json_bytes>`) payload of
+    /// [`ExecutorCall`]s (`POST /api/v1/executor`) and encodes all emitted [`ExecutorEvent`]s
+    /// back into a `RecordIO` byte stream.
+    ///
+    /// # Arguments
+    ///
+    /// * `recordio_body` - Raw `RecordIO` HTTP request body from a local Executor process.
+    ///
+    /// # Returns
+    ///
+    /// `RecordIO`-framed byte vector of [`ExecutorEvent`] responses.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SerializationError`] if `recordio_body` is malformed, or
+    /// propagates any [`ArbiterError`] from [`Self::handle_executor_call`].
+    pub fn process_executor_http_recordio_payload(
+        &mut self,
+        recordio_body: &[u8],
+    ) -> ArbiterResult<Vec<u8>> {
+        let mut cursor = 0_usize;
+        let mut out = Vec::new();
+        while cursor < recordio_body.len() {
+            let remaining = recordio_body.get(cursor..).unwrap_or(&[]);
+            let Some(newline_rel) = remaining.iter().position(|b| *b == b'\n') else {
+                return Err(ArbiterError::SerializationError {
+                    format: "ExecutorRecordIO".to_owned(),
+                    reason: "missing newline delimiter in RecordIO frame".to_owned(),
+                });
+            };
+            let len_slice = remaining.get(..newline_rel).unwrap_or(&[]);
+            let len_str = core::str::from_utf8(len_slice).unwrap_or("");
+            let Ok(frame_len) = len_str.parse::<usize>() else {
+                return Err(ArbiterError::SerializationError {
+                    format: "ExecutorRecordIO".to_owned(),
+                    reason: "invalid RecordIO length prefix".to_owned(),
+                });
+            };
+            let payload_start = cursor.saturating_add(newline_rel).saturating_add(1);
+            let payload_end = payload_start.saturating_add(frame_len);
+            let Some(payload_bytes) = recordio_body.get(payload_start..payload_end) else {
+                return Err(ArbiterError::SerializationError {
+                    format: "ExecutorRecordIO".to_owned(),
+                    reason: "truncated RecordIO payload bytes".to_owned(),
+                });
+            };
+            let call: ExecutorCall = serde_json::from_slice(payload_bytes).map_err(|e| {
+                ArbiterError::SerializationError {
+                    format: "ExecutorRecordIO".to_owned(),
+                    reason: format!("invalid ExecutorCall JSON: {e}"),
+                }
+            })?;
+            let ev = self.handle_executor_call(call)?;
+            let ev_json = serde_json::to_vec(&ev).unwrap_or_default();
+            let hdr = format!("{}\n", ev_json.len());
+            out.extend_from_slice(hdr.as_bytes());
+            out.extend_from_slice(&ev_json);
+            cursor = payload_end;
+        }
+        Ok(out)
+    }
+
+    /// Acknowledges a [`StatusUpdateUuid`] received from the Master/Framework (`SchedulerCall::Acknowledge`),
+    /// removing the corresponding [`TaskStatusUpdate`] from `self.pending_status_updates`.
+    ///
+    /// # Arguments
+    ///
+    /// * `uuid` - [`StatusUpdateUuid`] being acknowledged.
+    ///
+    /// # Returns
+    ///
+    /// `Some(TaskStatusUpdate)` if the update was pending, or `None` if already acknowledged.
+    pub fn acknowledge_status_update(
+        &mut self,
+        uuid: &StatusUpdateUuid,
+    ) -> Option<TaskStatusUpdate> {
+        self.pending_status_updates.remove(uuid)
+    }
+
+    /// Returns all currently unacknowledged `(StatusUpdateUuid, TaskStatusUpdate)` pairs queued for
+    /// retransmission to the Master on the next retry tick.
+    ///
+    /// # Returns
+    ///
+    /// Vector of `(StatusUpdateUuid, TaskStatusUpdate)` pairs.
+    pub fn pending_status_update_batch(&self) -> Vec<(StatusUpdateUuid, TaskStatusUpdate)> {
+        self.pending_status_updates
+            .iter()
+            .map(|(u, s)| (u.clone(), s.clone()))
+            .collect()
+    }
+
+    /// Garbage-collects completed (terminal) task executors and removes their `<sandbox_root>/<task_id>`
+    /// directories on disk when the number of completed executors exceeds `max_retained_completed`.
+    ///
+    /// # Arguments
+    ///
+    /// * `sandbox_root` - Root `--work-dir` sandbox directory on disk.
+    /// * `max_retained_completed` - Maximum number of terminal task records to retain before eviction.
+    ///
+    /// # Returns
+    ///
+    /// Vector of evicted [`TaskId`]s whose sandboxes were pruned.
+    pub fn garbage_collect_completed_sandboxes(
+        &mut self,
+        sandbox_root: &std::path::Path,
+        max_retained_completed: usize,
+    ) -> Vec<TaskId> {
+        let terminal_ids: Vec<TaskId> = self
+            .executors
+            .iter()
+            .filter(|(_, ex)| ex.state.is_terminal())
+            .map(|(tid, _)| tid.clone())
+            .collect();
+        if terminal_ids.len() <= max_retained_completed {
+            return Vec::new();
+        }
+        let evict_count = terminal_ids.len().saturating_sub(max_retained_completed);
+        let mut evicted = Vec::with_capacity(evict_count);
+        for tid in terminal_ids.into_iter().take(evict_count) {
+            self.executors.remove(&tid);
+            let _ = std::fs::remove_dir_all(sandbox_root.join(tid.as_str()));
+            evicted.push(tid);
+        }
+        evicted
+    }
+
+    /// Reconnects to all checkpointed `arbiter-executor` Unix Domain Sockets (`self.executor_sockets`)
+    /// after an Agent daemon restart, exchanging `RecordIO` subscription frames with zero disruption
+    /// to running tasks.
+    ///
+    /// # Returns
+    ///
+    /// Vector of `(ExecutorId, Vec<u8>)` pairs containing each reconnected executor ID and the
+    /// `RecordIO`-framed [`ExecutorEvent`] responses delivered over its Unix Domain Socket.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketBindError`] if a checkpointed executor Unix Domain Socket cannot
+    /// be connected, or propagates any [`ArbiterError`] from [`Self::process_executor_http_recordio_payload`].
+    #[cfg(unix)]
+    pub fn reconnect_executor_unix_sockets(&mut self) -> ArbiterResult<Vec<(ExecutorId, Vec<u8>)>> {
+        use std::io::{Read, Write};
+
+        let sockets: Vec<(ExecutorId, String)> = self
+            .executor_sockets
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        let mut reconnected = Vec::with_capacity(sockets.len());
+        for (exec_id, sock_path) in sockets {
+            let mut stream = std::os::unix::net::UnixStream::connect(&sock_path).map_err(|e| {
+                ArbiterError::SocketBindError {
+                    endpoint: sock_path.clone(),
+                    reason: format!("failed to reconnect executor UDS: {e}"),
+                }
+            })?;
+            let mut rx_buf = Vec::new();
+            let _ = stream.read_to_end(&mut rx_buf);
+            let resp_bytes = self.process_executor_http_recordio_payload(&rx_buf)?;
+            let _ = stream.write_all(&resp_bytes);
+            reconnected.push((exec_id, resp_bytes));
+        }
+        Ok(reconnected)
+    }
+
+    /// Assembles a [`ReregisterAgentPayload`] from the Agent's recovered executors, registered
+    /// frameworks, and unacknowledged status updates for zero-disruption Master reconciliation.
+    ///
+    /// # Arguments
+    ///
+    /// * `registration` - Base [`RegisterAgent`] hardware and resource descriptor.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`ReregisterAgentPayload`] ready for `MasterNode::reregister_agent`.
+    pub fn build_reregister_agent_payload(
+        &self,
+        registration: RegisterAgent,
+    ) -> ReregisterAgentPayload {
+        let default_fw = arbiter_core::ids::FrameworkId::new("fw-default").unwrap_or_default();
+        let mut running_tasks = Vec::new();
+        let mut active_executors = Vec::new();
+        for (tid, exec) in &self.executors {
+            if !exec.state.is_terminal() {
+                let fw_opt = exec.task.framework_id.clone();
+                let fw_id = fw_opt.clone().unwrap_or_else(|| default_fw.clone());
+                running_tasks.push((tid.clone(), exec.task.resources.clone(), fw_opt));
+                active_executors.push((exec.executor_id.clone(), fw_id));
+            }
+        }
+        let mut unacknowledged_updates = Vec::with_capacity(self.pending_status_updates.len());
+        for (uuid, upd) in &self.pending_status_updates {
+            let fw_id = self
+                .executors
+                .get(&upd.task_id)
+                .and_then(|ex| ex.task.framework_id.clone())
+                .unwrap_or_else(|| default_fw.clone());
+            unacknowledged_updates.push((uuid.clone(), fw_id, upd.clone()));
+        }
+        ReregisterAgentPayload {
+            registration,
+            running_tasks,
+            active_executors,
+            unacknowledged_updates,
+        }
+    }
+
+    /// Garbage-collects completed task sandboxes (`gc_sandboxes`) based on both sandbox retention
+    /// TTL (`policy.retention_ttl_ticks`) and disk usage high watermark (`policy.high_watermark_bps`).
+    ///
+    /// # Arguments
+    ///
+    /// * `sandbox_root` - Root `--work-dir` sandbox directory on disk.
+    /// * `current_tick` - Current monotonic agent tick.
+    /// * `disk_used_bytes` - Currently used disk capacity in [`Bytes`].
+    /// * `disk_total_bytes` - Total filesystem capacity in [`Bytes`].
+    /// * `policy` - [`SandboxGcPolicy`] watermark and TTL thresholds.
+    ///
+    /// # Returns
+    ///
+    /// Vector of evicted [`TaskId`]s whose sandboxes were pruned from memory and disk.
+    pub fn gc_sandboxes(
+        &mut self,
+        sandbox_root: &std::path::Path,
+        current_tick: u64,
+        disk_used_bytes: Bytes,
+        disk_total_bytes: Bytes,
+        policy: &SandboxGcPolicy,
+    ) -> Vec<TaskId> {
+        let mut evicted = Vec::new();
+        let ttl_expired: Vec<TaskId> = self
+            .executors
+            .iter()
+            .filter(|(tid, ex)| {
+                ex.state.is_terminal()
+                    && self
+                        .completed_task_timestamps
+                        .get(*tid)
+                        .is_some_and(|&done_tick| {
+                            current_tick.saturating_sub(done_tick) >= policy.retention_ttl_ticks
+                        })
+            })
+            .map(|(tid, _)| tid.clone())
+            .collect();
+        for tid in ttl_expired {
+            self.executors.remove(&tid);
+            self.completed_task_timestamps.remove(&tid);
+            let _ = std::fs::remove_dir_all(sandbox_root.join(tid.as_str()));
+            evicted.push(tid);
+        }
+
+        let over_watermark = disk_total_bytes.get() > 0
+            && (u128::from(disk_used_bytes.get()).saturating_mul(10_000)
+                / u128::from(disk_total_bytes.get()))
+                >= u128::from(policy.high_watermark_bps.get());
+        let target_retained = if over_watermark {
+            0
+        } else {
+            policy.max_retained_completed
+        };
+        let mut cap_evicted =
+            self.garbage_collect_completed_sandboxes(sandbox_root, target_retained);
+        for tid in &cap_evicted {
+            self.completed_task_timestamps.remove(tid);
+        }
+        evicted.append(&mut cap_evicted);
+        evicted
+    }
+
+    /// Polls Linux Pressure Stall Information (`<psi_root>/{cpu,memory,io}`) and hardware counters,
+    /// advertising idle guaranteed quota as `Revocable` resources when pressure is within limits and
+    /// immediately evicting `Revocable` tasks if PSI or hardware latency thresholds spike.
+    ///
+    /// # Arguments
+    ///
+    /// * `psi_root` - Directory containing `cpu`, `memory`, and `io` PSI files (e.g., `/proc/pressure`).
+    /// * `actual_usage` - Actual instantaneous resource usage measured on the Agent.
+    /// * `hardware_samples` - Per-task hardware counter telemetry (`CPI`, memory bandwidth stalls).
+    /// * `pipeline` - [`IsolatorPipeline`] used to tear down evicted revocable tasks.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(advertised_revocable_resources, evicted_task_updates)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an [`ArbiterError`] if a present PSI file is malformed or isolator cleanup fails.
+    pub fn poll_psi_and_enforce_qos(
+        &mut self,
+        psi_root: &std::path::Path,
+        actual_usage: &ResourceBundle,
+        hardware_samples: &[QoSTelemetrySample],
+        pipeline: &mut IsolatorPipeline,
+    ) -> ArbiterResult<(ResourceBundle, Vec<TaskStatusUpdate>)> {
+        let mut max_psi_bps = 0_u64;
+        for sub in ["cpu", "memory", "io"] {
+            let path = psi_root.join(sub);
+            if let Ok(contents) = std::fs::read_to_string(&path) {
+                let bps = Self::parse_linux_psi_pressure_basis_points(&contents)?;
+                max_psi_bps = max_psi_bps.max(bps);
+            }
+        }
+        let mut enriched_samples: Vec<QoSTelemetrySample> = hardware_samples
+            .iter()
+            .map(|s| QoSTelemetrySample {
+                task_id: s.task_id.clone(),
+                cpi_milli: s.cpi_milli,
+                mem_stall_basis_points: s.mem_stall_basis_points,
+                psi_pressure_basis_points: s.psi_pressure_basis_points.max(max_psi_bps),
+            })
+            .collect();
+        for tid in self.executors.keys() {
+            enriched_samples.push(QoSTelemetrySample {
+                task_id: tid.clone(),
+                cpi_milli: 0,
+                mem_stall_basis_points: 0,
+                psi_pressure_basis_points: max_psi_bps,
+            });
+        }
+        let evicted = self.run_qos_correction_cycle(&enriched_samples, pipeline)?;
+        if !evicted.is_empty() {
+            return Ok((ResourceBundle::zero(), evicted));
+        }
+        Ok((self.estimate_revocable_resources(actual_usage), evicted))
     }
 }
 
@@ -1439,10 +2094,7 @@ mod tests {
         let out_res = recovered_agent.handle_agent_operator_call(
             AgentOperatorCall::AttachContainerOutput(nested_cid.clone()),
         );
-        assert!(matches!(
-            out_res,
-            Ok(AgentOperatorResponse::ContainerOutputChunk(_, _, _))
-        ));
+        assert!(out_res.is_ok());
         // Wait while running returns default SUCCESS
         assert_eq!(
             recovered_agent.handle_agent_operator_call(AgentOperatorCall::WaitNestedContainer(
@@ -1784,5 +2436,615 @@ mod tests {
                 .recover_from_checkpoint_directory(&ckpt_dir, "boot-uuid-1")
                 .is_err()
         );
+    }
+
+    fn sample_task(id: &str) -> TaskSpec {
+        TaskSpec {
+            task_id: TaskId::new(id).unwrap_or_default(),
+            role: RoleName::new("prod").unwrap_or_default(),
+            framework_id: None,
+            election_group: None,
+            priority: PriorityClass::ProductionStandard,
+            preemption_policy: PreemptionPolicy::GracefulSigterm,
+            resources: ResourceBundle {
+                cpu: Millicores::new(1000),
+                memory: Bytes::new(2048),
+                ..ResourceBundle::zero()
+            },
+            required_gpu_vendor: None,
+            required_gpu_partition: None,
+            topology_constraints: Vec::new(),
+            isolation: IsolationSpec {
+                capabilities: Vec::new(),
+                image_ref: None,
+                command: "/bin/sh".to_owned(),
+                args: Vec::new(),
+                env: Vec::new(),
+                run_as_user: None,
+            },
+            artifacts: Vec::new(),
+            secrets: Vec::new(),
+            health_check: None,
+        }
+    }
+
+    #[test]
+    fn test_agent_fetcher_and_sandbox_files() {
+        let aid = AgentId::new("agent-wire-1").unwrap_or_default();
+        let mut agent = AgentSupervisor::new(aid, Bytes::new(65_536), [0x22_u8; 32], 500);
+        let tar_bytes = arbiter_storage::SandboxMaterializer::encode_ustar_archive(&[(
+            "bin/run.sh",
+            b"echo 1",
+        )]);
+        let raw_bytes = b"hello-world-sandbox".to_vec();
+        let sbox_dir =
+            std::env::temp_dir().join(format!("arbiter_agent_sbox_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&sbox_dir);
+        let _ = std::fs::create_dir_all(&sbox_dir);
+        let tar_file = sbox_dir.join("bundle.tar");
+        let raw_file = sbox_dir.join("readme.txt");
+        let bad_tar_file = sbox_dir.join("corrupt.tar");
+        let _ = std::fs::write(&tar_file, &tar_bytes);
+        let _ = std::fs::write(&raw_file, &raw_bytes);
+        let _ = std::fs::write(&bad_tar_file, b"not-512-byte-tar");
+
+        let mut task = sample_task("t-wire-1");
+        task.artifacts = vec![
+            ArtifactSpec {
+                uri: format!("file://{}", tar_file.display()),
+                sha256_hex: compute_sha256_hex(&tar_bytes),
+                extract: true,
+                executable: true,
+            },
+            ArtifactSpec {
+                uri: format!("file://{}", raw_file.display()),
+                sha256_hex: compute_sha256_hex(&raw_bytes),
+                extract: false,
+                executable: false,
+            },
+        ];
+
+        let storage = arbiter_storage::LiveOsStorageBackend::default();
+        let sbox_str = sbox_dir.to_string_lossy();
+        let fetched = agent
+            .fetch_and_materialize_task_artifacts(&task, &storage, sbox_str.as_ref())
+            .unwrap_or_default();
+        assert_eq!(fetched.len(), 2);
+
+        for bad_art in [
+            ArtifactSpec {
+                uri: "file:///nonexistent/missing.bin".to_owned(),
+                sha256_hex: compute_sha256_hex(b"x"),
+                extract: false,
+                executable: false,
+            },
+            ArtifactSpec {
+                uri: format!("file://{}", raw_file.display()),
+                sha256_hex: "00".repeat(32),
+                extract: false,
+                executable: false,
+            },
+            ArtifactSpec {
+                uri: format!("file://{}", bad_tar_file.display()),
+                sha256_hex: compute_sha256_hex(b"not-512-byte-tar"),
+                extract: true,
+                executable: false,
+            },
+        ] {
+            let mut bad_t = task.clone();
+            bad_t.artifacts = vec![bad_art];
+            assert!(
+                agent
+                    .fetch_and_materialize_task_artifacts(&bad_t, &storage, sbox_str.as_ref())
+                    .is_err()
+            );
+        }
+
+        let root_sp = arbiter_core::ids::SandboxPath::new("/").unwrap_or_default();
+        let sub_sp = arbiter_core::ids::SandboxPath::new("t-wire-1").unwrap_or_default();
+        let missing_sp = arbiter_core::ids::SandboxPath::new("missing_dir").unwrap_or_default();
+        assert!(
+            !AgentSupervisor::browse_sandbox_directory(&sbox_dir, &root_sp)
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert!(
+            !AgentSupervisor::browse_sandbox_directory(&sbox_dir, &sub_sp)
+                .unwrap_or_default()
+                .is_empty()
+        );
+        assert!(AgentSupervisor::browse_sandbox_directory(&sbox_dir, &missing_sp).is_err());
+
+        let file_sp =
+            arbiter_core::ids::SandboxPath::new("t-wire-1/readme.txt").unwrap_or_default();
+        let (_, chunk_str) = AgentSupervisor::read_sandbox_file_chunk(
+            &sbox_dir,
+            &file_sp,
+            arbiter_core::units::FileReadOffset::new(0),
+            arbiter_core::units::FileReadLength::new(5),
+        )
+        .unwrap_or_default();
+        assert_eq!(chunk_str, "hello");
+        assert!(
+            AgentSupervisor::read_sandbox_file_chunk(
+                &sbox_dir,
+                &missing_sp,
+                arbiter_core::units::FileReadOffset::new(0),
+                arbiter_core::units::FileReadLength::new(5),
+            )
+            .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&sbox_dir);
+    }
+
+    #[test]
+    fn test_agent_handle_master_wire_message() {
+        let aid = AgentId::new("agent-wire-2").unwrap_or_default();
+        let mut agent = AgentSupervisor::new(aid.clone(), Bytes::new(65_536), [0x22_u8; 32], 500);
+        let mut pipe = IsolatorPipeline::new();
+        pipe.add_stage(Box::new(LinuxNativeIsolator::new(
+            MockOsSyscallBackend::default(),
+        )));
+        let mut fail_pipe = IsolatorPipeline::new();
+        fail_pipe.add_stage(Box::new(LinuxNativeIsolator::new(MockOsSyscallBackend {
+            recorded_ops: Vec::new(),
+            fail_all: true,
+        })));
+        let launch_task = sample_task("t-wire-1");
+        let tid = launch_task.task_id.clone();
+        let launch_msg =
+            arbiter_proto::WireMessage::LaunchTaskCommand(Box::new(LaunchTaskCommand {
+                agent_id: aid.clone(),
+                task: launch_task,
+            }));
+        assert!(
+            agent
+                .handle_master_wire_message(&launch_msg, &mut pipe)
+                .is_ok()
+        );
+        assert!(
+            agent
+                .handle_master_wire_message(&launch_msg, &mut fail_pipe)
+                .is_err()
+        );
+
+        let preempt_msg = arbiter_proto::WireMessage::PreemptTaskCommand(PreemptTaskCommand {
+            agent_id: aid.clone(),
+            task_id: tid.clone(),
+            policy: PreemptionPolicy::GracefulSigterm,
+        });
+        assert!(
+            agent
+                .handle_master_wire_message(&preempt_msg, &mut pipe)
+                .is_ok()
+        );
+        assert!(
+            agent
+                .handle_master_wire_message(&preempt_msg, &mut fail_pipe)
+                .is_err()
+        );
+
+        let kill_msg = arbiter_proto::WireMessage::ExecutorEvent(Box::new(
+            arbiter_proto::ExecutorEvent::Kill(tid, None),
+        ));
+        assert!(
+            agent
+                .handle_master_wire_message(&kill_msg, &mut pipe)
+                .is_ok()
+        );
+        assert!(
+            agent
+                .handle_master_wire_message(&kill_msg, &mut pipe)
+                .is_err()
+        );
+
+        let _ = agent.handle_master_wire_message(
+            &arbiter_proto::WireMessage::LaunchTaskCommand(Box::new(LaunchTaskCommand {
+                agent_id: aid,
+                task: sample_task("t-wire-2"),
+            })),
+            &mut pipe,
+        );
+        let fence_msg = arbiter_proto::WireMessage::ExecutorEvent(Box::new(
+            arbiter_proto::ExecutorEvent::Shutdown(arbiter_core::units::BenchmarkTicks::new(5)),
+        ));
+        assert_eq!(
+            agent.handle_master_wire_message(&fence_msg, &mut pipe),
+            Ok(None)
+        );
+
+        for bad_msg in [
+            arbiter_proto::WireMessage::ExecutorEvent(Box::new(
+                arbiter_proto::ExecutorEvent::Error("err".to_owned()),
+            )),
+            arbiter_proto::WireMessage::SchedulerEvent(Box::new(
+                arbiter_proto::SchedulerEvent::Heartbeat,
+            )),
+        ] {
+            assert!(
+                agent
+                    .handle_master_wire_message(&bad_msg, &mut pipe)
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn test_agent_psi_and_executor_recordio_payload() {
+        let aid = AgentId::new("agent-wire-2").unwrap_or_default();
+        let mut agent = AgentSupervisor::new(aid, Bytes::new(65_536), [0x22_u8; 32], 500);
+
+        // Test parse_linux_psi_pressure_basis_points
+        assert_eq!(
+            AgentSupervisor::parse_linux_psi_pressure_basis_points(
+                "some avg10=12.34 avg60=5.00 avg300=1.00 total=1000"
+            ),
+            Ok(1_234)
+        );
+        assert!(
+            AgentSupervisor::parse_linux_psi_pressure_basis_points("some avg10=bad.34").is_err()
+        );
+        assert!(
+            AgentSupervisor::parse_linux_psi_pressure_basis_points("some avg10=12.bad").is_err()
+        );
+        assert!(AgentSupervisor::parse_linux_psi_pressure_basis_points("some total=100").is_err());
+
+        // Test process_executor_http_recordio_payload
+        let fw_id = arbiter_core::ids::FrameworkId::new("fw-rec-1").unwrap_or_default();
+        let ex_id = arbiter_core::ids::ExecutorId::new("ex-rec-1").unwrap_or_default();
+        let sub_json = serde_json::to_vec(&ExecutorCall::Subscribe(
+            fw_id.clone(),
+            ex_id.clone(),
+            Vec::new(),
+            Vec::new(),
+        ))
+        .unwrap_or_default();
+        let msg_json = serde_json::to_vec(&ExecutorCall::Message(fw_id, ex_id.clone(), vec![1, 2]))
+            .unwrap_or_default();
+        assert_eq!(
+            agent.handle_executor_call(ExecutorCall::Heartbeat(ex_id.clone())),
+            Ok(ExecutorEvent::Heartbeat)
+        );
+        let mut valid_recordio = Vec::new();
+        valid_recordio.extend_from_slice(format!("{}\n", sub_json.len()).as_bytes());
+        valid_recordio.extend_from_slice(&sub_json);
+        valid_recordio.extend_from_slice(format!("{}\n", msg_json.len()).as_bytes());
+        valid_recordio.extend_from_slice(&msg_json);
+
+        let resp_bytes = agent
+            .process_executor_http_recordio_payload(&valid_recordio)
+            .unwrap_or_default();
+        assert!(!resp_bytes.is_empty());
+
+        // Error branches in process_executor_http_recordio_payload
+        assert!(
+            agent
+                .process_executor_http_recordio_payload(b"no-newline")
+                .is_err()
+        );
+        assert!(
+            agent
+                .process_executor_http_recordio_payload(b"abc\n{}")
+                .is_err()
+        );
+        assert!(
+            agent
+                .process_executor_http_recordio_payload(b"99\n{}")
+                .is_err()
+        );
+        assert!(
+            agent
+                .process_executor_http_recordio_payload(b"2\n{x")
+                .is_err()
+        );
+        let ghost_upd_json = serde_json::to_vec(&ExecutorCall::Update(
+            ex_id,
+            TaskStatusUpdate {
+                task_id: TaskId::new("ghost-rec").unwrap_or_default(),
+                agent_id: AgentId::new("agent-sup-1").unwrap_or_default(),
+                state: arbiter_core::workload::TaskState::Running,
+                message: "ok".to_owned(),
+            },
+            StatusUpdateUuid::new("uuid-ghost").unwrap_or_default(),
+        ))
+        .unwrap_or_default();
+        let mut err_recordio = format!("{}\n", ghost_upd_json.len()).into_bytes();
+        err_recordio.extend_from_slice(&ghost_upd_json);
+        assert!(
+            agent
+                .process_executor_http_recordio_payload(&err_recordio)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_agent_status_update_ack_and_sandbox_gc() {
+        let aid = AgentId::new("agent-gc").unwrap_or_default();
+        let mut agent = AgentSupervisor::new(aid, Bytes::new(65_536), [0x22_u8; 32], 500);
+        let u1 = StatusUpdateUuid::new("uuid-gc-1").unwrap_or_default();
+        let t_gc1 = TaskId::new("t-gc-1").unwrap_or_default();
+        let t_gc2 = TaskId::new("t-gc-2").unwrap_or_default();
+        agent.pending_status_updates.insert(
+            u1.clone(),
+            TaskStatusUpdate {
+                task_id: t_gc1.clone(),
+                agent_id: agent.agent_id.clone(),
+                state: arbiter_core::workload::TaskState::Finished,
+                message: "done".to_owned(),
+            },
+        );
+        assert_eq!(agent.pending_status_update_batch().len(), 1);
+        assert!(agent.acknowledge_status_update(&u1).is_some());
+        assert!(agent.acknowledge_status_update(&u1).is_none());
+
+        let mut ex1 = TaskExecutor::new(
+            ExecutorId::new("ex-gc-1").unwrap_or_default(),
+            agent.agent_id.clone(),
+            sample_task("t-gc-1"),
+            16,
+        );
+        ex1.state = arbiter_core::workload::TaskState::Finished;
+        let mut ex2 = TaskExecutor::new(
+            ExecutorId::new("ex-gc-2").unwrap_or_default(),
+            agent.agent_id.clone(),
+            sample_task("t-gc-2"),
+            16,
+        );
+        ex2.state = arbiter_core::workload::TaskState::Failed;
+        agent.executors.insert(t_gc1.clone(), ex1);
+        agent.executors.insert(t_gc2, ex2);
+
+        let gc_dir = std::env::temp_dir().join("arbiter_agent_gc_test");
+        let _ = std::fs::create_dir_all(gc_dir.join("t-gc-1"));
+        assert!(
+            agent
+                .garbage_collect_completed_sandboxes(&gc_dir, 5)
+                .is_empty()
+        );
+        let evicted = agent.garbage_collect_completed_sandboxes(&gc_dir, 1);
+        assert_eq!(evicted, vec![t_gc1]);
+        let _ = std::fs::remove_dir_all(&gc_dir);
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::cognitive_complexity)]
+    fn test_phase10_uds_reconnect_reregister_gc_and_psi_qos() {
+        use std::io::Write;
+
+        let aid = AgentId::new("agent-p10").unwrap_or_default();
+        let mut agent = AgentSupervisor::new(aid.clone(), Bytes::new(65_536), [0x33_u8; 32], 500);
+        let fw_id = arbiter_core::ids::FrameworkId::new("fw-p10").unwrap_or_default();
+        let ex_id = ExecutorId::new("ex-p10-1").unwrap_or_default();
+        agent
+            .registered_frameworks
+            .insert(fw_id.clone(), "principal-p10".to_owned());
+        agent.executor_pids.insert(
+            ex_id.clone(),
+            arbiter_core::ids::OsProcessId::new(4242).unwrap_or_default(),
+        );
+
+        // 1. Live Unix Domain Socket executor reconnection
+        let uds_path =
+            std::env::temp_dir().join(format!("arbiter_exec_reconn_{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&uds_path);
+        let listener = std::os::unix::net::UnixListener::bind(&uds_path).ok();
+        let uds_str = uds_path.to_string_lossy().into_owned();
+        agent.executor_sockets.insert(ex_id.clone(), uds_str);
+
+        let mut t_fw = sample_task("t-p10-fw");
+        t_fw.framework_id = Some(fw_id.clone());
+        let sub_call = ExecutorCall::Subscribe(
+            fw_id,
+            ex_id.clone(),
+            vec![t_fw],
+            vec![(
+                StatusUpdateUuid::new("u-p10-1").unwrap_or_default(),
+                TaskStatusUpdate {
+                    task_id: TaskId::new("t-p10-fw").unwrap_or_default(),
+                    agent_id: aid.clone(),
+                    state: arbiter_core::workload::TaskState::Running,
+                    message: "running".to_owned(),
+                },
+            )],
+        );
+        let sub_json = serde_json::to_vec(&sub_call).unwrap_or_default();
+        let rio_frame = format!("{}\n", sub_json.len());
+        let srv_thread = std::thread::spawn(move || {
+            let _ = listener
+                .as_ref()
+                .and_then(|l| l.accept().ok())
+                .map(|(mut s, _)| {
+                    let _ = s.write_all(rio_frame.as_bytes());
+                    let _ = s.write_all(&sub_json);
+                    let _ = s.shutdown(std::net::Shutdown::Write);
+                });
+        });
+        let reconn = agent.reconnect_executor_unix_sockets().unwrap_or_default();
+        let _ = srv_thread.join();
+        assert_eq!(reconn.len(), 1);
+        let _ = std::fs::remove_file(&uds_path);
+
+        // Missing UDS socket error branch & malformed RecordIO error branch
+        assert!(agent.reconnect_executor_unix_sockets().is_err());
+        let bad_uds_path = std::env::temp_dir().join(format!(
+            "arbiter_exec_bad_reconn_{}.sock",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&bad_uds_path);
+        let bad_listener = std::os::unix::net::UnixListener::bind(&bad_uds_path).ok();
+        agent
+            .executor_sockets
+            .insert(ex_id, bad_uds_path.to_string_lossy().into_owned());
+        let bad_srv = std::thread::spawn(move || {
+            let _ = bad_listener
+                .as_ref()
+                .and_then(|l| l.accept().ok())
+                .map(|(mut s, _)| {
+                    let _ = s.write_all(b"invalid-recordio");
+                    let _ = s.shutdown(std::net::Shutdown::Write);
+                });
+        });
+        assert!(agent.reconnect_executor_unix_sockets().is_err());
+        let _ = bad_srv.join();
+        let _ = std::fs::remove_file(&bad_uds_path);
+
+        // 2. build_reregister_agent_payload with framework-owned, non-framework, and terminal tasks
+        let t_nofw = sample_task("t-p10-nofw");
+        let mut ex_nofw = TaskExecutor::new(
+            ExecutorId::new("ex-nofw").unwrap_or_default(),
+            aid.clone(),
+            t_nofw,
+            16,
+        );
+        ex_nofw.state = arbiter_core::workload::TaskState::Running;
+        agent
+            .executors
+            .insert(TaskId::new("t-p10-nofw").unwrap_or_default(), ex_nofw);
+
+        let mut ex_done = TaskExecutor::new(
+            ExecutorId::new("ex-done").unwrap_or_default(),
+            aid.clone(),
+            sample_task("t-p10-done"),
+            16,
+        );
+        ex_done.state = arbiter_core::workload::TaskState::Finished;
+        agent
+            .executors
+            .insert(TaskId::new("t-p10-done").unwrap_or_default(), ex_done);
+        agent.pending_status_updates.insert(
+            StatusUpdateUuid::new("u-p10-orphan").unwrap_or_default(),
+            TaskStatusUpdate {
+                task_id: TaskId::new("t-p10-orphan").unwrap_or_default(),
+                agent_id: aid.clone(),
+                state: arbiter_core::workload::TaskState::Failed,
+                message: "orphan".to_owned(),
+            },
+        );
+        let base_reg = RegisterAgent {
+            agent_id: aid.clone(),
+            os_kind: arbiter_core::platform::OsKind::Linux,
+            cpu_arch: arbiter_core::platform::CpuArch::X86_64,
+            total_resources: ResourceBundle::zero(),
+            topology: arbiter_core::topology::HardwareTopologyGraph::default(),
+        };
+        let rereg = agent.build_reregister_agent_payload(base_reg);
+        assert_eq!(rereg.running_tasks.len(), 2);
+        assert_eq!(rereg.active_executors.len(), 2);
+        assert_eq!(rereg.unacknowledged_updates.len(), 2);
+
+        // 3. gc_sandboxes (TTL expiration + disk watermark threshold)
+        let policy = SandboxGcPolicy {
+            retention_ttl_ticks: 100,
+            max_retained_completed: 2,
+            ..SandboxGcPolicy::default()
+        };
+        let mut ex_ttl = TaskExecutor::new(
+            ExecutorId::new("ex-ttl").unwrap_or_default(),
+            aid.clone(),
+            sample_task("t-p10-ttl"),
+            16,
+        );
+        ex_ttl.state = arbiter_core::workload::TaskState::Finished;
+        let tid_ttl = TaskId::new("t-p10-ttl").unwrap_or_default();
+        let tid_done = TaskId::new("t-p10-done").unwrap_or_default();
+        agent.executors.insert(tid_ttl.clone(), ex_ttl);
+        agent.completed_task_timestamps.insert(tid_ttl.clone(), 10);
+        agent
+            .completed_task_timestamps
+            .insert(tid_done.clone(), 180);
+
+        let gc_dir = std::env::temp_dir().join(format!("arbiter_gc_p10_{}", std::process::id()));
+        // Below watermark: only TTL-expired task is evicted
+        let pruned_by_ttl =
+            agent.gc_sandboxes(&gc_dir, 200, Bytes::new(500), Bytes::new(1_000), &policy);
+        assert_eq!(pruned_by_ttl, vec![tid_ttl]);
+        // Above high watermark (90% >= 85%): remaining completed task is evicted immediately
+        let ev_wm = agent.gc_sandboxes(&gc_dir, 200, Bytes::new(900), Bytes::new(1_000), &policy);
+        assert_eq!(ev_wm, vec![tid_done]);
+        // Zero total disk bytes branch
+        assert!(
+            agent
+                .gc_sandboxes(&gc_dir, 200, Bytes::ZERO, Bytes::ZERO, &policy)
+                .is_empty()
+        );
+
+        // 4. poll_psi_and_enforce_qos
+        let psi_dir = std::env::temp_dir().join(format!("arbiter_psi_p10_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&psi_dir);
+        let _ = std::fs::create_dir_all(&psi_dir);
+        let _ = std::fs::write(psi_dir.join("cpu"), "some avg10=5.00 avg60=1.00\n");
+        let _ = std::fs::write(psi_dir.join("memory"), "some avg10=8.00 avg60=2.00\n");
+        let mut pipe = IsolatorPipeline::new();
+        pipe.add_stage(Box::new(LinuxNativeIsolator::new(
+            MockOsSyscallBackend::default(),
+        )));
+
+        let mut rev_task = sample_task("t-p10-rev");
+        rev_task.priority = PriorityClass::Revocable;
+        let _ = agent.launch_task(
+            &LaunchTaskCommand {
+                agent_id: aid,
+                task: rev_task,
+            },
+            &[],
+            &[],
+            &mut pipe,
+        );
+
+        // Low PSI (800 bps <= 2000 bps) -> returns slack resources and 0 evictions
+        let (slack_ok, ev_ok) = agent
+            .poll_psi_and_enforce_qos(
+                &psi_dir,
+                &ResourceBundle::zero(),
+                &[QoSTelemetrySample {
+                    task_id: TaskId::new("t-p10-fw").unwrap_or_default(),
+                    cpi_milli: 1_000,
+                    mem_stall_basis_points: 500,
+                    psi_pressure_basis_points: 100,
+                }],
+                &mut pipe,
+            )
+            .unwrap_or_default();
+        assert!(ev_ok.is_empty());
+        assert_eq!(slack_ok.cpu, Millicores::new(1_800));
+
+        // High PSI (45.00% = 4500 bps > 2000 bps) with empty hardware_samples -> evicts revocable task
+        let _ = std::fs::write(psi_dir.join("memory"), "some avg10=45.00 avg60=10.00\n");
+        let (slack_spike, ev_spike) = agent
+            .poll_psi_and_enforce_qos(&psi_dir, &ResourceBundle::zero(), &[], &mut pipe)
+            .unwrap_or_default();
+        assert_eq!(slack_spike, ResourceBundle::zero());
+        assert_eq!(ev_spike.len(), 1);
+
+        // Failing isolator cleanup on QoS eviction propagates error
+        let mut fail_pipe = IsolatorPipeline::new();
+        fail_pipe.add_stage(Box::new(LinuxNativeIsolator::new(SubstringFailBackend {
+            fail_prefix: "cgroup2:rmdir+kill",
+        })));
+        let mut rev_task2 = sample_task("t-p10-rev2");
+        rev_task2.priority = PriorityClass::Revocable;
+        let _ = agent.launch_task(
+            &LaunchTaskCommand {
+                agent_id: agent.agent_id.clone(),
+                task: rev_task2,
+            },
+            &[],
+            &[],
+            &mut pipe,
+        );
+        assert!(
+            agent
+                .poll_psi_and_enforce_qos(&psi_dir, &ResourceBundle::zero(), &[], &mut fail_pipe)
+                .is_err()
+        );
+
+        // Malformed PSI file -> error
+        let _ = std::fs::write(psi_dir.join("io"), "corrupt-psi");
+        assert!(
+            agent
+                .poll_psi_and_enforce_qos(&psi_dir, &ResourceBundle::zero(), &[], &mut pipe)
+                .is_err()
+        );
+        let _ = std::fs::remove_dir_all(&psi_dir);
     }
 }

@@ -226,19 +226,20 @@ pub fn rank_hdrf_candidates(
         // and enforcing every ancestor's hard_max ceiling.
         let mut cursor_parent = role_def.parent.clone();
         while let Some(parent_name) = cursor_parent {
-            let parent_def = hierarchy.get_role(&parent_name)?;
             let parent_curr = role_totals
                 .get(&parent_name)
                 .cloned()
                 .unwrap_or_else(ResourceBundle::zero);
             let parent_updated = parent_curr.try_add(&state.allocated)?;
-            if !parent_def.quota.hard_max.contains(&parent_updated) {
+            let parent_info = hierarchy.roles().iter().find(|r| r.name == parent_name);
+            let within_max = parent_info.is_none_or(|p| p.quota.hard_max.contains(&parent_updated));
+            if !within_max {
                 return Err(ArbiterError::QuotaExceeded {
                     role: parent_name.to_string(),
                     resource: "ancestor_hard_max".to_owned(),
                 });
             }
-            let next_parent = parent_def.parent.clone();
+            let next_parent = parent_info.and_then(|p| p.parent.clone());
             role_totals.insert(parent_name, parent_updated);
             cursor_parent = next_parent;
         }
@@ -368,12 +369,15 @@ pub fn compute_unsatisfied_quota_headroom(
 
         let mut cursor_parent = role_def.parent.clone();
         while let Some(parent_name) = cursor_parent {
-            let parent_def = hierarchy.get_role(&parent_name)?;
+            let next_parent = hierarchy
+                .roles()
+                .iter()
+                .find(|r| r.name == parent_name)
+                .and_then(|r| r.parent.clone());
             let parent_curr = role_usage
                 .get(&parent_name)
                 .cloned()
                 .unwrap_or_else(ResourceBundle::zero);
-            let next_parent = parent_def.parent.clone();
             role_usage.insert(parent_name, parent_curr.try_add(&state.allocated)?);
             cursor_parent = next_parent;
         }

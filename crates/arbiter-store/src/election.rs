@@ -114,6 +114,14 @@ pub struct MultiplexedAgentHeartbeat {
     pub healthy_tasks: Vec<TaskId>,
     /// Monotonic tick when the heartbeat was processed.
     pub heartbeat_tick: u64,
+    /// Piggybacked `(ElectionGroupId, TaskId, LogSequenceNumber, TimelineId)` replication progress reports (`0` extra network packets).
+    #[serde(default)]
+    pub replication_progress: Vec<(
+        ElectionGroupId,
+        TaskId,
+        arbiter_core::units::LogSequenceNumber,
+        arbiter_core::units::TimelineId,
+    )>,
 }
 
 /// Control-plane coordinator for shared `CaaS` workload elections, single-wire lease renewals,
@@ -124,6 +132,15 @@ pub struct ElectionPlane {
     groups: BTreeMap<ElectionGroupId, ElectionGroup>,
     /// Monotonic counter for generating [`LeaseId`]s.
     next_lease_seq: u64,
+    /// Latest reported `(TimelineId, LogSequenceNumber)` per `(ElectionGroupId, TaskId)` from multiplexed heartbeats.
+    #[serde(default)]
+    reported_progress: BTreeMap<
+        (ElectionGroupId, TaskId),
+        (
+            arbiter_core::units::TimelineId,
+            arbiter_core::units::LogSequenceNumber,
+        ),
+    >,
 }
 
 impl ElectionPlane {
@@ -136,6 +153,7 @@ impl ElectionPlane {
         Self {
             groups: BTreeMap::new(),
             next_lease_seq: 1,
+            reported_progress: BTreeMap::new(),
         }
     }
 
@@ -305,7 +323,8 @@ impl ElectionPlane {
     }
 
     /// Processes a single-wire [`MultiplexedAgentHeartbeat`], renewing active primary leases for all
-    /// co-located healthy tasks on `heartbeat.agent_id` in a single pass.
+    /// co-located healthy tasks on `heartbeat.agent_id` and recording piggybacked replication progress
+    /// `(LogSequenceNumber, TimelineId)` in a single pass.
     ///
     /// # Arguments
     ///
@@ -318,6 +337,10 @@ impl ElectionPlane {
         &mut self,
         heartbeat: &MultiplexedAgentHeartbeat,
     ) -> Vec<LeaseGrant> {
+        for (gid, tid, lsn, timeline) in &heartbeat.replication_progress {
+            self.reported_progress
+                .insert((gid.clone(), tid.clone()), (*timeline, *lsn));
+        }
         let mut renewed = Vec::new();
         for group in self.groups.values_mut() {
             if let Some(ref mut lease) = group.current_lease {
@@ -333,6 +356,72 @@ impl ElectionPlane {
             }
         }
         renewed
+    }
+
+    /// Selects the candidate standby task in `group_id` with the highest reported `(TimelineId, LogSequenceNumber)`
+    /// replication progress for zero-data-loss automatic promotion.
+    ///
+    /// # Arguments
+    ///
+    /// * `group_id` - Target [`ElectionGroupId`].
+    /// * `exclude_task` - Optional failed primary [`TaskId`] to exclude from candidate ranking.
+    ///
+    /// # Returns
+    ///
+    /// Highest-ranking standby [`TaskId`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::StoreReadError`] if `group_id` is not registered or no eligible standby exists.
+    pub fn select_highest_lsn_standby(
+        &self,
+        group_id: &ElectionGroupId,
+        exclude_task: Option<&TaskId>,
+    ) -> ArbiterResult<TaskId> {
+        let Some(group) = self.groups.get(group_id) else {
+            return Err(ArbiterError::StoreReadError {
+                key: group_id.to_string(),
+                reason: "election group not registered".to_owned(),
+            });
+        };
+        let best = group
+            .members
+            .iter()
+            .filter(|(tid, _)| exclude_task != Some(tid))
+            .max_by_key(|(tid, _)| {
+                self.reported_progress
+                    .get(&(group_id.clone(), tid.clone()))
+                    .map_or((0_u64, 0_u64), |(tl, lsn)| (tl.get(), lsn.get()))
+            })
+            .map(|(tid, _)| tid.clone());
+        best.ok_or_else(|| ArbiterError::StoreReadError {
+            key: group_id.to_string(),
+            reason: "no eligible standby candidate in election group".to_owned(),
+        })
+    }
+
+    /// Revokes and removes all active [`LeaseGrant`]s hosted on `agent_id` when the Agent is
+    /// fenced or permanently marked gone (`MarkAgentGone`).
+    ///
+    /// # Arguments
+    ///
+    /// * `agent_id` - Fenced or gone [`AgentId`].
+    ///
+    /// # Returns
+    ///
+    /// Vector of revoked [`LeaseGrant`]s previously hosted on `agent_id`.
+    pub fn revoke_leases_on_agent(&mut self, agent_id: &AgentId) -> Vec<LeaseGrant> {
+        let mut revoked = Vec::new();
+        for group in self.groups.values_mut() {
+            if group
+                .current_lease
+                .as_ref()
+                .is_some_and(|l| &l.hosting_agent_id == agent_id)
+            {
+                revoked.extend(group.current_lease.take());
+            }
+        }
+        revoked
     }
 }
 
@@ -362,18 +451,19 @@ mod tests {
                 .is_err()
         );
 
-        // Unknown group election rejected
+        // Unknown group election & standby selection rejected
         assert!(
             plane
                 .elect_or_promote_primary(&mut store, &gid, &t1, 10, None)
                 .is_err()
         );
+        assert!(plane.select_highest_lsn_standby(&gid, None).is_err());
 
         assert!(
             plane
                 .register_group(
                     gid.clone(),
-                    vec![(t1.clone(), a1.clone()), (t2, a2.clone())],
+                    vec![(t1.clone(), a1.clone()), (t2.clone(), a2.clone())],
                     100,
                 )
                 .is_ok()
@@ -384,8 +474,24 @@ mod tests {
             agent_id: a1.clone(),
             healthy_tasks: vec![t1.clone()],
             heartbeat_tick: 5,
+            replication_progress: vec![(
+                gid.clone(),
+                t2.clone(),
+                arbiter_core::units::LogSequenceNumber::new(8192),
+                arbiter_core::units::TimelineId::new(2).unwrap_or_default(),
+            )],
         };
         assert!(plane.process_multiplexed_heartbeat(&hb_before).is_empty());
+        assert_eq!(plane.select_highest_lsn_standby(&gid, Some(&t1)), Ok(t2));
+
+        // Single-member group where the only member is excluded -> StoreReadError
+        let single_gid = ElectionGroupId::new("pg-single").unwrap_or_default();
+        let _ = plane.register_group(single_gid.clone(), vec![(t1.clone(), a1.clone())], 100);
+        assert!(
+            plane
+                .select_highest_lsn_standby(&single_gid, Some(&t1))
+                .is_err()
+        );
 
         // Non-member task rejected
         let non_member = TaskId::new("pg-ghost").unwrap_or_default();
@@ -407,6 +513,7 @@ mod tests {
             agent_id: a1.clone(),
             healthy_tasks: vec![t1.clone()],
             heartbeat_tick: 50,
+            replication_progress: Vec::new(),
         };
         let renewed = plane.process_multiplexed_heartbeat(&hb);
         assert_eq!(renewed.len(), 1);
@@ -417,6 +524,7 @@ mod tests {
             agent_id: a2,
             healthy_tasks: vec![t1.clone()],
             heartbeat_tick: 60,
+            replication_progress: Vec::new(),
         };
         assert!(plane.process_multiplexed_heartbeat(&hb_other).is_empty());
 
@@ -424,6 +532,7 @@ mod tests {
             agent_id: a1.clone(),
             healthy_tasks: vec![],
             heartbeat_tick: 60,
+            replication_progress: Vec::new(),
         };
         assert!(
             plane
@@ -435,11 +544,13 @@ mod tests {
             agent_id: a1,
             healthy_tasks: vec![t1],
             heartbeat_tick: 200,
+            replication_progress: Vec::new(),
         };
         assert!(plane.process_multiplexed_heartbeat(&hb_expired).is_empty());
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_stonith_fencing_and_split_brain_immunity() {
         let mut store = MemoryStateStore::new();
         let mut plane = ElectionPlane::new();
@@ -547,8 +658,25 @@ mod tests {
 
         let mut recovered_plane = ElectionPlane::new();
         recovered_plane.restore_lease(grant3.clone());
-        recovered_plane.restore_lease(grant3);
+        recovered_plane.restore_lease(grant3.clone());
         assert_eq!(recovered_plane.groups().len(), 1);
+        let ghost_aid = AgentId::new("agent-ghost").unwrap_or_default();
+        assert!(
+            recovered_plane
+                .revoke_leases_on_agent(&ghost_aid)
+                .is_empty()
+        );
+        assert_eq!(
+            recovered_plane
+                .revoke_leases_on_agent(&grant3.hosting_agent_id)
+                .len(),
+            1
+        );
+        assert!(
+            recovered_plane
+                .revoke_leases_on_agent(&grant3.hosting_agent_id)
+                .is_empty()
+        );
 
         // Store fault on next_fencing_token propagates cleanly
         store.set_fault(Some(crate::memory::MemoryStoreFault::FailWrites));

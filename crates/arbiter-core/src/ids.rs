@@ -49,6 +49,13 @@ pub fn validate_identifier(kind: &str, value: &str) -> ArbiterResult<()> {
             reason: format!("exceeds maximum length of {MAX_IDENTIFIER_LEN} bytes"),
         });
     }
+    if value.contains("..") {
+        return Err(ArbiterError::InvalidIdentifierCharacters {
+            kind: kind.to_owned(),
+            value: value.to_owned(),
+            reason: "contains disallowed path-traversal sequence '..'".to_owned(),
+        });
+    }
     for byte in value.bytes() {
         let is_valid = byte.is_ascii_alphanumeric()
             || byte == b'-'
@@ -157,6 +164,18 @@ macro_rules! define_string_id {
 }
 
 define_string_id!(
+    /// Unique identifier for a Master control-plane instance in an Arbiter cluster.
+    MasterId,
+    "MasterId"
+);
+
+define_string_id!(
+    /// Unique identifier for a physical or virtual machine host (`MachineID` in Mesos maintenance).
+    MachineId,
+    "MachineId"
+);
+
+define_string_id!(
     /// Unique identifier for an Agent node in an Arbiter cluster.
     AgentId,
     "AgentId"
@@ -184,6 +203,18 @@ define_string_id!(
     /// Unique identifier for a resource Offer sent to a Framework.
     OfferId,
     "OfferId"
+);
+
+define_string_id!(
+    /// Unique identifier for a Mesos v1 maintenance drain InverseOffer sent to a Framework.
+    InverseOfferId,
+    "InverseOfferId"
+);
+
+define_string_id!(
+    /// Validated Windows Job Object kernel handle name (`JobObjectHandle`, e.g., `job-task-01`).
+    JobObjectHandle,
+    "JobObjectHandle"
 );
 
 define_string_id!(
@@ -294,6 +325,49 @@ define_string_id!(
     "ContainerId"
 );
 
+impl ContainerId {
+    /// Constructs a hierarchical Mesos v1 nested [`ContainerId`] (`<parent>.<child>`).
+    ///
+    /// # Arguments
+    ///
+    /// * `parent` - Parent container identifier.
+    /// * `child` - Child container identifier (must not already contain `.`).
+    ///
+    /// # Returns
+    ///
+    /// Validated nested [`ContainerId`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidIdentifierCharacters`] if the combined identifier
+    /// exceeds [`MAX_IDENTIFIER_LEN`] or `child` is empty/malformed.
+    pub fn new_nested(parent: &Self, child: &str) -> ArbiterResult<Self> {
+        validate_identifier("ContainerId", child)?;
+        let combined = format!("{}.{child}", parent.as_str());
+        Self::new(&combined)
+    }
+
+    /// Returns the immediate parent [`ContainerId`] if this container is a nested child (`<parent>.<child>`).
+    ///
+    /// # Returns
+    ///
+    /// `Some(parent_container_id)` if nested, or `None` if top-level.
+    pub fn parent_container_id(&self) -> Option<Self> {
+        self.0
+            .rsplit_once('.')
+            .map(|(parent_str, _)| Self(parent_str.to_owned()))
+    }
+
+    /// Returns `true` if this [`ContainerId`] represents a nested child container.
+    ///
+    /// # Returns
+    ///
+    /// `true` if `self` has a parent container.
+    pub fn is_nested(&self) -> bool {
+        self.0.contains('.')
+    }
+}
+
 define_string_id!(
     /// Unique identifier for a lightweight `MicroVM` instance (`Firecracker`, `bhyve`, `Hyper-V`, `Virtualization.framework`).
     VmId,
@@ -305,6 +379,141 @@ define_string_id!(
     CgroupPath,
     "CgroupPath"
 );
+
+define_string_id!(
+    /// Validated Mesos v1 framework or operator authentication principal name (`PrincipalName`).
+    PrincipalName,
+    "PrincipalName"
+);
+
+define_string_id!(
+    /// Validated container network namespace handle (`NetNsHandle`, e.g., `netns-ctr-01`).
+    NetNsHandle,
+    "NetNsHandle"
+);
+
+define_string_id!(
+    /// Validated Mesos v1 HTTP/2 `RecordIO` and QUIC subscription stream identifier (`Mesos-Stream-Id`).
+    StreamId,
+    "StreamId"
+);
+
+/// Validated `PCIe` Bus:Device.Function (`BDF`) address (`DDDD:BB:DD.F`, e.g., `0000:c1:00.0`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct PcieBdfAddress(String);
+
+impl PcieBdfAddress {
+    /// Exact character length (`12`) of a canonical `DDDD:BB:DD.F` `PCIe` BDF address.
+    pub const BDF_LEN: usize = 12;
+
+    /// Validates and constructs a canonical lowercase [`PcieBdfAddress`] (`DDDD:BB:DD.F`).
+    ///
+    /// # Arguments
+    ///
+    /// * `bdf` - Candidate `PCIe` BDF address string (e.g., `"0000:c1:00.0"`).
+    ///
+    /// # Returns
+    ///
+    /// Validated lowercase [`PcieBdfAddress`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidIdentifierCharacters`] if `bdf` is not in `DDDD:BB:DD.F`
+    /// hexadecimal format with function `F` in `'0'..='7'`.
+    pub fn new(bdf: &str) -> ArbiterResult<Self> {
+        if bdf.len() != Self::BDF_LEN {
+            return Err(ArbiterError::InvalidIdentifierCharacters {
+                kind: "PcieBdfAddress".to_owned(),
+                value: bdf.to_owned(),
+                reason: "PCIe BDF address must be 12 characters in 'DDDD:BB:DD.F' format"
+                    .to_owned(),
+            });
+        }
+        let bytes = bdf.as_bytes();
+        let colons_and_dot_ok = bytes.get(4) == Some(&b':')
+            && bytes.get(7) == Some(&b':')
+            && bytes.get(10) == Some(&b'.');
+        let hex_positions = [0_usize, 1, 2, 3, 5, 6, 8, 9];
+        let hex_ok = hex_positions.iter().all(|&idx| {
+            bytes
+                .get(idx)
+                .copied()
+                .is_some_and(|b| b.is_ascii_hexdigit())
+        });
+        let func_ok = bytes
+            .get(11)
+            .copied()
+            .is_some_and(|b| (b'0'..=b'7').contains(&b));
+        if !colons_and_dot_ok || !hex_ok || !func_ok {
+            return Err(ArbiterError::InvalidIdentifierCharacters {
+                kind: "PcieBdfAddress".to_owned(),
+                value: bdf.to_owned(),
+                reason: "invalid PCIe BDF syntax (expected hex DDDD:BB:DD.F with F in 0..=7)"
+                    .to_owned(),
+            });
+        }
+        Ok(Self(bdf.to_ascii_lowercase()))
+    }
+
+    /// Returns the canonical `DDDD:BB:DD.F` string slice.
+    ///
+    /// # Returns
+    ///
+    /// Canonical `&str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for PcieBdfAddress {
+    /// Formats the `PCIe` BDF address.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for PcieBdfAddress {
+    type Err = ArbiterError;
+
+    /// Parses a string slice into a [`PcieBdfAddress`].
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - Candidate BDF string slice.
+    ///
+    /// # Returns
+    ///
+    /// Validated [`PcieBdfAddress`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidIdentifierCharacters`] if malformed.
+    fn from_str(s: &str) -> ArbiterResult<Self> {
+        Self::new(s)
+    }
+}
 
 /// Validated FreeBSD Jail numeric identifier (`jid >= 1`).
 #[must_use]
@@ -1327,11 +1536,15 @@ mod tests {
         };
     }
 
+    check_id_type!(test_master_id, MasterId, "master-01.prod:5050");
+    check_id_type!(test_machine_id, MachineId, "machine-rack-01:node-02");
     check_id_type!(test_agent_id, AgentId, "agent-01.prod:rack_1");
     check_id_type!(test_framework_id, FrameworkId, "fw-1");
     check_id_type!(test_task_id, TaskId, "task-1");
     check_id_type!(test_task_group_id, TaskGroupId, "tg-1");
     check_id_type!(test_offer_id, OfferId, "offer-1");
+    check_id_type!(test_inverse_offer_id, InverseOfferId, "inv-offer-1");
+    check_id_type!(test_job_object_handle, JobObjectHandle, "job-win-01");
     check_id_type!(test_executor_id, ExecutorId, "exec-1");
     check_id_type!(test_role_name, RoleName, "role.prod");
     check_id_type!(test_cluster_id, ClusterId, "cluster-a");
@@ -1356,6 +1569,29 @@ mod tests {
     check_id_type!(test_container_id, ContainerId, "ctr-task-01");
     check_id_type!(test_vm_id, VmId, "vm-fc-01");
     check_id_type!(test_cgroup_path, CgroupPath, "arbiter.slice:task-01");
+    check_id_type!(test_principal_name, PrincipalName, "scheduler-principal:01");
+    check_id_type!(test_netns_handle, NetNsHandle, "netns-ctr-01");
+    check_id_type!(test_stream_id, StreamId, "stream-fw-01:9001");
+
+    #[test]
+    fn test_pcie_bdf_address() {
+        let bdf = PcieBdfAddress::from_str("0000:C1:00.0").unwrap_or_default();
+        assert_eq!(bdf.as_str(), "0000:c1:00.0");
+        assert_eq!(bdf.to_string(), "0000:c1:00.0");
+        let _ = rkyv::to_bytes::<rkyv::rancor::Error>(&bdf);
+
+        for bad_bdf in [
+            "",
+            "short",
+            "0000-c1:00.0",
+            "0000:c1-00.0",
+            "0000:c1:00:0",
+            "0000:zz:00.0",
+            "0000:c1:00.8",
+        ] {
+            assert!(PcieBdfAddress::new(bad_bdf).is_err());
+        }
+    }
 
     #[test]
     fn test_jail_id_and_zone_id() {
@@ -1456,6 +1692,17 @@ mod tests {
         let long_str = "a".repeat(MAX_IDENTIFIER_LEN + 1);
         assert!(TaskId::new(&long_str).is_err());
         assert!(RoleName::new("invalid:char@").is_err());
+        assert!(TaskId::new("bad..id").is_err());
+
+        let root_ctr = ContainerId::new("ctr-root-1").unwrap_or_default();
+        assert!(!root_ctr.is_nested());
+        assert_eq!(root_ctr.parent_container_id(), None);
+        let child_ctr = ContainerId::new_nested(&root_ctr, "debug-shell").unwrap_or_default();
+        assert!(child_ctr.is_nested());
+        assert_eq!(child_ctr.as_str(), "ctr-root-1.debug-shell");
+        assert_eq!(child_ctr.parent_container_id(), Some(root_ctr.clone()));
+        assert!(ContainerId::new_nested(&root_ctr, "").is_err());
+        assert!(ContainerId::new_nested(&root_ctr, &long_str).is_err());
     }
 
     #[test]
@@ -1556,7 +1803,7 @@ mod tests {
 
     proptest! {
         #[test]
-        fn prop_valid_identifier_roundtrip(s in "[a-zA-Z0-9_.:-]{1,64}") {
+        fn prop_valid_identifier_roundtrip(s in "[a-zA-Z0-9_:-]{1,64}") {
             let id = AgentId::new(&s);
             prop_assert!(id.is_ok());
         }

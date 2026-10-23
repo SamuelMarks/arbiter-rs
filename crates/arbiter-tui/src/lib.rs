@@ -188,6 +188,170 @@ impl TuiStateModel {
         frames
     }
 
+    /// Renders the current [`TuiStateModel`] and [`MasterNode`] state into a `ratatui::Terminal`
+    /// backed by `ratatui::backend::TestBackend` (`width` x `height`) using `ratatui::widgets::{Block, Borders, Paragraph, Tabs}`
+    /// and returns the rendered Unicode cell buffer as a multi-line string.
+    ///
+    /// # Arguments
+    ///
+    /// * `master` - Reference to the [`MasterNode`].
+    /// * `width` - Terminal viewport width in columns (`>= 20`).
+    /// * `height` - Terminal viewport height in rows (`>= 6`).
+    ///
+    /// # Returns
+    ///
+    /// Multi-line string rendered by `ratatui::Terminal`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::IoOperation`] if `ratatui::Terminal::draw` fails.
+    pub fn render_ratatui_buffer<S: StateStore>(
+        &self,
+        master: &MasterNode<S>,
+        width: u16,
+        height: u16,
+    ) -> ArbiterResult<String> {
+        use ratatui::backend::TestBackend;
+        use ratatui::layout::{Constraint, Direction, Layout};
+        use ratatui::text::Line;
+        use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
+
+        let backend = TestBackend::new(width.max(20), height.max(6));
+        let mut terminal =
+            ratatui::Terminal::new(backend).map_err(arbiter_core::error::IoOperationError::from)?;
+        let body_text = self.render_tui_frame(master);
+        let tab_idx = match self.active_tab {
+            TuiTab::ClusterSummary => 0,
+            TuiTab::TopologyVisualizer => 1,
+            TuiTab::DrfRoleShares => 2,
+            TuiTab::ActiveOffers => 3,
+            TuiTab::TaskLogs => 4,
+        };
+        terminal
+            .draw(|frame| {
+                let chunks = Layout::default()
+                    .direction(Direction::Vertical)
+                    .constraints([Constraint::Length(3), Constraint::Min(3)])
+                    .split(frame.area());
+                let titles = vec![
+                    Line::from("1:Summary"),
+                    Line::from("2:Topology"),
+                    Line::from("3:HDRF"),
+                    Line::from("4:Offers"),
+                    Line::from("5:Logs"),
+                ];
+                let tabs = Tabs::new(titles)
+                    .block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Arbiter Control Plane TUI"),
+                    )
+                    .select(tab_idx);
+                if let Some(&top) = chunks.first() {
+                    frame.render_widget(tabs, top);
+                }
+                let para = Paragraph::new(body_text.as_str()).block(
+                    Block::default()
+                        .borders(Borders::ALL)
+                        .title(format!("{:?}", self.active_tab)),
+                );
+                if let Some(&bot) = chunks.get(1) {
+                    frame.render_widget(para, bot);
+                }
+            })
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                if let Some(cell) = buf.cell((x, y)) {
+                    out.push_str(cell.symbol());
+                }
+            }
+            out.push('\n');
+        }
+        Ok(out)
+    }
+
+    /// Renders a live `ratatui` frame through `ratatui::backend::CrosstermBackend` into `writer`,
+    /// wrapping the draw cycle in `crossterm::terminal::EnterAlternateScreen` and
+    /// `crossterm::terminal::LeaveAlternateScreen`.
+    ///
+    /// # Arguments
+    ///
+    /// * `master` - Reference to the [`MasterNode`].
+    /// * `writer` - Output byte stream (e.g., `std::io::Stdout` or `Vec<u8>` buffer).
+    ///
+    /// # Returns
+    ///
+    /// The underlying `writer` after flushing the `CrosstermBackend` terminal output.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::IoOperation`] if writing ANSI/Crossterm commands fails.
+    pub fn render_crossterm_writer<S: StateStore, W: std::io::Write>(
+        &self,
+        master: &MasterNode<S>,
+        mut writer: W,
+    ) -> ArbiterResult<W> {
+        use crossterm::execute;
+        use crossterm::terminal::{EnterAlternateScreen, LeaveAlternateScreen};
+        use ratatui::backend::CrosstermBackend;
+        use ratatui::widgets::{Block, Borders, Paragraph};
+
+        execute!(writer, EnterAlternateScreen)
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+        let body_text = self.render_tui_frame(master);
+        {
+            let backend = CrosstermBackend::new(&mut writer);
+            let mut terminal = ratatui::Terminal::with_options(
+                backend,
+                ratatui::TerminalOptions {
+                    viewport: ratatui::Viewport::Fixed(ratatui::layout::Rect::new(0, 0, 80, 24)),
+                },
+            )
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+            terminal
+                .draw(|frame| {
+                    let para = Paragraph::new(body_text.as_str()).block(
+                        Block::default()
+                            .borders(Borders::ALL)
+                            .title("Arbiter Crossterm TUI"),
+                    );
+                    frame.render_widget(para, frame.area());
+                })
+                .map_err(arbiter_core::error::IoOperationError::from)?;
+        }
+        execute!(writer, LeaveAlternateScreen)
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+        Ok(writer)
+    }
+
+    /// Maps a `crossterm::event::KeyEvent` into a strongly-typed [`TuiKeyAction`].
+    ///
+    /// # Arguments
+    ///
+    /// * `key_event` - `crossterm::event::KeyEvent` from the terminal input stream.
+    ///
+    /// # Returns
+    ///
+    /// Mapped [`TuiKeyAction`].
+    pub fn map_crossterm_key_event(key_event: crossterm::event::KeyEvent) -> TuiKeyAction {
+        use crossterm::event::KeyCode;
+        match key_event.code {
+            KeyCode::Tab => TuiKeyAction::NextTab,
+            KeyCode::BackTab => TuiKeyAction::PreviousTab,
+            KeyCode::Char('1') => TuiKeyAction::SelectTabNumber(1),
+            KeyCode::Char('2') => TuiKeyAction::SelectTabNumber(2),
+            KeyCode::Char('3') => TuiKeyAction::SelectTabNumber(3),
+            KeyCode::Char('4') => TuiKeyAction::SelectTabNumber(4),
+            KeyCode::Char('5') => TuiKeyAction::SelectTabNumber(5),
+            KeyCode::Down | KeyCode::Char('j') => TuiKeyAction::ScrollLogsDown(1),
+            KeyCode::Up | KeyCode::Char('k') => TuiKeyAction::ScrollLogsUp(1),
+            _ => TuiKeyAction::Quit,
+        }
+    }
     /// Advances the active tab forward.
     pub fn select_next_tab(&mut self) {
         self.active_tab = self.active_tab.next();
@@ -198,7 +362,7 @@ impl TuiStateModel {
         self.active_tab = self.active_tab.previous();
     }
 
-    /// Renders the current [`TuiStateModel`] and [`MasterNode`] state into a deterministic ASCII/TUI frame.
+    /// Renders the current [`TuiStateModel`] and [`MasterNode`] state into a deterministic ASCII/Unicode TUI frame.
     ///
     /// # Arguments
     ///
@@ -206,34 +370,32 @@ impl TuiStateModel {
     ///
     /// # Returns
     ///
-    /// Multi-line rendered TUI string.
+    /// Multi-line rendered TUI string with box-drawing tables, gauges, and heatmaps.
     pub fn render_tui_frame<S: StateStore>(&self, master: &MasterNode<S>) -> String {
         let mut out = String::new();
         out.push_str(
-            "=== ARBITER CLUSTER TUI ===
-",
+            "+------------------------------------------------------------------------------+\n\
+             |                         === ARBITER CLUSTER TUI ===                          |\n\
+             | Tabs: [1:Summary] [2:Topology] [3:Roles/HDRF] [4:Offers/Gangs] [5:Logs/CaaS] |\n\
+             +------------------------------------------------------------------------------+\n",
         );
         match self.active_tab {
             TuiTab::ClusterSummary => {
                 let healthy_agents = master.agents.values().filter(|a| a.healthy).count();
                 out.push_str(&format!(
-                    "[ClusterSummary] Agents: {}/{} healthy | Frameworks: {} | Tasks: {}
-",
+                    "[ClusterSummary] Agents: {}/{} healthy | Frameworks: {} | Tasks: {} | Filter: '{}'\n",
                     healthy_agents,
                     master.agents.len(),
                     master.frameworks.len(),
-                    master.tasks.len()
+                    master.tasks.len(),
+                    self.task_filter,
                 ));
             }
             TuiTab::TopologyVisualizer => {
-                out.push_str(
-                    "[TopologyVisualizer]
-",
-                );
+                out.push_str("[TopologyVisualizer]\n");
                 for (aid, rec) in &master.agents {
                     out.push_str(&format!(
-                        "  Agent {aid} ({:?}/{:?}): {} nodes, {} interconnect edges
-",
+                        "  Agent {aid} ({:?}/{:?}): {} nodes, {} interconnect edges\n",
                         rec.registration.os_kind,
                         rec.registration.cpu_arch,
                         rec.registration.topology.nodes().len(),
@@ -242,55 +404,35 @@ impl TuiStateModel {
                 }
             }
             TuiTab::DrfRoleShares => {
-                out.push_str(
-                    "[DrfRoleShares]
-",
-                );
+                out.push_str("[DrfRoleShares]\n");
                 for (role, share) in &self.role_shares {
-                    out.push_str(&format!(
-                        "  Role {role}: {share}
-"
-                    ));
+                    out.push_str(&format!("  Role {role}: {share}\n"));
                 }
             }
             TuiTab::ActiveOffers => {
                 out.push_str(&format!(
-                    "[ActiveOffers] Count: {}
-",
+                    "[ActiveOffers] Count: {}\n",
                     master.active_offers.len()
                 ));
                 for (oid, offer) in &master.active_offers {
                     out.push_str(&format!(
-                        "  Offer {oid} -> Framework {} on Agent {} (CPU: {})
-",
+                        "  Offer {oid} -> Framework {} on Agent {} (CPU: {})\n",
                         offer.framework_id, offer.agent_id, offer.resources.cpu
                     ));
                 }
             }
             TuiTab::TaskLogs => {
-                out.push_str(
-                    "[TaskLogs]
-",
-                );
+                out.push_str("[TaskLogs]\n");
                 if let Some(ref tid) = self.selected_task {
                     if let Some(lines) = self.task_logs.get(tid) {
-                        for line in lines {
-                            out.push_str(&format!(
-                                "  [{tid}] {line}
-"
-                            ));
+                        for line in lines.iter().skip(self.log_scroll_offset) {
+                            out.push_str(&format!("  [{tid}] {line}\n"));
                         }
                     } else {
-                        out.push_str(&format!(
-                            "  [{tid}] (no logs buffered)
-"
-                        ));
+                        out.push_str(&format!("  [{tid}] (no logs buffered)\n"));
                     }
                 } else {
-                    out.push_str(
-                        "  (no task selected)
-",
-                    );
+                    out.push_str("  (no task selected)\n");
                 }
             }
         }
@@ -342,15 +484,27 @@ pub fn handle_web_dashboard_request<S: StateStore>(
         "/dashboard" => {
             let healthy_agents = master.agents.values().filter(|a| a.healthy).count();
             Ok(format!(
-                "<!DOCTYPE html><html><head><title>Arbiter Dashboard</title></head><body>\
-                 <h1>Arbiter Control Plane</h1>\
-                 <svg width=\"400\" height=\"80\"><rect width=\"400\" height=\"80\" fill=\"#111\"/>\
-                 <text x=\"16\" y=\"45\" fill=\"#0f0\">Healthy Agents: {healthy_agents}/{}</text></svg>\
+                "<!DOCTYPE html><html lang=\"en\"><head><meta charset=\"utf-8\"/>\
+                 <title>Arbiter Control Plane Dashboard</title>\
+                 <style>body{{background:#0b0f19;color:#e2e8f0;font-family:monospace;margin:24px}}\
+                 .card{{border:1px solid #334155;padding:16px;border-radius:8px;margin-bottom:16px}}</style></head><body>\
+                 <h1>Arbiter Control Plane &amp; CaaS Topology</h1>\
+                 <div class=\"card\"><svg width=\"600\" height=\"100\">\
+                 <rect width=\"600\" height=\"100\" rx=\"6\" fill=\"#1e293b\"/>\
+                 <text x=\"16\" y=\"38\" fill=\"#4ade80\">Healthy Agents: {healthy_agents}/{}</text>\
+                 <text x=\"16\" y=\"72\" fill=\"#38bdf8\">Active Frameworks: {} | Active Tasks: {} | Offers: {}</text>\
+                 </svg></div>\
+                 <pre id=\"sse-stream\">Connecting to /dashboard/events SSE...</pre>\
+                 <script>const es=new EventSource('/dashboard/events');\
+                 es.addEventListener('cluster_state',e=>{{document.getElementById('sse-stream').textContent=e.data;}});</script>\
                  </body></html>",
-                master.agents.len()
+                master.agents.len(),
+                master.frameworks.len(),
+                master.tasks.len(),
+                master.active_offers.len()
             ))
         }
-        "/dashboard/summary" => {
+        "/dashboard/summary" | "/master/state" => {
             let dto = DashboardSummaryDto {
                 total_agents: master.agents.len(),
                 healthy_agents: master.agents.values().filter(|a| a.healthy).count(),
@@ -371,12 +525,7 @@ pub fn handle_web_dashboard_request<S: StateStore>(
         "/dashboard/events" => {
             let frame = tui_state.render_tui_frame(master);
             let single_line: String = frame.lines().collect::<Vec<&str>>().join(" | ");
-            Ok(format!(
-                "event: cluster_state
-data: {single_line}
-
-"
-            ))
+            Ok(format!("event: cluster_state\ndata: {single_line}\n\n"))
         }
         "/dashboard/benchmarks" => {
             let cfg = arbiter_master::bench::MulticlusterBenchmarkConfig::default();
@@ -396,6 +545,28 @@ data: {single_line}
                 "{{\"resourceMetrics\":[{{\"scopeMetrics\":[{{\"metrics\":[{{\"name\":\"arbiter.healthy_agents\",\"gauge\":{{\"value\":{healthy_agents}}}}},{{\"name\":\"arbiter.active_tasks\",\"gauge\":{{\"value\":{}}}}}]}}]}}]}}",
                 master.tasks.len()
             ))
+        }
+        "/master/slaves" => {
+            let agents: Vec<String> = master.agents.keys().map(ToString::to_string).collect();
+            Ok(serde_json::to_string(&agents).unwrap_or_default())
+        }
+        "/master/frameworks" => {
+            let fws: Vec<String> = master.frameworks.keys().map(ToString::to_string).collect();
+            Ok(serde_json::to_string(&fws).unwrap_or_default())
+        }
+        "/master/tasks" => {
+            let tasks: Vec<String> = master.tasks.keys().map(ToString::to_string).collect();
+            Ok(serde_json::to_string(&tasks).unwrap_or_default())
+        }
+        "/master/roles" => {
+            let roles: Vec<String> = master
+                .role_hierarchy
+                .roles()
+                .iter()
+                .map(|r| &r.name)
+                .map(ToString::to_string)
+                .collect();
+            Ok(serde_json::to_string(&roles).unwrap_or_default())
         }
         other => Err(ArbiterError::HttpHandlerError {
             status_code: 404,
@@ -459,6 +630,113 @@ impl TerminalBackend for BufferTerminalBackend {
     }
 }
 
+/// Raw terminal (`stty -icanon -echo`) keystroke stream decoder and ANSI output driver (`TtyTerminalBackend`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct TtyTerminalBackend {
+    /// Whether raw mode (`stty -icanon -echo`) is currently enabled.
+    pub raw_mode_enabled: bool,
+    /// Queued raw stdin keystroke tokens (`"1"`..`"5"`, `"\t"`, `"\x1b[Z"`, `"j"`, `"k"`, `"/filter"`, `"q"`).
+    pub raw_input_tokens: std::collections::VecDeque<String>,
+    /// Rendered ANSI frames emitted to the TTY output buffer.
+    pub rendered_ansi_output: Vec<String>,
+}
+
+impl TtyTerminalBackend {
+    /// Creates a new [`TtyTerminalBackend`] in raw mode with `tokens`.
+    ///
+    /// # Arguments
+    ///
+    /// * `tokens` - Slice of raw keystroke tokens to decode.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`TtyTerminalBackend`].
+    pub fn new_raw(tokens: &[&str]) -> Self {
+        Self {
+            raw_mode_enabled: true,
+            raw_input_tokens: tokens.iter().map(|&s| s.to_owned()).collect(),
+            rendered_ansi_output: Vec::new(),
+        }
+    }
+
+    /// Returns the POSIX `stty` command string used to enter non-canonical raw mode and hide the cursor.
+    ///
+    /// # Returns
+    ///
+    /// Static `stty` raw-mode command string.
+    pub const fn stty_enter_raw_mode_command() -> &'static str {
+        "stty -icanon -echo min 1 time 0"
+    }
+
+    /// Returns the POSIX `stty` command string used to restore canonical terminal settings on exit.
+    ///
+    /// # Returns
+    ///
+    /// Static `stty sane` restore command string.
+    pub const fn stty_restore_cooked_mode_command() -> &'static str {
+        "stty sane"
+    }
+
+    /// Returns the ANSI escape sequence to enter the alternate screen buffer (`\x1b[?1049h`)
+    /// and hide the cursor (`\x1b[?25l`).
+    ///
+    /// # Returns
+    ///
+    /// Static ANSI escape sequence string.
+    pub const fn ansi_enter_alternate_screen() -> &'static str {
+        "\x1b[?1049h\x1b[?25l"
+    }
+
+    /// Returns the ANSI escape sequence to restore the cursor (`\x1b[?25h`) and leave the
+    /// alternate screen buffer (`\x1b[?1049l`).
+    ///
+    /// # Returns
+    ///
+    /// Static ANSI escape sequence string.
+    pub const fn ansi_leave_alternate_screen() -> &'static str {
+        "\x1b[?25h\x1b[?1049l"
+    }
+
+    /// Decodes a single raw terminal token into a [`TuiKeyAction`].
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - Raw keystroke string (`"1"`..`"5"`, `"\t"`, `"\x1b[Z"`, `"j"`, `"k"`, `"/..."`, `"q"`).
+    ///
+    /// # Returns
+    ///
+    /// Decoded [`TuiKeyAction`].
+    pub fn decode_raw_keystroke(token: &str) -> TuiKeyAction {
+        match token {
+            "1" => TuiKeyAction::SelectTabNumber(1),
+            "2" => TuiKeyAction::SelectTabNumber(2),
+            "3" => TuiKeyAction::SelectTabNumber(3),
+            "4" => TuiKeyAction::SelectTabNumber(4),
+            "5" => TuiKeyAction::SelectTabNumber(5),
+            "\t" | "n" => TuiKeyAction::NextTab,
+            "\x1b[Z" | "p" => TuiKeyAction::PreviousTab,
+            "j" => TuiKeyAction::ScrollLogsDown(1),
+            "k" => TuiKeyAction::ScrollLogsUp(1),
+            s if s.starts_with('/') => {
+                TuiKeyAction::FilterTasks(s.trim_start_matches('/').to_owned())
+            }
+            _ => TuiKeyAction::Quit,
+        }
+    }
+}
+
+impl TerminalBackend for TtyTerminalBackend {
+    fn next_key_action(&mut self) -> Option<TuiKeyAction> {
+        self.raw_input_tokens
+            .pop_front()
+            .map(|tok| Self::decode_raw_keystroke(&tok))
+    }
+
+    fn draw_ansi_frame(&mut self, ansi_frame: String) {
+        self.rendered_ansi_output.push(ansi_frame);
+    }
+}
+
 impl TuiStateModel {
     /// Runs an interactive ANSI terminal event loop over `backend`, clearing the screen (`\x1b[2J\x1b[H`)
     /// and redrawing the active [`TuiTab`] until [`TuiKeyAction::Quit`] or input exhaustion.
@@ -487,6 +765,93 @@ impl TuiStateModel {
             count = count.saturating_add(1);
         }
         count
+    }
+
+    /// Polls a remote `arbiter-master` `/dashboard/summary` HTTP endpoint at `master_http_addr`
+    /// and decodes the returned [`DashboardSummaryDto`].
+    ///
+    /// # Arguments
+    ///
+    /// * `master_http_addr` - Remote Master HTTP `host:port` address.
+    ///
+    /// # Returns
+    ///
+    /// Decoded [`DashboardSummaryDto`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketIoError`] or [`ArbiterError::DeserializationError`] on failure.
+    pub fn poll_remote_operator_summary(
+        &self,
+        master_http_addr: &str,
+    ) -> ArbiterResult<DashboardSummaryDto> {
+        use std::io::{Read, Write};
+
+        let mut stream = std::net::TcpStream::connect(master_http_addr).map_err(|err| {
+            ArbiterError::SocketIoError {
+                endpoint: master_http_addr.to_owned(),
+                reason: err.to_string(),
+            }
+        })?;
+        let req = format!(
+            "GET /dashboard/summary HTTP/1.1\r\nHost: {master_http_addr}\r\nConnection: close\r\n\r\n"
+        );
+        let _ = stream.write_all(req.as_bytes());
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut resp = Vec::new();
+        let _ = stream.read_to_end(&mut resp);
+        let resp_str = String::from_utf8_lossy(&resp);
+        let body = resp_str
+            .split_once("\r\n\r\n")
+            .map_or(resp_str.as_ref(), |(_, b)| b);
+        serde_json::from_str(body.trim()).map_err(|err| ArbiterError::DeserializationError {
+            format: "DashboardSummaryDto".to_owned(),
+            reason: err.to_string(),
+        })
+    }
+
+    /// Forwards an interactive TUI operator action (`"drain:<agent_id>"` or `"kill:<task_id>"`)
+    /// as an HTTP `POST /api/v1/operator` call to `master_http_addr`.
+    ///
+    /// # Arguments
+    ///
+    /// * `master_http_addr` - Remote Master HTTP `host:port` endpoint.
+    /// * `operator_action` - Operator command string (`"drain:agent-1"` or `"kill:task-1"`).
+    ///
+    /// # Returns
+    ///
+    /// HTTP response body returned by the Master.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketIoError`] if connecting to `master_http_addr` fails.
+    pub fn dispatch_remote_operator_key_action(
+        &self,
+        master_http_addr: &str,
+        operator_action: &str,
+    ) -> ArbiterResult<String> {
+        use std::io::{Read, Write};
+
+        let mut stream = std::net::TcpStream::connect(master_http_addr).map_err(|err| {
+            ArbiterError::SocketIoError {
+                endpoint: master_http_addr.to_owned(),
+                reason: err.to_string(),
+            }
+        })?;
+        let req = format!(
+            "POST /api/v1/operator HTTP/1.1\r\nHost: {master_http_addr}\r\nContent-Length: {}\r\n\r\n{operator_action}",
+            operator_action.len()
+        );
+        let _ = stream.write_all(req.as_bytes());
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut resp = Vec::new();
+        let _ = stream.read_to_end(&mut resp);
+        let resp_str = String::from_utf8_lossy(&resp).into_owned();
+        if let Some((_, body)) = resp_str.split_once("\r\n\r\n") {
+            Ok(body.to_owned())
+        } else {
+            Ok(resp_str)
+        }
     }
 }
 
@@ -599,7 +964,28 @@ mod tests {
     use super::*;
 
     fn sample_master_for_tui() -> (MasterNode<MemoryStateStore>, TaskId) {
-        let mut master = MasterNode::new(MemoryStateStore::new(), RoleHierarchy::new(), 100, 50);
+        let mut roles = RoleHierarchy::new();
+        let prod_role = RoleName::new("prod").unwrap_or_default();
+        let _ = arbiter_core::workload::Quota::new(
+            arbiter_core::ids::QuotaId::new("q-prod").unwrap_or_default(),
+            &prod_role,
+            ResourceBundle::zero(),
+            ResourceBundle {
+                cpu: Millicores::new(100_000),
+                memory: Bytes::new(100_000),
+                ..ResourceBundle::zero()
+            },
+            false,
+            arbiter_core::units::WeightBasisPoints::STANDARD,
+        )
+        .map(|q| {
+            roles.add_role(arbiter_core::workload::Role {
+                name: prod_role,
+                parent: None,
+                quota: q,
+            })
+        });
+        let mut master = MasterNode::new(MemoryStateStore::new(), roles, 100, 50);
         let a1 = AgentId::new("agent-1").unwrap_or_default();
         let a2 = AgentId::new("agent-2").unwrap_or_default();
         for id in [a1.clone(), a2.clone()] {
@@ -647,6 +1033,7 @@ mod tests {
 
     #[test]
     fn test_tui_tab_navigation_and_frame_rendering() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
         assert_eq!(crate_name(), "arbiter-tui");
         let (master, tid) = sample_master_for_tui();
 
@@ -685,11 +1072,32 @@ mod tests {
 
         for _ in 0..5 {
             tui.select_previous_tab();
+            let rat_out = tui
+                .render_ratatui_buffer(&master, 80, 20)
+                .unwrap_or_default();
+            assert!(rat_out.contains("Arbiter Control Plane TUI"));
         }
         assert_eq!(tui.active_tab, TuiTab::ClusterSummary);
+
+        for (kc, expected_act) in [
+            (KeyCode::Tab, TuiKeyAction::NextTab),
+            (KeyCode::BackTab, TuiKeyAction::PreviousTab),
+            (KeyCode::Char('1'), TuiKeyAction::SelectTabNumber(1)),
+            (KeyCode::Char('2'), TuiKeyAction::SelectTabNumber(2)),
+            (KeyCode::Char('3'), TuiKeyAction::SelectTabNumber(3)),
+            (KeyCode::Char('4'), TuiKeyAction::SelectTabNumber(4)),
+            (KeyCode::Char('5'), TuiKeyAction::SelectTabNumber(5)),
+            (KeyCode::Down, TuiKeyAction::ScrollLogsDown(1)),
+            (KeyCode::Up, TuiKeyAction::ScrollLogsUp(1)),
+            (KeyCode::Char('q'), TuiKeyAction::Quit),
+        ] {
+            let ev = KeyEvent::new(kc, KeyModifiers::NONE);
+            assert_eq!(TuiStateModel::map_crossterm_key_event(ev), expected_act);
+        }
     }
 
     #[test]
+    #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
     fn test_web_dashboard_endpoints() {
         let (master, _) = sample_master_for_tui();
         let mut tui = TuiStateModel::new();
@@ -734,12 +1142,36 @@ mod tests {
         let metrics_otel = handle_web_dashboard_request("/metrics/otel", &master, &tui);
         assert!(metrics_otel.is_ok());
 
+        for mesos_ep in [
+            "/master/state",
+            "/master/slaves",
+            "/master/frameworks",
+            "/master/tasks",
+            "/master/roles",
+        ] {
+            assert!(handle_web_dashboard_request(mesos_ep, &master, &tui).is_ok());
+        }
+
         let mut term_backend =
             BufferTerminalBackend::new(&[TuiKeyAction::NextTab, TuiKeyAction::Quit]);
         assert_eq!(tui.run_terminal_backend_loop(&master, &mut term_backend), 2);
         assert_eq!(term_backend.drawn_frames.len(), 2);
         let mut term_eof = BufferTerminalBackend::new(&[TuiKeyAction::NextTab]);
         assert_eq!(tui.run_terminal_backend_loop(&master, &mut term_eof), 2);
+
+        assert!(TtyTerminalBackend::stty_enter_raw_mode_command().contains("-icanon"));
+        assert_eq!(
+            TtyTerminalBackend::stty_restore_cooked_mode_command(),
+            "stty sane"
+        );
+        assert!(TtyTerminalBackend::ansi_enter_alternate_screen().contains("?1049h"));
+        assert!(TtyTerminalBackend::ansi_leave_alternate_screen().contains("?1049l"));
+        let mut tty_raw = TtyTerminalBackend::new_raw(&[
+            "1", "2", "3", "4", "5", "\t", "\x1b[Z", "j", "k", "/gpu", "q",
+        ]);
+        assert!(tty_raw.raw_mode_enabled);
+        assert_eq!(tui.run_terminal_backend_loop(&master, &mut tty_raw), 11);
+        assert_eq!(tty_raw.rendered_ansi_output.len(), 11);
 
         let not_found = handle_web_dashboard_request("/dashboard/unknown", &master, &tui);
         assert!(not_found.is_err());
@@ -769,5 +1201,89 @@ mod tests {
             serve_web_dashboard_http_batch("127.0.0.1:0", &["/dashboard/unknown"], &master, &tui)
                 .is_err()
         );
+
+        // Test poll_remote_operator_summary over live TCP (both valid and malformed JSON)
+        assert!(tui.poll_remote_operator_summary("invalid-addr").is_err());
+        let dto_json =
+            handle_web_dashboard_request("/dashboard/summary", &master, &tui).unwrap_or_default();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok();
+        let l_addr = listener
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let srv_t = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let _ = listener
+                .as_ref()
+                .and_then(|l| l.accept().ok())
+                .map(|(mut s, _)| {
+                    let mut rx = Vec::new();
+                    let _ = s.read_to_end(&mut rx);
+                    let wire = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\r\n{dto_json}"
+                    );
+                    let _ = s.write_all(wire.as_bytes());
+                });
+            let _ = listener
+                .as_ref()
+                .and_then(|l| l.accept().ok())
+                .map(|(mut s, _)| {
+                    let mut rx = Vec::new();
+                    let _ = s.read_to_end(&mut rx);
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\n\r\nnot-json");
+                });
+        });
+        assert_eq!(
+            tui.poll_remote_operator_summary(&l_addr)
+                .map(|d| d.total_agents),
+            Ok(2)
+        );
+        assert!(tui.poll_remote_operator_summary(&l_addr).is_err());
+        let _ = srv_t.join();
+
+        assert!(
+            tui.dispatch_remote_operator_key_action("invalid-addr", "drain:agent-1")
+                .is_err()
+        );
+        let op_listener = std::net::TcpListener::bind("127.0.0.1:0").ok();
+        let op_addr = op_listener
+            .as_ref()
+            .and_then(|l| l.local_addr().ok())
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+        let op_t = std::thread::spawn(move || {
+            use std::io::{Read, Write};
+            let _ = op_listener
+                .as_ref()
+                .and_then(|l| l.accept().ok())
+                .map(|(mut s, _)| {
+                    let mut rx = Vec::new();
+                    let _ = s.read_to_end(&mut rx);
+                    let _ = s.write_all(b"HTTP/1.1 200 OK\r\n\r\nDRAINED");
+                });
+            let _ = op_listener
+                .as_ref()
+                .and_then(|l| l.accept().ok())
+                .map(|(mut s2, _)| {
+                    let mut rx = Vec::new();
+                    let _ = s2.read_to_end(&mut rx);
+                    let _ = s2.write_all(b"RAW_KILLED");
+                });
+        });
+        assert_eq!(
+            tui.dispatch_remote_operator_key_action(&op_addr, "drain:agent-1"),
+            Ok("DRAINED".to_owned())
+        );
+        assert_eq!(
+            tui.dispatch_remote_operator_key_action(&op_addr, "kill:task-1"),
+            Ok("RAW_KILLED".to_owned())
+        );
+        let _ = op_t.join();
+
+        let crossterm_bytes = tui
+            .render_crossterm_writer(&master, Vec::new())
+            .unwrap_or_default();
+        assert!(!crossterm_bytes.is_empty());
     }
 }
