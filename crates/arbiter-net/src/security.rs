@@ -964,7 +964,7 @@ pub fn sha256_digest(message: &[u8]) -> [u8; 32] {
 ///
 /// 32-byte RFC 2104 `HMAC-SHA256` digest.
 pub fn hmac_sha256(key: &[u8], message: &[u8]) -> [u8; 32] {
-    use hmac::Mac as _;
+    use hmac::{KeyInit as _, Mac as _};
     let mut k_block = [0_u8; 64];
     if key.len() > 64 {
         let hashed_key: [u8; 32] = Sha256::digest(key).into();
@@ -1007,11 +1007,11 @@ pub fn chacha20poly1305_aead_seal(
     aad_bytes: &[u8],
     plaintext: &[u8],
 ) -> ArbiterResult<(Vec<u8>, [u8; 16])> {
-    use chacha20poly1305::aead::{AeadInPlace as _, KeyInit as _};
+    use chacha20poly1305::aead::{AeadInOut as _, KeyInit as _};
     let cipher = chacha20poly1305::ChaCha20Poly1305::new(key.into());
     let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
     let mut buffer = plaintext.to_vec();
-    let tag = cipher.encrypt_in_place_detached(&nonce, aad_bytes, &mut buffer)?;
+    let tag = cipher.encrypt_inout_detached(&nonce, aad_bytes, buffer.as_mut_slice().into())?;
     let mut tag_arr = [0_u8; 16];
     tag_arr.copy_from_slice(tag.as_slice());
     Ok((buffer, tag_arr))
@@ -1041,12 +1041,12 @@ pub fn chacha20poly1305_aead_open(
     ciphertext: &[u8],
     tag_bytes: &[u8; 16],
 ) -> ArbiterResult<Vec<u8>> {
-    use chacha20poly1305::aead::{AeadInPlace as _, KeyInit as _};
+    use chacha20poly1305::aead::{AeadInOut as _, KeyInit as _};
     let cipher = chacha20poly1305::ChaCha20Poly1305::new(key.into());
     let nonce = chacha20poly1305::Nonce::from(nonce_bytes);
     let tag = chacha20poly1305::Tag::from(*tag_bytes);
     let mut buffer = ciphertext.to_vec();
-    cipher.decrypt_in_place_detached(&nonce, aad_bytes, &mut buffer, &tag)?;
+    cipher.decrypt_inout_detached(&nonce, aad_bytes, buffer.as_mut_slice().into(), &tag)?;
     Ok(buffer)
 }
 
@@ -1578,11 +1578,8 @@ pub fn decode_x509_san_der(
     parse_spiffe_san(uri_str, expected_trust_domain)
 }
 
-/// RFC 4648 Section 5 URL-safe Base64 alphabet (`A-Z`, `a-z`, `0-9`, `-`, `_`).
-const BASE64URL_ALPHABET: [u8; 64] =
-    *b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
-
-/// Encodes `input` bytes into unpadded RFC 4648 §5 `Base64URL` format (used by RFC 7515 JWS and PEM/DER).
+/// Encodes `input` bytes into unpadded RFC 4648 §5 `Base64URL` format (used by RFC 7515 JWS and PEM/DER)
+/// via `base64::engine::general_purpose::URL_SAFE_NO_PAD`.
 ///
 /// # Arguments
 ///
@@ -1592,37 +1589,11 @@ const BASE64URL_ALPHABET: [u8; 64] =
 ///
 /// Unpadded `Base64URL` string.
 pub fn base64url_encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity(input.len().saturating_mul(4).div_ceil(3));
-    for chunk in input.chunks(3) {
-        let b0 = chunk.first().copied().unwrap_or(0);
-        let b1 = chunk.get(1).copied().unwrap_or(0);
-        let b2 = chunk.get(2).copied().unwrap_or(0);
-        let triple = (u32::from(b0) << 16) | (u32::from(b1) << 8) | u32::from(b2);
-        let idx0 = usize::try_from((triple >> 18) & 0x3F).unwrap_or(0);
-        let idx1 = usize::try_from((triple >> 12) & 0x3F).unwrap_or(0);
-        let idx2 = usize::try_from((triple >> 6) & 0x3F).unwrap_or(0);
-        let idx3 = usize::try_from(triple & 0x3F).unwrap_or(0);
-        out.push(char::from(
-            BASE64URL_ALPHABET.get(idx0).copied().unwrap_or(b'A'),
-        ));
-        out.push(char::from(
-            BASE64URL_ALPHABET.get(idx1).copied().unwrap_or(b'A'),
-        ));
-        if chunk.len() > 1 {
-            out.push(char::from(
-                BASE64URL_ALPHABET.get(idx2).copied().unwrap_or(b'A'),
-            ));
-        }
-        if chunk.len() > 2 {
-            out.push(char::from(
-                BASE64URL_ALPHABET.get(idx3).copied().unwrap_or(b'A'),
-            ));
-        }
-    }
-    out
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(input)
 }
 
-/// Decodes an unpadded RFC 4648 §5 `Base64URL` string into raw bytes.
+/// Decodes an unpadded RFC 4648 §5 `Base64URL` string into raw bytes via `base64::engine::general_purpose::URL_SAFE_NO_PAD`.
 ///
 /// # Arguments
 ///
@@ -1637,42 +1608,13 @@ pub fn base64url_encode(input: &[u8]) -> String {
 /// Returns [`ArbiterError::AuthenticationFailed`] if `encoded` contains non-`Base64URL` characters
 /// or has an invalid remainder length (`len % 4 == 1`).
 pub fn base64url_decode(encoded: &str) -> ArbiterResult<Vec<u8>> {
-    let mut sextets = Vec::with_capacity(encoded.len());
-    for &byte in encoded.as_bytes() {
-        let val = match byte {
-            b'A'..=b'Z' => byte - b'A',
-            b'a'..=b'z' => byte - b'a' + 26,
-            b'0'..=b'9' => byte - b'0' + 52,
-            b'-' => 62,
-            b'_' => 63,
-            _ => {
-                return Err(ArbiterError::AuthenticationFailed {
-                    principal: "base64url".to_owned(),
-                    reason: format!("invalid Base64URL character 0x{byte:02x}"),
-                });
-            }
-        };
-        sextets.push(val);
-    }
-    let mut out = Vec::with_capacity(sextets.len().saturating_mul(3) / 4);
-    for chunk in sextets.chunks(4) {
-        if chunk.len() == 1 {
-            return Err(ArbiterError::AuthenticationFailed {
-                principal: "base64url".to_owned(),
-                reason: "invalid Base64URL length (remainder 1)".to_owned(),
-            });
-        }
-        let s0 = chunk.first().copied().unwrap_or(0);
-        let s1 = chunk.get(1).copied().unwrap_or(0);
-        out.push((s0 << 2) | (s1 >> 4));
-        if let Some(&s2) = chunk.get(2) {
-            out.push(((s1 & 0x0F) << 4) | (s2 >> 2));
-            if let Some(&s3) = chunk.get(3) {
-                out.push(((s2 & 0x03) << 6) | s3);
-            }
-        }
-    }
-    Ok(out)
+    use base64::Engine as _;
+    base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|e| ArbiterError::AuthenticationFailed {
+            principal: "base64url".to_owned(),
+            reason: e.to_string(),
+        })
 }
 
 /// Supported JWS / OIDC token signing algorithms (`HS256`, `EdDSA`, `ES256`).
@@ -1901,8 +1843,8 @@ impl OidcJwtClaims {
     /// Computes a hex cryptographic signature tag over `header` and `payload` using `key`.
     ///
     /// - For `alg=HS256`: computes standard RFC 2104 `HMAC-SHA256(key, header || "." || payload)`.
-    /// - For `alg=EdDSA`: signs `header || "." || payload` with [`Ed25519Keypair::from_seed(*key)`].
-    /// - For `alg=ES256`: signs `header || "." || payload` with [`P256Keypair::from_seed(*key)`].
+    /// - For `alg=EdDSA`: signs `header || "." || payload` with [`Ed25519Keypair::from_seed`].
+    /// - For `alg=ES256`: signs `header || "." || payload` with [`P256Keypair::from_seed`].
     ///
     /// # Arguments
     ///
@@ -2071,8 +2013,9 @@ pub trait SpireTransport {
     ) -> ArbiterResult<SpiffeSvid>;
 }
 
-/// Zeroizing 32-byte cryptographic master key that overwrites its memory with `0x00` upon `Drop`.
-#[derive(Clone, PartialEq, Eq)]
+/// Zeroizing 32-byte cryptographic master key that overwrites its memory with `0x00` upon `Drop`
+/// via `zeroize::ZeroizeOnDrop`.
+#[derive(Clone, PartialEq, Eq, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct ZeroizingSecretKey {
     /// Underlying 32-byte key material.
     bytes: [u8; 32],
@@ -2117,16 +2060,9 @@ impl core::fmt::Debug for ZeroizingSecretKey {
     }
 }
 
-impl Drop for ZeroizingSecretKey {
-    fn drop(&mut self) {
-        self.bytes.fill(0);
-        core::hint::black_box(&mut self.bytes);
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
-    }
-}
-
-/// Zeroizing variable-length plaintext secret buffer that scrubs its bytes with `0x00` upon `Drop`.
-#[derive(Default, Clone, PartialEq, Eq)]
+/// Zeroizing variable-length plaintext secret buffer that scrubs its bytes with `0x00` upon `Drop`
+/// via `zeroize::ZeroizeOnDrop`.
+#[derive(Default, Clone, PartialEq, Eq, zeroize::Zeroize, zeroize::ZeroizeOnDrop)]
 pub struct ZeroizingSecretBuffer {
     /// Underlying sensitive plaintext bytes.
     bytes: Vec<u8>,
@@ -2175,11 +2111,197 @@ impl core::fmt::Debug for ZeroizingSecretBuffer {
     }
 }
 
-impl Drop for ZeroizingSecretBuffer {
-    fn drop(&mut self) {
-        self.bytes.fill(0);
-        core::hint::black_box(&mut self.bytes);
-        core::sync::atomic::compiler_fence(core::sync::atomic::Ordering::SeqCst);
+/// Seals a plaintext payload using `RustCrypto` `aes_gcm::Aes256Gcm` (NIST SP 800-38D),
+/// returning `(ciphertext, 16-byte_tag)`.
+///
+/// # Arguments
+///
+/// * `key` - 32-byte `AES-256-GCM` key.
+/// * `nonce_bytes` - 12-byte GCM IV.
+/// * `aad_bytes` - Additional authenticated data (`AAD`).
+/// * `plaintext` - Plaintext bytes to seal.
+///
+/// # Returns
+///
+/// Tuple `(ciphertext_bytes, 16-byte_tag)`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::AeadCipher`] if encryption fails.
+pub fn aes256_gcm_crate_seal(
+    key: &[u8; 32],
+    nonce_bytes: [u8; 12],
+    aad_bytes: &[u8],
+    plaintext: &[u8],
+) -> ArbiterResult<(Vec<u8>, [u8; 16])> {
+    use aes_gcm::aead::{AeadInOut as _, KeyInit as _};
+    let cipher = aes_gcm::Aes256Gcm::new(key.into());
+    let nonce = aes_gcm::Nonce::from(nonce_bytes);
+    let mut buffer = plaintext.to_vec();
+    let tag = cipher.encrypt_inout_detached(&nonce, aad_bytes, buffer.as_mut_slice().into())?;
+    let mut tag_arr = [0_u8; 16];
+    tag_arr.copy_from_slice(tag.as_slice());
+    Ok((buffer, tag_arr))
+}
+
+/// Opens and authenticates a ciphertext payload using `RustCrypto` `aes_gcm::Aes256Gcm` (NIST SP 800-38D).
+///
+/// # Arguments
+///
+/// * `key` - 32-byte `AES-256-GCM` key.
+/// * `nonce_bytes` - 12-byte GCM IV.
+/// * `aad_bytes` - Additional authenticated data (`AAD`).
+/// * `ciphertext` - Encrypted bytes.
+/// * `tag_bytes` - 16-byte authentication tag.
+///
+/// # Returns
+///
+/// Authenticated plaintext byte vector.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::AeadCipher`] if authentication tag verification fails.
+pub fn aes256_gcm_crate_open(
+    key: &[u8; 32],
+    nonce_bytes: [u8; 12],
+    aad_bytes: &[u8],
+    ciphertext: &[u8],
+    tag_bytes: &[u8; 16],
+) -> ArbiterResult<Vec<u8>> {
+    use aes_gcm::aead::{AeadInOut as _, KeyInit as _};
+    let cipher = aes_gcm::Aes256Gcm::new(key.into());
+    let nonce = aes_gcm::Nonce::from(nonce_bytes);
+    let tag = aes_gcm::Tag::from(*tag_bytes);
+    let mut buffer = ciphertext.to_vec();
+    cipher.decrypt_inout_detached(&nonce, aad_bytes, buffer.as_mut_slice().into(), &tag)?;
+    Ok(buffer)
+}
+
+/// Validates a `spiffe://<trust-domain>/<path>` URI using the official `spiffe::SpiffeId` parser
+/// and extracts `(trust_domain, path)`.
+///
+/// # Arguments
+///
+/// * `uri` - Raw SPIFFE ID URI string.
+///
+/// # Returns
+///
+/// Tuple `(trust_domain_string, path_string)`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::X509Certificate`] if `spiffe::SpiffeId::new` rejects `uri`.
+pub fn validate_spiffe_uri_with_crate(uri: &str) -> ArbiterResult<(String, String)> {
+    let parsed = spiffe::SpiffeId::new(uri)?;
+    Ok((parsed.trust_domain().to_string(), parsed.path().to_owned()))
+}
+
+impl OidcJwtClaims {
+    /// Issues a standard RFC 7519 `HS256` JWT token string using the `jsonwebtoken` crate.
+    ///
+    /// # Arguments
+    ///
+    /// * `signing_key` - 32-byte `HS256` secret key.
+    ///
+    /// # Returns
+    ///
+    /// Compact `jsonwebtoken`-encoded JWT string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::JwtValidation`] if encoding fails.
+    pub fn encode_with_jsonwebtoken(&self, signing_key: &[u8; 32]) -> ArbiterResult<String> {
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::HS256);
+        let key = jsonwebtoken::EncodingKey::from_secret(signing_key);
+        Ok(jsonwebtoken::encode(&header, self, &key)?)
+    }
+
+    /// Verifies and decodes an RFC 7519 `HS256` JWT token string using the `jsonwebtoken` crate.
+    ///
+    /// # Arguments
+    ///
+    /// * `token` - Compact JWT string.
+    /// * `signing_key` - 32-byte `HS256` verification key.
+    /// * `expected_issuer` - Required `iss` claim.
+    /// * `current_tick` - Current monotonic tick compared against `expires_at_tick`.
+    ///
+    /// # Returns
+    ///
+    /// Decoded and verified [`OidcJwtClaims`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::JwtValidation`] or [`ArbiterError::AuthenticationFailed`] if signature,
+    /// issuer, or expiration checks fail.
+    pub fn verify_with_jsonwebtoken(
+        token: &str,
+        signing_key: &[u8; 32],
+        expected_issuer: &str,
+        current_tick: u64,
+    ) -> ArbiterResult<Self> {
+        let mut validation = jsonwebtoken::Validation::new(jsonwebtoken::Algorithm::HS256);
+        validation.required_spec_claims.clear();
+        validation.validate_exp = false;
+        let key = jsonwebtoken::DecodingKey::from_secret(signing_key);
+        let token_data = jsonwebtoken::decode::<Self>(token, &key, &validation)?;
+        let claims = token_data.claims;
+        if claims.issuer != expected_issuer || current_tick >= claims.expires_at_tick {
+            return Err(ArbiterError::AuthenticationFailed {
+                principal: claims.subject,
+                reason: "JWT expired or untrusted issuer".to_owned(),
+            });
+        }
+        Ok(claims)
+    }
+}
+
+impl PolicyEngine {
+    /// Evaluates a formal Cedar policy (`cedar-policy`) over `(principal_id, action_id, resource_id)`,
+    /// mapping `cedar_policy::Decision::Allow` to [`Decision::Allow`] and `Deny` to [`ArbiterError::AuthorizationDenied`].
+    ///
+    /// # Arguments
+    ///
+    /// * `cedar_policy_src` - Cedar policy source text (e.g., `permit(principal == User::"alice", action == Action::"RunTask", resource == Resource::"role:prod");`).
+    /// * `principal_id` - Principal identifier under `User::"<id>"`.
+    /// * `action_id` - Action identifier under `Action::"<id>"`.
+    /// * `resource_id` - Resource identifier under `Resource::"<id>"`.
+    ///
+    /// # Returns
+    ///
+    /// [`Decision::Allow`] when the Cedar `Authorizer` permits the request.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::PolicyEvaluation`] on policy syntax errors or
+    /// [`ArbiterError::AuthorizationDenied`] when Cedar denies the request.
+    pub fn evaluate_with_cedar_policy(
+        cedar_policy_src: &str,
+        principal_id: &str,
+        action_id: &str,
+        resource_id: &str,
+    ) -> ArbiterResult<Decision> {
+        let policy_set: cedar_policy::PolicySet = cedar_policy_src.parse()?;
+        let p_uid = format!("User::\"{principal_id}\"").parse::<cedar_policy::EntityUid>()?;
+        let a_uid = format!("Action::\"{action_id}\"").parse::<cedar_policy::EntityUid>()?;
+        let r_uid = format!("Resource::\"{resource_id}\"").parse::<cedar_policy::EntityUid>()?;
+        let authorizer = cedar_policy::Authorizer::new();
+        let allowed =
+            cedar_policy::Request::new(p_uid, a_uid, r_uid, cedar_policy::Context::empty(), None)
+                .is_ok_and(|req| {
+                    authorizer
+                        .is_authorized(&req, &policy_set, &cedar_policy::Entities::empty())
+                        .decision()
+                        == cedar_policy::Decision::Allow
+                });
+        if allowed {
+            Ok(Decision::Allow)
+        } else {
+            Err(ArbiterError::AuthorizationDenied {
+                principal: principal_id.to_owned(),
+                action: action_id.to_owned(),
+                resource: resource_id.to_owned(),
+            })
+        }
     }
 }
 
@@ -2662,7 +2784,10 @@ impl X509CertificatePem {
         use der::Decode as _;
         let parsed = x509_cert::Certificate::from_der(cert_der)?;
         let spiffe_prefix = format!("spiffe://{expected_trust_domain}/");
-        let exts = parsed.tbs_certificate.extensions.unwrap_or_default();
+        let exts = parsed
+            .tbs_certificate()
+            .extensions()
+            .map_or(&[][..], Vec::as_slice);
         for ext in exts {
             let raw = ext.extn_value.as_bytes();
             if let Some(pos) = raw
@@ -3558,12 +3683,7 @@ impl P256Keypair {
         let sk_opt = p256::ecdsa::SigningKey::from_slice(&derived_scalar).ok();
         let vk_bytes = sk_opt
             .as_ref()
-            .map(|sk| {
-                sk.verifying_key()
-                    .to_encoded_point(true)
-                    .as_bytes()
-                    .to_vec()
-            })
+            .map(|sk| sk.verifying_key().to_sec1_point(true).as_bytes().to_vec())
             .unwrap_or_default();
         let mut public_key = [0_u8; 32];
         for (dst, &src) in public_key.iter_mut().zip(vk_bytes.iter().skip(1)) {
@@ -4103,24 +4223,14 @@ impl X509DerCertificateChain {
         let inter_uri = format!("spiffe://{trust_domain}/master/intermediate-ca");
         let _ = parse_spiffe_san(&root_uri, trust_domain)?;
         let _ = parse_spiffe_san(leaf_uri, trust_domain)?;
-        let root_cert = X509CertificatePem::issue_pem(
-            &root_uri,
-            not_before_tick,
-            not_after_tick,
-            &root_kp.public_key,
-        )?;
-        let inter_cert = X509CertificatePem::issue_pem(
-            &inter_uri,
-            not_before_tick,
-            not_after_tick,
-            &root_kp.public_key,
-        )?;
-        let leaf_cert = X509CertificatePem::issue_pem(
-            leaf_uri,
-            not_before_tick,
-            not_after_tick,
-            &intermediate_kp.public_key,
-        )?;
+        let r_pk = &root_kp.public_key;
+        let i_pk = &intermediate_kp.public_key;
+        let root_cert =
+            X509CertificatePem::issue_pem(&root_uri, not_before_tick, not_after_tick, r_pk)?;
+        let inter_cert =
+            X509CertificatePem::issue_pem(&inter_uri, not_before_tick, not_after_tick, r_pk)?;
+        let leaf_cert =
+            X509CertificatePem::issue_pem(leaf_uri, not_before_tick, not_after_tick, i_pk)?;
         let root_der = root_cert.encode_asn1_der();
         let intermediate_der = inter_cert.encode_asn1_der();
         let leaf_der = leaf_cert.encode_asn1_der();
@@ -6717,6 +6827,98 @@ pub fn x25519_diffie_hellman(
     Ok(ZeroizingSecretKey::new(shared))
 }
 
+/// Zero-trust HTTP/QUIC RPC interceptor (`ZeroTrustCallInterceptor`).
+///
+/// Enforces SPIFFE URI identity validation (`spiffe` crate), Cedar ABAC policy evaluation
+/// (`cedar-policy` crate), and hash-chained audit logging ([`HashChainedAuditLog`]).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ZeroTrustCallInterceptor {
+    /// Required SPIFFE trust domain (`"arbiter.internal"`).
+    pub expected_trust_domain: String,
+    /// Active Cedar policy source string.
+    pub cedar_policy_src: String,
+    /// Tamper-evident hash-chained audit log.
+    pub audit_log: HashChainedAuditLog,
+}
+
+impl ZeroTrustCallInterceptor {
+    /// Creates a new [`ZeroTrustCallInterceptor`].
+    ///
+    /// # Arguments
+    ///
+    /// * `expected_trust_domain` - Required SPIFFE trust domain.
+    /// * `cedar_policy_src` - Cedar policy source text.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`ZeroTrustCallInterceptor`].
+    pub fn new(expected_trust_domain: &str, cedar_policy_src: &str) -> Self {
+        Self {
+            expected_trust_domain: expected_trust_domain.to_owned(),
+            cedar_policy_src: cedar_policy_src.to_owned(),
+            audit_log: HashChainedAuditLog::new(),
+        }
+    }
+
+    /// Validates the caller's `spiffe_uri`, evaluates `cedar_policy_src` for `(spiffe_uri, action, resource)`,
+    /// and appends a hash-chained audit entry at `tick`.
+    ///
+    /// # Arguments
+    ///
+    /// * `tick` - Current monotonic tick.
+    /// * `spiffe_uri` - Presented caller SPIFFE ID (`spiffe://<domain>/...`).
+    /// * `action` - Requested Mesos/Arbiter action (`"RegisterFramework"`, `"RunTask"`, `"DrainAgent"`, etc.).
+    /// * `resource` - Target resource identifier (`"role:prod"`, `"agent:a1"`, etc.).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(Decision::Allow)` if both SPIFFE trust domain and Cedar policy checks succeed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if the SPIFFE URI or trust domain is invalid or Cedar denies the action.
+    pub fn intercept_and_authorize(
+        &mut self,
+        tick: u64,
+        spiffe_uri: &str,
+        action: &str,
+        resource: &str,
+    ) -> ArbiterResult<Decision> {
+        let (domain, _) = validate_spiffe_uri_with_crate(spiffe_uri)?;
+        if domain != self.expected_trust_domain {
+            let _ = self
+                .audit_log
+                .append_event(tick, spiffe_uri, action, resource, false);
+            return Err(ArbiterError::SpiffeIdentityInvalid {
+                uri: spiffe_uri.to_owned(),
+                reason: format!(
+                    "SPIFFE domain '{domain}' does not match expected '{}'",
+                    self.expected_trust_domain
+                ),
+            });
+        }
+        match PolicyEngine::evaluate_with_cedar_policy(
+            &self.cedar_policy_src,
+            spiffe_uri,
+            action,
+            resource,
+        ) {
+            Ok(decision) => {
+                let _ = self
+                    .audit_log
+                    .append_event(tick, spiffe_uri, action, resource, true);
+                Ok(decision)
+            }
+            Err(err) => {
+                let _ = self
+                    .audit_log
+                    .append_event(tick, spiffe_uri, action, resource, false);
+                Err(err)
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod phase1_crypto_tests {
     use super::*;
@@ -6865,6 +7067,70 @@ mod phase1_crypto_tests {
             );
         }
 
+        // RustCrypto aes_gcm::Aes256Gcm seal/open roundtrip + tamper rejection
+        let (ag_ct, ag_tag) =
+            aes256_gcm_crate_seal(&fips_key, gcm_nonce, aad, plaintext).unwrap_or_default();
+        assert_eq!(
+            aes256_gcm_crate_open(&fips_key, gcm_nonce, aad, &ag_ct, &ag_tag),
+            Ok(plaintext.to_vec())
+        );
+        assert!(
+            aes256_gcm_crate_open(&fips_key, gcm_nonce, b"wrong-aad", &ag_ct, &ag_tag).is_err()
+        );
+
+        // spiffe::SpiffeId crate validation
+        assert_eq!(
+            validate_spiffe_uri_with_crate("spiffe://arbiter.internal/node/agent-1"),
+            Ok(("arbiter.internal".to_owned(), "/node/agent-1".to_owned()))
+        );
+        assert!(validate_spiffe_uri_with_crate("invalid-spiffe-uri").is_err());
+
+        // jsonwebtoken crate encode/verify roundtrip + expiry/signature rejection
+        let jwt_claims = OidcJwtClaims {
+            issuer: "arbiter-oidc".to_owned(),
+            subject: "operator-1".to_owned(),
+            role: RoleName::new("prod").unwrap_or_default(),
+            expires_at_tick: 100,
+        };
+        let jwt_str = jwt_claims
+            .encode_with_jsonwebtoken(&fips_key)
+            .unwrap_or_default();
+        assert_eq!(
+            OidcJwtClaims::verify_with_jsonwebtoken(&jwt_str, &fips_key, "arbiter-oidc", 50),
+            Ok(jwt_claims)
+        );
+        assert!(
+            OidcJwtClaims::verify_with_jsonwebtoken(&jwt_str, &fips_key, "wrong-iss", 50).is_err()
+        );
+        assert!(
+            OidcJwtClaims::verify_with_jsonwebtoken(&jwt_str, &fips_key, "arbiter-oidc", 150)
+                .is_err()
+        );
+        assert!(
+            OidcJwtClaims::verify_with_jsonwebtoken("bad.jwt.token", &fips_key, "arbiter-oidc", 50)
+                .is_err()
+        );
+
+        // cedar-policy crate authorization evaluation
+        let cedar_src = r#"permit(principal == User::"alice", action == Action::"RunTask", resource == Resource::"role:prod");"#;
+        assert_eq!(
+            PolicyEngine::evaluate_with_cedar_policy(cedar_src, "alice", "RunTask", "role:prod"),
+            Ok(Decision::Allow)
+        );
+        assert!(
+            PolicyEngine::evaluate_with_cedar_policy(cedar_src, "bob", "RunTask", "role:prod")
+                .is_err()
+        );
+        assert!(
+            PolicyEngine::evaluate_with_cedar_policy(
+                "invalid cedar !!!",
+                "alice",
+                "RunTask",
+                "role:prod"
+            )
+            .is_err()
+        );
+
         // LiveSpireUdsTransport connecting to an already-existing external SpireMockAgentServer UDS
         #[cfg(unix)]
         {
@@ -6886,5 +7152,38 @@ mod phase1_crypto_tests {
                 });
             assert!(ext_check.is_ok());
         }
+
+        let interceptor_cedar = r#"permit(principal == User::"spiffe://arbiter.internal/master/m1", action == Action::"SetQuota", resource == Resource::"role:prod");"#;
+        let mut interceptor = ZeroTrustCallInterceptor::new("arbiter.internal", interceptor_cedar);
+        assert_eq!(
+            interceptor.intercept_and_authorize(
+                100,
+                "spiffe://arbiter.internal/master/m1",
+                "SetQuota",
+                "role:prod",
+            ),
+            Ok(Decision::Allow)
+        );
+        assert!(
+            interceptor
+                .intercept_and_authorize(
+                    101,
+                    "spiffe://wrong.domain/master/m1",
+                    "SetQuota",
+                    "role:prod",
+                )
+                .is_err()
+        );
+        assert!(
+            interceptor
+                .intercept_and_authorize(
+                    102,
+                    "spiffe://arbiter.internal/node/a1",
+                    "SetQuota",
+                    "role:prod",
+                )
+                .is_err()
+        );
+        assert_eq!(interceptor.audit_log.verify_chain(), Ok(3));
     }
 }

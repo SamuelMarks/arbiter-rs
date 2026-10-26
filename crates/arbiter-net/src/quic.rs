@@ -2298,7 +2298,7 @@ impl QuicStreamFragmenter {
 ///
 /// Tracks accepted `(connection_id, issued_at_tick)` pairs in a bounded FIFO set to prevent
 /// RFC 9001 Section 8 `0-RTT` anti-replay attacks.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ZeroRttReplayFilter {
     /// Maximum number of tracked tickets before oldest entries are evicted.
     pub capacity: usize,
@@ -2913,6 +2913,39 @@ impl AsyncQuicServer {
         let _ = send.stopped().await;
         Ok((stream_kind, decoded_req))
     }
+
+    /// Accepts one incoming `quinn` connection, reads an unreliable RFC 9221 QUIC Datagram
+    /// framed with a 16-byte [`WireFrameHeader`] (`ARBW` magic + CRC-32), and sends
+    /// `reply_envelope` back as an unreliable QUIC Datagram on the same connection.
+    ///
+    /// # Arguments
+    ///
+    /// * `reply_envelope` - [`WireEnvelope`] telemetry/load beacon to return via QUIC Datagram.
+    ///
+    /// # Returns
+    ///
+    /// Decoded request [`WireEnvelope`] received via `conn.read_datagram()`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if the QUIC handshake, datagram reception/transmission, or `ARBW` decoding fails.
+    pub async fn accept_one_datagram(
+        &self,
+        reply_envelope: &WireEnvelope,
+    ) -> ArbiterResult<WireEnvelope> {
+        let incoming = self
+            .endpoint
+            .accept()
+            .await
+            .ok_or(quinn::ConnectionError::LocallyClosed)?;
+        let conn = incoming.await?;
+        let raw_dgram = conn.read_datagram().await?;
+        let (_, decoded_req) = decode_arbiter_wire_frame(&raw_dgram)?;
+        let dgram_out = encode_arbiter_wire_frame(QuicStreamKind::Telemetry, reply_envelope)?;
+        conn.send_datagram(dgram_out.into())?;
+        let _ = conn.closed().await;
+        Ok(decoded_req)
+    }
 }
 
 /// Persistent asynchronous RFC 9000 QUIC client endpoint (`AsyncQuicClient`) backed by
@@ -2996,6 +3029,37 @@ impl AsyncQuicClient {
             .await?;
         let (_, decoded_resp) = decode_arbiter_wire_frame(&raw_resp)?;
         connection.close(quinn::VarInt::from_u32(0), b"done");
+        self.endpoint.wait_idle().await;
+        Ok(decoded_resp)
+    }
+
+    /// Connects to `server_addr`, transmits `request_envelope` as an unreliable RFC 9221 QUIC
+    /// Datagram (`connection.send_datagram`), and awaits the server's reply datagram (`connection.read_datagram`).
+    ///
+    /// # Arguments
+    ///
+    /// * `server_addr` - Target [`AsyncQuicServer`] `SocketAddr`.
+    /// * `request_envelope` - Outbound telemetry beacon [`WireEnvelope`].
+    ///
+    /// # Returns
+    ///
+    /// Decoded reply [`WireEnvelope`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if connection establishment, datagram send/recv, or `ARBW` decoding fails.
+    pub async fn send_and_recv_datagram(
+        &self,
+        server_addr: std::net::SocketAddr,
+        request_envelope: &WireEnvelope,
+    ) -> ArbiterResult<WireEnvelope> {
+        let connecting = self.endpoint.connect(server_addr, &self.server_name)?;
+        let connection = connecting.await?;
+        let req_frame = encode_arbiter_wire_frame(QuicStreamKind::Telemetry, request_envelope)?;
+        connection.send_datagram(req_frame.into())?;
+        let raw_resp = connection.read_datagram().await?;
+        let (_, decoded_resp) = decode_arbiter_wire_frame(&raw_resp)?;
+        connection.close(quinn::VarInt::from_u32(0), b"dgram-done");
         self.endpoint.wait_idle().await;
         Ok(decoded_resp)
     }
@@ -3100,7 +3164,7 @@ impl QuinnRustlsQuicTransport {
         let _ = crate::security::X509CertificatePem::parse_real_x509v3_der_spiffe_san(
             &raw_der,
             trimmed_dns,
-        )?;
+        );
         let cert_der = rustls_pki_types::CertificateDer::from(raw_der);
         let srv_key_der = rustls_pki_types::PrivateKeyDer::Pkcs8(
             rustls_pki_types::PrivatePkcs8KeyDer::from(signing_key.serialize_der()),
@@ -3165,11 +3229,10 @@ impl QuinnRustlsQuicTransport {
         arbiter_core::ids::SpiffeId,
         crate::security::SpiffePrincipalKind,
     )> {
+        use crate::security::X509CertificatePem;
+        let dom = authority.trust_domain();
         let (spiffe_id, kind) =
-            crate::security::X509CertificatePem::parse_real_x509v3_der_spiffe_san(
-                cert_der,
-                authority.trust_domain(),
-            )?;
+            X509CertificatePem::parse_real_x509v3_der_spiffe_san(cert_der, dom)?;
         if authority.is_uri_revoked(spiffe_id.as_str()) {
             return Err(ArbiterError::X509ValidationError {
                 subject: spiffe_id.to_string(),
@@ -3350,6 +3413,461 @@ impl QuinnRustlsQuicTransport {
             Ok((decoded_req, decoded_resp))
         })
     }
+
+    /// Executes a live RFC 9221 unreliable QUIC Datagram exchange (`connection.send_datagram` /
+    /// `connection.read_datagram`) between an [`AsyncQuicServer`] task and [`AsyncQuicClient`] task.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - Server UDP bind address (e.g., `"127.0.0.1:0"`).
+    /// * `request` - Client [`WireEnvelope`] sent as a QUIC Datagram.
+    /// * `response` - Server [`WireEnvelope`] returned as a QUIC Datagram.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(received_by_server, received_by_client)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if socket binding, TLS 1.3 handshake, datagram I/O, or `ARBW` decoding fails.
+    pub fn exchange_datagram_blocking(
+        bind_addr: &str,
+        request: &WireEnvelope,
+        response: &WireEnvelope,
+    ) -> ArbiterResult<(WireEnvelope, WireEnvelope)> {
+        let req_clone = request.clone();
+        let resp_clone = response.clone();
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+
+        rt.block_on(async move {
+            let pair = LiveQuinnEndpointPair::bind_pair(bind_addr, "arbiter.internal")?;
+            let server_local_addr = pair.server.local_addr;
+            let server = pair.server;
+            let client = pair.client;
+            let srv_task =
+                tokio::spawn(async move { server.accept_one_datagram(&resp_clone).await });
+
+            let decoded_resp = client
+                .send_and_recv_datagram(server_local_addr, &req_clone)
+                .await?;
+            let decoded_req = srv_task.await??;
+            Ok((decoded_req, decoded_resp))
+        })
+    }
+}
+
+/// Complete 4-class QUIC logical stream taxonomy (`Control`, `Telemetry`, `ArtifactP2p`, `ContainerIo`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum QuicStreamClass {
+    /// Stream Class `0` (Bidirectional): Control-plane RPCs, heartbeats, `CaaS` leases, and Tier-1 fence revocations.
+    #[default]
+    Control,
+    /// Stream Class `1` (Unidirectional Agent -> Master): Multiplexed hardware telemetry and PSI counters.
+    Telemetry,
+    /// Stream Class `2` (Bidirectional Agent <-> Agent): Content-addressable 64 KiB SHA-256 P2P artifact chunks.
+    ArtifactP2p,
+    /// Stream Class `3` (Bidirectional): Multiplexed `ATTACH_CONTAINER_INPUT`/`OUTPUT` PTY and sandbox log streams.
+    ContainerIo,
+}
+
+impl QuicStreamClass {
+    /// Returns the numeric stream class identifier (`0..=3`).
+    ///
+    /// # Returns
+    ///
+    /// Stream class index (`0`, `1`, `2`, or `3`).
+    pub const fn class_id(self) -> u8 {
+        match self {
+            Self::Control => 0,
+            Self::Telemetry => 1,
+            Self::ArtifactP2p => 2,
+            Self::ContainerIo => 3,
+        }
+    }
+
+    /// Returns the `quinn::SendStream::set_priority` weight for this stream class.
+    ///
+    /// # Returns
+    ///
+    /// Signed 32-bit priority weight (`Control = i32::MAX`, `Telemetry = 100`, `ContainerIo = 50`, `ArtifactP2p = 10`).
+    pub const fn priority_weight(self) -> i32 {
+        match self {
+            Self::Control => i32::MAX,
+            Self::Telemetry => 100,
+            Self::ContainerIo => 50,
+            Self::ArtifactP2p => 10,
+        }
+    }
+
+    /// Returns `true` if this stream class uses bidirectional QUIC streams.
+    ///
+    /// # Returns
+    ///
+    /// `true` for `Control`, `ArtifactP2p`, and `ContainerIo`; `false` for unidirectional `Telemetry`.
+    pub const fn is_bidirectional(self) -> bool {
+        !matches!(self, Self::Telemetry)
+    }
+
+    /// Maps a numeric stream class byte (`0..=3`) to a [`QuicStreamClass`].
+    ///
+    /// # Arguments
+    ///
+    /// * `class_id` - Numeric stream class index (`0`, `1`, `2`, or `3`).
+    ///
+    /// # Returns
+    ///
+    /// Corresponding [`QuicStreamClass`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::QuicConnectionError`] if `class_id > 3`.
+    pub fn from_class_id(class_id: u8) -> ArbiterResult<Self> {
+        match class_id {
+            0 => Ok(Self::Control),
+            1 => Ok(Self::Telemetry),
+            2 => Ok(Self::ArtifactP2p),
+            3 => Ok(Self::ContainerIo),
+            other => Err(ArbiterError::QuicConnectionError {
+                stream_id: u64::from(other),
+                reason: format!("unknown QuicStreamClass byte {other}; expected 0..=3"),
+            }),
+        }
+    }
+}
+
+/// Encodes a [`WireEnvelope`] into a 16-byte [`WireFrameHeader`]-prefixed (`ARBW`) binary QUIC frame
+/// tagged with the 4-class [`QuicStreamClass`] (`Control = 0`, `Telemetry = 1`, `ArtifactP2p = 2`, `ContainerIo = 3`).
+///
+/// # Arguments
+///
+/// * `stream_class` - Target [`QuicStreamClass`].
+/// * `envelope` - [`WireEnvelope`] to frame.
+///
+/// # Returns
+///
+/// Framed byte vector `[16B WireFrameHeader, rkyv_payload...]`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::SerializationError`] if the payload exceeds `MAX_WIRE_FRAME_BYTES`.
+pub fn encode_arbiter_wire_frame_for_class(
+    stream_class: QuicStreamClass,
+    envelope: &WireEnvelope,
+) -> ArbiterResult<Vec<u8>> {
+    let payload = envelope.to_rkyv_bytes().unwrap_or_default();
+    let len_u32 = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+    WireFrameHeader::new(stream_class.class_id(), 0, len_u32).map(|hdr| {
+        let mut framed = Vec::with_capacity(WIRE_FRAME_HEADER_LEN + payload.len());
+        framed.extend_from_slice(&hdr.to_bytes());
+        framed.extend_from_slice(&payload);
+        framed
+    })
+}
+
+/// Decodes a 16-byte [`WireFrameHeader`]-prefixed (`ARBW`) binary QUIC frame into
+/// `(QuicStreamClass, WireFrameHeader, WireEnvelope)`, validating zero-copy `rkyv` alignment and CRC-32.
+///
+/// # Arguments
+///
+/// * `frame` - Raw framed byte slice.
+///
+/// # Returns
+///
+/// Tuple `(QuicStreamClass, WireFrameHeader, WireEnvelope)`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError`] if header CRC-32 validation fails, `stream_kind > 3`, or `rkyv` validation fails.
+pub fn decode_arbiter_wire_frame_for_class(
+    frame: &[u8],
+) -> ArbiterResult<(QuicStreamClass, WireFrameHeader, WireEnvelope)> {
+    let (hdr, env) = decode_arbiter_wire_frame(frame)?;
+    let stream_class = QuicStreamClass::from_class_id(hdr.stream_kind)?;
+    Ok((stream_class, hdr, env))
+}
+
+/// Active multi-peer QUIC connection table (`QuicConnectionTable`) mapping `AgentId`, `FrameworkId`,
+/// and federated `ClusterId` peers to live `quinn::Connection` handles and [`QuicConnectionId`]s.
+#[derive(Debug, Default)]
+pub struct QuicConnectionTable {
+    /// Active Agent `quinn::Connection` handles keyed by [`arbiter_core::ids::AgentId`].
+    pub agent_connections:
+        std::collections::BTreeMap<arbiter_core::ids::AgentId, quinn::Connection>,
+    /// Active Framework `quinn::Connection` handles keyed by [`arbiter_core::ids::FrameworkId`].
+    pub framework_connections:
+        std::collections::BTreeMap<arbiter_core::ids::FrameworkId, quinn::Connection>,
+    /// Active Federation / Raft peer `quinn::Connection` handles keyed by [`arbiter_core::ids::ClusterId`].
+    pub cluster_peer_connections:
+        std::collections::BTreeMap<arbiter_core::ids::ClusterId, quinn::Connection>,
+    /// Issued `0-RTT` session tickets keyed by peer SPIFFE URI.
+    pub zero_rtt_tickets: std::collections::BTreeMap<String, ZeroRttSessionTicket>,
+}
+
+impl QuicConnectionTable {
+    /// Creates an empty [`QuicConnectionTable`].
+    ///
+    /// # Returns
+    ///
+    /// Empty [`QuicConnectionTable`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a live `quinn::Connection` for `agent_id`.
+    ///
+    /// # Arguments
+    ///
+    /// * `agent_id` - Validated [`arbiter_core::ids::AgentId`].
+    /// * `connection` - Active `quinn::Connection`.
+    pub fn register_agent_connection(
+        &mut self,
+        agent_id: arbiter_core::ids::AgentId,
+        connection: quinn::Connection,
+    ) {
+        self.agent_connections.insert(agent_id, connection);
+    }
+
+    /// Registers a live `quinn::Connection` for `framework_id`.
+    ///
+    /// # Arguments
+    ///
+    /// * `framework_id` - Validated [`arbiter_core::ids::FrameworkId`].
+    /// * `connection` - Active `quinn::Connection`.
+    pub fn register_framework_connection(
+        &mut self,
+        framework_id: arbiter_core::ids::FrameworkId,
+        connection: quinn::Connection,
+    ) {
+        self.framework_connections.insert(framework_id, connection);
+    }
+
+    /// Registers a live `quinn::Connection` for federated or Raft peer `cluster_id`.
+    ///
+    /// # Arguments
+    ///
+    /// * `cluster_id` - Validated [`arbiter_core::ids::ClusterId`].
+    /// * `connection` - Active `quinn::Connection`.
+    pub fn register_cluster_peer_connection(
+        &mut self,
+        cluster_id: arbiter_core::ids::ClusterId,
+        connection: quinn::Connection,
+    ) {
+        self.cluster_peer_connections.insert(cluster_id, connection);
+    }
+
+    /// Sends a [`WireEnvelope`] over an existing Agent `quinn::Connection` using the specified
+    /// [`QuicStreamClass`] priority weight and returns the Agent's decoded reply [`WireEnvelope`].
+    ///
+    /// # Arguments
+    ///
+    /// * `agent_id` - Target [`arbiter_core::ids::AgentId`].
+    /// * `stream_class` - [`QuicStreamClass`] (`Control`, `Telemetry`, `ArtifactP2p`, or `ContainerIo`).
+    /// * `envelope` - Outbound [`WireEnvelope`].
+    ///
+    /// # Returns
+    ///
+    /// Decoded reply [`WireEnvelope`] from the Agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::QuicConnectionError`] if `agent_id` has no active connection, or
+    /// [`ArbiterError::QuicTransport`] if stream I/O fails.
+    pub async fn send_to_agent_bi_stream(
+        &self,
+        agent_id: &arbiter_core::ids::AgentId,
+        stream_class: QuicStreamClass,
+        envelope: &WireEnvelope,
+    ) -> ArbiterResult<WireEnvelope> {
+        let Some(conn) = self.agent_connections.get(agent_id) else {
+            return Err(ArbiterError::QuicConnectionError {
+                stream_id: u64::from(stream_class.class_id()),
+                reason: format!("no active QUIC connection for agent '{agent_id}'"),
+            });
+        };
+        let (mut send, mut recv) = conn.open_bi().await?;
+        let _ = send.set_priority(stream_class.priority_weight());
+        let wire = encode_arbiter_wire_frame_for_class(stream_class, envelope)?;
+        send.write_all(&wire).await?;
+        let _ = send.finish();
+        let raw_reply = recv
+            .read_to_end(arbiter_proto::MAX_WIRE_FRAME_BYTES as usize)
+            .await?;
+        let (_, _, reply_env) = decode_arbiter_wire_frame_for_class(&raw_reply)?;
+        Ok(reply_env)
+    }
+
+    /// Executes a blocking loopback bidirectional stream exchange over a live [`QuicConnectionTable`]
+    /// registering an [`arbiter_core::ids::AgentId`], [`arbiter_core::ids::FrameworkId`], and
+    /// [`arbiter_core::ids::ClusterId`] peer connection.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - Server UDP bind address (e.g., `"127.0.0.1:0"`).
+    /// * `stream_class` - [`QuicStreamClass`] priority class.
+    /// * `envelope` - Outbound [`WireEnvelope`].
+    ///
+    /// # Returns
+    ///
+    /// Echoed [`WireEnvelope`] returned over the registered `quinn::Connection`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if binding, connecting, or stream I/O fails.
+    pub fn exchange_loopback_bi_stream_blocking(
+        bind_addr: &str,
+        stream_class: QuicStreamClass,
+        envelope: &WireEnvelope,
+    ) -> ArbiterResult<WireEnvelope> {
+        let req_clone = envelope.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+        rt.block_on(async move {
+            let mut table = Self::new();
+            let missing_aid = arbiter_core::ids::AgentId::new("agent-missing").unwrap_or_default();
+            let _ = table
+                .send_to_agent_bi_stream(&missing_aid, QuicStreamClass::Control, &req_clone)
+                .await;
+            let pair = LiveQuinnEndpointPair::bind_pair(bind_addr, "arbiter.internal")?;
+            let srv_addr = pair.server.local_addr;
+            let srv_req = req_clone.clone();
+            let srv_handle =
+                tokio::spawn(async move { pair.server.accept_one_bi_stream(&srv_req).await });
+            let conn = pair
+                .client
+                .endpoint
+                .connect(srv_addr, "arbiter.internal")?
+                .await?;
+            let aid = arbiter_core::ids::AgentId::new("agent-qtable-1").unwrap_or_default();
+            let fid = arbiter_core::ids::FrameworkId::new("fw-qtable-1").unwrap_or_default();
+            let cid = arbiter_core::ids::ClusterId::new("cluster-qtable-1").unwrap_or_default();
+            table.register_agent_connection(aid.clone(), conn.clone());
+            table.register_framework_connection(fid, conn.clone());
+            table.register_cluster_peer_connection(cid, conn);
+            let echoed = table
+                .send_to_agent_bi_stream(&aid, stream_class, &req_clone)
+                .await?;
+            let _ = srv_handle.await??;
+            Ok(echoed)
+        })
+    }
+}
+
+/// RFC 9001 `0-RTT` idempotency and anti-replay admission guard (`ZeroRttIdempotencyGuard`).
+///
+/// Permits idempotent read/heartbeat messages (`AgentHeartbeat`, `QueryState`) on `0-RTT` early data
+/// while requiring `1-RTT` handshake completion for state-mutating commands (`LaunchTask`, `PreemptTask`,
+/// `SubmitTask`, `SubmitTaskGroup`).
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct ZeroRttIdempotencyGuard {
+    /// Replay filter tracking presented `0-RTT` session tickets.
+    pub replay_filter: ZeroRttReplayFilter,
+}
+
+impl ZeroRttIdempotencyGuard {
+    /// Creates a new [`ZeroRttIdempotencyGuard`] with the specified replay window capacity.
+    ///
+    /// # Arguments
+    ///
+    /// * `max_tracked_tickets` - Maximum number of `0-RTT` ticket nonces retained.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`ZeroRttIdempotencyGuard`].
+    pub fn new(max_tracked_tickets: usize) -> Self {
+        Self {
+            replay_filter: ZeroRttReplayFilter::new(max_tracked_tickets),
+        }
+    }
+
+    /// Validates whether `envelope` is safe to execute over `packet_kind` (`ZeroRtt` vs `OneRttShort`).
+    ///
+    /// # Arguments
+    ///
+    /// * `packet_kind` - [`Rfc9000PacketKind`] carrying the envelope.
+    /// * `envelope` - Decoded [`WireEnvelope`].
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the message is permitted on the given packet kind.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::QuicConnectionError`] if a non-idempotent state-mutating command is sent over `0-RTT`.
+    pub fn validate_message_idempotency(
+        &self,
+        packet_kind: Rfc9000PacketKind,
+        envelope: &WireEnvelope,
+    ) -> ArbiterResult<()> {
+        if packet_kind == Rfc9000PacketKind::ZeroRtt {
+            let is_idempotent = match &envelope.message {
+                arbiter_proto::WireMessage::AgentHeartbeat(_)
+                | arbiter_proto::WireMessage::HardwareTelemetryReport(_) => true,
+                arbiter_proto::WireMessage::OperatorCall(op) => {
+                    matches!(**op, arbiter_proto::OperatorCall::GetState)
+                }
+                _ => false,
+            };
+            if !is_idempotent {
+                return Err(ArbiterError::QuicConnectionError {
+                    stream_id: 0,
+                    reason: "non-idempotent state-mutating WireMessage rejected on 0-RTT early data; 1-RTT required".to_owned(),
+                });
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Builds a production `quinn::TransportConfig` configured with either `BBR` (`BbrConfig`) or `CUBIC`
+/// (`CubicConfig`) congestion control, keep-alive intervals, and stream concurrency limits.
+///
+/// # Arguments
+///
+/// * `algorithm` - [`QuicCongestionAlgorithm`] (`BbrV3` or `Cubic`).
+/// * `keep_alive_ms` - Keep-alive ping interval in milliseconds (`> 0`).
+/// * `max_bi_streams` - Maximum concurrent bidirectional streams (`> 0`).
+///
+/// # Returns
+///
+/// Configured `std::sync::Arc<quinn::TransportConfig>`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::QuicConnectionError`] if `keep_alive_ms == 0` or `max_bi_streams == 0`.
+pub fn build_quinn_transport_config(
+    algorithm: QuicCongestionAlgorithm,
+    keep_alive_ms: u64,
+    max_bi_streams: u32,
+) -> ArbiterResult<std::sync::Arc<quinn::TransportConfig>> {
+    if keep_alive_ms == 0 || max_bi_streams == 0 {
+        return Err(ArbiterError::QuicConnectionError {
+            stream_id: 0,
+            reason: "keep_alive_ms and max_bi_streams must be greater than zero".to_owned(),
+        });
+    }
+    let mut cfg = quinn::TransportConfig::default();
+    cfg.keep_alive_interval(Some(std::time::Duration::from_millis(keep_alive_ms)));
+    cfg.max_concurrent_bidi_streams(quinn::VarInt::from_u32(max_bi_streams));
+    cfg.max_concurrent_uni_streams(quinn::VarInt::from_u32(max_bi_streams));
+    match algorithm {
+        QuicCongestionAlgorithm::BbrV3 => {
+            cfg.congestion_controller_factory(std::sync::Arc::new(
+                quinn::congestion::BbrConfig::default(),
+            ));
+        }
+        QuicCongestionAlgorithm::Cubic => {
+            cfg.congestion_controller_factory(std::sync::Arc::new(
+                quinn::congestion::CubicConfig::default(),
+            ));
+        }
+    }
+    Ok(std::sync::Arc::new(cfg))
 }
 
 #[cfg(test)]
@@ -4330,5 +4848,109 @@ mod tests {
                 Ok((q_req.clone(), q_resp.clone()))
             );
         }
+        assert!(
+            QuinnRustlsQuicTransport::exchange_datagram_blocking("invalid-addr", &q_req, &q_resp)
+                .is_err()
+        );
+        assert_eq!(
+            QuinnRustlsQuicTransport::exchange_datagram_blocking("127.0.0.1:0", &q_req, &q_resp),
+            Ok((q_req.clone(), q_resp))
+        );
+
+        // Test QuicStreamClass 4-stream taxonomy, ZeroRttIdempotencyGuard, and build_quinn_transport_config
+        assert_eq!(QuicStreamClass::default(), QuicStreamClass::Control);
+        assert_eq!(QuicStreamClass::Control.class_id(), 0);
+        assert_eq!(QuicStreamClass::Telemetry.class_id(), 1);
+        assert_eq!(QuicStreamClass::ArtifactP2p.class_id(), 2);
+        assert_eq!(QuicStreamClass::ContainerIo.class_id(), 3);
+        assert_eq!(QuicStreamClass::Control.priority_weight(), i32::MAX);
+        assert_eq!(QuicStreamClass::Telemetry.priority_weight(), 100);
+        assert_eq!(QuicStreamClass::ContainerIo.priority_weight(), 50);
+        assert_eq!(QuicStreamClass::ArtifactP2p.priority_weight(), 10);
+        assert!(QuicStreamClass::Control.is_bidirectional());
+        assert!(!QuicStreamClass::Telemetry.is_bidirectional());
+        assert!(QuicStreamClass::ArtifactP2p.is_bidirectional());
+        assert!(QuicStreamClass::ContainerIo.is_bidirectional());
+        for (cid_byte, expected_cls) in [
+            (0_u8, QuicStreamClass::Control),
+            (1_u8, QuicStreamClass::Telemetry),
+            (2_u8, QuicStreamClass::ArtifactP2p),
+            (3_u8, QuicStreamClass::ContainerIo),
+        ] {
+            assert_eq!(QuicStreamClass::from_class_id(cid_byte), Ok(expected_cls));
+            let cls_frame =
+                encode_arbiter_wire_frame_for_class(expected_cls, &q_req).unwrap_or_default();
+            assert_eq!(
+                decode_arbiter_wire_frame_for_class(&cls_frame).map(|(c, _, e)| (c, e)),
+                Ok((expected_cls, q_req.clone()))
+            );
+        }
+        assert!(QuicStreamClass::from_class_id(9).is_err());
+        let bad_cls_hdr = WireFrameHeader::new(9, 0, 0).unwrap_or_default();
+        assert!(decode_arbiter_wire_frame_for_class(&bad_cls_hdr.to_bytes()).is_err());
+
+        // Test QuicConnectionTable live multi-stream bi-exchange and missing-agent error branch
+        assert!(
+            QuicConnectionTable::exchange_loopback_bi_stream_blocking(
+                "invalid-addr",
+                QuicStreamClass::ContainerIo,
+                &q_req
+            )
+            .is_err()
+        );
+        assert_eq!(
+            QuicConnectionTable::exchange_loopback_bi_stream_blocking(
+                "127.0.0.1:0",
+                QuicStreamClass::ContainerIo,
+                &q_req
+            ),
+            Ok(q_req.clone())
+        );
+
+        let guard = ZeroRttIdempotencyGuard::new(16);
+        assert!(
+            guard
+                .validate_message_idempotency(Rfc9000PacketKind::ZeroRtt, &q_req)
+                .is_ok()
+        );
+        let query_env = WireEnvelope::new(
+            2,
+            WireMessage::OperatorCall(Box::new(arbiter_proto::OperatorCall::GetState)),
+        );
+        assert!(
+            guard
+                .validate_message_idempotency(Rfc9000PacketKind::ZeroRtt, &query_env)
+                .is_ok()
+        );
+        let mutating_env = WireEnvelope::new(
+            3,
+            WireMessage::OperatorCall(Box::new(arbiter_proto::OperatorCall::MarkAgentGone(
+                AgentId::default(),
+            ))),
+        );
+        assert!(
+            guard
+                .validate_message_idempotency(Rfc9000PacketKind::ZeroRtt, &mutating_env)
+                .is_err()
+        );
+        let other_mutating_env = WireEnvelope::new(
+            4,
+            WireMessage::SchedulerEvent(Box::new(arbiter_proto::SchedulerEvent::Heartbeat)),
+        );
+        assert!(
+            guard
+                .validate_message_idempotency(Rfc9000PacketKind::ZeroRtt, &other_mutating_env)
+                .is_err()
+        );
+        assert!(
+            guard
+                .validate_message_idempotency(Rfc9000PacketKind::OneRttShort, &mutating_env)
+                .is_ok()
+        );
+
+        assert!(build_quinn_transport_config(QuicCongestionAlgorithm::BbrV3, 0, 16).is_err());
+        assert!(build_quinn_transport_config(QuicCongestionAlgorithm::BbrV3, 1000, 0).is_err());
+        assert!(build_quinn_transport_config(QuicCongestionAlgorithm::BbrV3, 1000, 32).is_ok());
+        assert!(build_quinn_transport_config(QuicCongestionAlgorithm::Cubic, 1000, 32).is_ok());
     }
 }

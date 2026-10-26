@@ -14,9 +14,8 @@ categories.workspace = true
 [dependencies]
 arbiter-core = { workspace = true }
 serde = { workspace = true }
-
-[target.'cfg(unix)'.dependencies]
-nix = { workspace = true }
+sysinfo = { workspace = true }
+nvml-wrapper = { workspace = true }
 
 [lints]
 workspace = true

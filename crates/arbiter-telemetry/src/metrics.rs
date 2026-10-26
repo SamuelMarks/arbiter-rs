@@ -664,6 +664,70 @@ impl TelemetryRegistry {
         self.record_hardware_counters(snap.clone());
         Ok(snap)
     }
+
+    /// Exports all registered counters and gauges using the official `prometheus-client`
+    /// `OpenMetrics` text encoder (`prometheus_client::encoding::text::encode`).
+    ///
+    /// # Returns
+    ///
+    /// `OpenMetrics`-formatted exposition string ending in `# EOF\n`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::PrometheusRegistry`] if encoding fails.
+    pub fn encode_openmetrics_with_prometheus_client(&self) -> ArbiterResult<String> {
+        let mut prom_reg = prometheus_client::registry::Registry::default();
+        for (name, entry) in &self.metrics {
+            match entry.kind {
+                MetricKind::Counter => {
+                    let c = prometheus_client::metrics::counter::Counter::<u64>::default();
+                    let _ = c.inc_by(u64::try_from(entry.value).unwrap_or(0));
+                    prom_reg.register(name.as_str(), entry.help.as_str(), c);
+                }
+                MetricKind::Gauge => {
+                    let g = prometheus_client::metrics::gauge::Gauge::<i64>::default();
+                    let _ = g.set(entry.value);
+                    prom_reg.register(name.as_str(), entry.help.as_str(), g);
+                }
+            }
+        }
+        let mut buf = String::new();
+        prometheus_client::encoding::text::encode(&mut buf, &prom_reg)?;
+        Ok(buf)
+    }
+}
+
+impl TraceParentContext {
+    /// Converts this W3C [`TraceParentContext`] into a canonical `opentelemetry::trace::SpanContext`.
+    ///
+    /// # Returns
+    ///
+    /// Validated `opentelemetry::trace::SpanContext`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::OtlpTelemetry`] if `trace_id_hex` or `span_id_hex` is not valid hex.
+    pub fn to_opentelemetry_span_context(
+        &self,
+    ) -> ArbiterResult<opentelemetry::trace::SpanContext> {
+        let mut tid_bytes = [0_u8; 16];
+        base16ct::mixed::decode(self.trace_id_hex.as_bytes(), &mut tid_bytes).map_err(|e| {
+            arbiter_core::error::OtlpTelemetryError::new("trace_id", &e.to_string())
+        })?;
+        let mut sid_bytes = [0_u8; 8];
+        base16ct::mixed::decode(self.span_id_hex.as_bytes(), &mut sid_bytes)
+            .map_err(|e| arbiter_core::error::OtlpTelemetryError::new("span_id", &e.to_string()))?;
+        let trace_id = opentelemetry::trace::TraceId::from_bytes(tid_bytes);
+        let span_id = opentelemetry::trace::SpanId::from_bytes(sid_bytes);
+        let flags = opentelemetry::trace::TraceFlags::new(self.trace_flags);
+        Ok(opentelemetry::trace::SpanContext::new(
+            trace_id,
+            span_id,
+            flags,
+            true,
+            opentelemetry::trace::TraceState::default(),
+        ))
+    }
 }
 
 #[cfg(test)]
@@ -745,6 +809,12 @@ mod tests {
         assert!(prom.contains(r#"arbiter_hw_power_milliwatts{device="gpu-0"} 320000"#));
         assert!(prom.contains(r#"arbiter_hw_ecc_uncorrected_errors_total{device="gpu-0"} 2"#));
 
+        let openmetrics = reg
+            .encode_openmetrics_with_prometheus_client()
+            .unwrap_or_default();
+        assert!(openmetrics.contains("arbiter_preemptions_total"));
+        assert!(openmetrics.contains("# EOF"));
+
         let otlp = reg.render_otlp_json();
         assert!(otlp.contains("resourceMetrics"));
         let pb_metrics = reg.encode_otlp_protobuf_metrics();
@@ -772,6 +842,24 @@ mod tests {
         let child_tp = tp.child_span("b7ad6b7169203331").unwrap_or_default();
         assert_eq!(child_tp.span_id_hex, "b7ad6b7169203331");
         assert!(tp.child_span("invalid").is_err());
+        let otel_sc = tp.to_opentelemetry_span_context();
+        assert!(otel_sc.is_ok());
+        assert!(
+            TraceParentContext {
+                trace_id_hex: "bad".to_owned(),
+                ..tp.clone()
+            }
+            .to_opentelemetry_span_context()
+            .is_err()
+        );
+        assert!(
+            TraceParentContext {
+                span_id_hex: "bad".to_owned(),
+                ..tp.clone()
+            }
+            .to_opentelemetry_span_context()
+            .is_err()
+        );
         for bad_hdr in [
             "bad",
             "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01-extra",

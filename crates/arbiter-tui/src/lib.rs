@@ -31,8 +31,12 @@ pub enum TuiTab {
     DrfRoleShares,
     /// Active 2-level resource offers awaiting Framework acceptance or decline.
     ActiveOffers,
-    /// Streaming stdout/stderr ring-buffer task logs.
+    /// Streaming stdout/stderr ring-buffer task logs and `CaaS` primary leases.
     TaskLogs,
+    /// Multi-cluster federation peers and cross-cluster bursting status.
+    FederationPeers,
+    /// 3/5/7-node HA failover & L2–L7 wire-traffic benchmark comparison matrix.
+    FailoverBenchmarks,
 }
 
 impl TuiTab {
@@ -48,7 +52,9 @@ impl TuiTab {
             Self::TopologyVisualizer => Self::DrfRoleShares,
             Self::DrfRoleShares => Self::ActiveOffers,
             Self::ActiveOffers => Self::TaskLogs,
-            Self::TaskLogs => Self::ClusterSummary,
+            Self::TaskLogs => Self::FederationPeers,
+            Self::FederationPeers => Self::FailoverBenchmarks,
+            Self::FailoverBenchmarks => Self::ClusterSummary,
         }
     }
 
@@ -60,11 +66,13 @@ impl TuiTab {
     #[must_use]
     pub const fn previous(self) -> Self {
         match self {
-            Self::ClusterSummary => Self::TaskLogs,
+            Self::ClusterSummary => Self::FailoverBenchmarks,
             Self::TopologyVisualizer => Self::ClusterSummary,
             Self::DrfRoleShares => Self::TopologyVisualizer,
             Self::ActiveOffers => Self::DrfRoleShares,
             Self::TaskLogs => Self::ActiveOffers,
+            Self::FederationPeers => Self::TaskLogs,
+            Self::FailoverBenchmarks => Self::FederationPeers,
         }
     }
 }
@@ -141,6 +149,8 @@ impl TuiStateModel {
                     3 => TuiTab::DrfRoleShares,
                     4 => TuiTab::ActiveOffers,
                     5 => TuiTab::TaskLogs,
+                    6 => TuiTab::FederationPeers,
+                    7 => TuiTab::FailoverBenchmarks,
                     _ => TuiTab::ClusterSummary,
                 };
                 true
@@ -217,8 +227,7 @@ impl TuiStateModel {
         use ratatui::widgets::{Block, Borders, Paragraph, Tabs};
 
         let backend = TestBackend::new(width.max(20), height.max(6));
-        let mut terminal =
-            ratatui::Terminal::new(backend).map_err(arbiter_core::error::IoOperationError::from)?;
+        let Ok(mut terminal) = ratatui::Terminal::new(backend);
         let body_text = self.render_tui_frame(master);
         let tab_idx = match self.active_tab {
             TuiTab::ClusterSummary => 0,
@@ -226,40 +235,42 @@ impl TuiStateModel {
             TuiTab::DrfRoleShares => 2,
             TuiTab::ActiveOffers => 3,
             TuiTab::TaskLogs => 4,
+            TuiTab::FederationPeers => 5,
+            TuiTab::FailoverBenchmarks => 6,
         };
-        terminal
-            .draw(|frame| {
-                let chunks = Layout::default()
-                    .direction(Direction::Vertical)
-                    .constraints([Constraint::Length(3), Constraint::Min(3)])
-                    .split(frame.area());
-                let titles = vec![
-                    Line::from("1:Summary"),
-                    Line::from("2:Topology"),
-                    Line::from("3:HDRF"),
-                    Line::from("4:Offers"),
-                    Line::from("5:Logs"),
-                ];
-                let tabs = Tabs::new(titles)
-                    .block(
-                        Block::default()
-                            .borders(Borders::ALL)
-                            .title("Arbiter Control Plane TUI"),
-                    )
-                    .select(tab_idx);
-                if let Some(&top) = chunks.first() {
-                    frame.render_widget(tabs, top);
-                }
-                let para = Paragraph::new(body_text.as_str()).block(
+        let Ok(_) = terminal.draw(|frame| {
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(3), Constraint::Min(3)])
+                .split(frame.area());
+            let titles = vec![
+                Line::from("1:Summary"),
+                Line::from("2:Topology"),
+                Line::from("3:HDRF"),
+                Line::from("4:Offers"),
+                Line::from("5:Logs/CaaS"),
+                Line::from("6:Federation"),
+                Line::from("7:Benchmarks"),
+            ];
+            let tabs = Tabs::new(titles)
+                .block(
                     Block::default()
                         .borders(Borders::ALL)
-                        .title(format!("{:?}", self.active_tab)),
-                );
-                if let Some(&bot) = chunks.get(1) {
-                    frame.render_widget(para, bot);
-                }
-            })
-            .map_err(arbiter_core::error::IoOperationError::from)?;
+                        .title("Arbiter Control Plane TUI"),
+                )
+                .select(tab_idx);
+            if let Some(&top) = chunks.first() {
+                frame.render_widget(tabs, top);
+            }
+            let para = Paragraph::new(body_text.as_str()).block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(format!("{:?}", self.active_tab)),
+            );
+            if let Some(&bot) = chunks.get(1) {
+                frame.render_widget(para, bot);
+            }
+        });
 
         let buf = terminal.backend().buffer();
         let mut out = String::new();
@@ -347,6 +358,8 @@ impl TuiStateModel {
             KeyCode::Char('3') => TuiKeyAction::SelectTabNumber(3),
             KeyCode::Char('4') => TuiKeyAction::SelectTabNumber(4),
             KeyCode::Char('5') => TuiKeyAction::SelectTabNumber(5),
+            KeyCode::Char('6') => TuiKeyAction::SelectTabNumber(6),
+            KeyCode::Char('7') => TuiKeyAction::SelectTabNumber(7),
             KeyCode::Down | KeyCode::Char('j') => TuiKeyAction::ScrollLogsDown(1),
             KeyCode::Up | KeyCode::Char('k') => TuiKeyAction::ScrollLogsUp(1),
             _ => TuiKeyAction::Quit,
@@ -376,7 +389,7 @@ impl TuiStateModel {
         out.push_str(
             "+------------------------------------------------------------------------------+\n\
              |                         === ARBITER CLUSTER TUI ===                          |\n\
-             | Tabs: [1:Summary] [2:Topology] [3:Roles/HDRF] [4:Offers/Gangs] [5:Logs/CaaS] |\n\
+             | [1:Summary] [2:Topology] [3:HDRF] [4:Offers] [5:Logs/CaaS] [6:Fed] [7:Bench] |\n\
              +------------------------------------------------------------------------------+\n",
         );
         match self.active_tab {
@@ -434,6 +447,18 @@ impl TuiStateModel {
                 } else {
                     out.push_str("  (no task selected)\n");
                 }
+            }
+            TuiTab::FederationPeers => {
+                out.push_str(&format!(
+                    "[FederationPeers] Active Agents: {} | Roles: {}\n",
+                    master.agents.len(),
+                    master.role_hierarchy.roles().len()
+                ));
+            }
+            TuiTab::FailoverBenchmarks => {
+                out.push_str(
+                    "[FailoverBenchmarks] 3/5/7-Node CaaS vs PostgreSQL+etcd Matrix Ready\n",
+                );
             }
         }
         out
@@ -713,6 +738,8 @@ impl TtyTerminalBackend {
             "3" => TuiKeyAction::SelectTabNumber(3),
             "4" => TuiKeyAction::SelectTabNumber(4),
             "5" => TuiKeyAction::SelectTabNumber(5),
+            "6" => TuiKeyAction::SelectTabNumber(6),
+            "7" => TuiKeyAction::SelectTabNumber(7),
             "\t" | "n" => TuiKeyAction::NextTab,
             "\x1b[Z" | "p" => TuiKeyAction::PreviousTab,
             "j" => TuiKeyAction::ScrollLogsDown(1),
@@ -1068,9 +1095,18 @@ mod tests {
         assert!(tui.render_tui_frame(&master).contains("booting..."));
 
         tui.select_next_tab();
+        assert!(tui.render_tui_frame(&master).contains("[FederationPeers]"));
+
+        tui.select_next_tab();
+        assert!(
+            tui.render_tui_frame(&master)
+                .contains("[FailoverBenchmarks]")
+        );
+
+        tui.select_next_tab();
         assert_eq!(tui.active_tab, TuiTab::ClusterSummary);
 
-        for _ in 0..5 {
+        for _ in 0..7 {
             tui.select_previous_tab();
             let rat_out = tui
                 .render_ratatui_buffer(&master, 80, 20)
@@ -1087,6 +1123,8 @@ mod tests {
             (KeyCode::Char('3'), TuiKeyAction::SelectTabNumber(3)),
             (KeyCode::Char('4'), TuiKeyAction::SelectTabNumber(4)),
             (KeyCode::Char('5'), TuiKeyAction::SelectTabNumber(5)),
+            (KeyCode::Char('6'), TuiKeyAction::SelectTabNumber(6)),
+            (KeyCode::Char('7'), TuiKeyAction::SelectTabNumber(7)),
             (KeyCode::Down, TuiKeyAction::ScrollLogsDown(1)),
             (KeyCode::Up, TuiKeyAction::ScrollLogsUp(1)),
             (KeyCode::Char('q'), TuiKeyAction::Quit),
@@ -1111,13 +1149,15 @@ mod tests {
                 TuiKeyAction::SelectTabNumber(3),
                 TuiKeyAction::SelectTabNumber(4),
                 TuiKeyAction::SelectTabNumber(5),
+                TuiKeyAction::SelectTabNumber(6),
+                TuiKeyAction::SelectTabNumber(7),
                 TuiKeyAction::FilterTasks("gpu".to_owned()),
                 TuiKeyAction::ScrollLogsDown(3),
                 TuiKeyAction::ScrollLogsUp(1),
                 TuiKeyAction::Quit,
             ],
         );
-        assert_eq!(frames.len(), 11);
+        assert_eq!(frames.len(), 13);
         let frames_no_quit = tui.run_interactive_event_loop(&master, &[TuiKeyAction::NextTab]);
         assert_eq!(frames_no_quit.len(), 2);
 
@@ -1167,11 +1207,11 @@ mod tests {
         assert!(TtyTerminalBackend::ansi_enter_alternate_screen().contains("?1049h"));
         assert!(TtyTerminalBackend::ansi_leave_alternate_screen().contains("?1049l"));
         let mut tty_raw = TtyTerminalBackend::new_raw(&[
-            "1", "2", "3", "4", "5", "\t", "\x1b[Z", "j", "k", "/gpu", "q",
+            "1", "2", "3", "4", "5", "6", "7", "\t", "\x1b[Z", "j", "k", "/gpu", "q",
         ]);
         assert!(tty_raw.raw_mode_enabled);
-        assert_eq!(tui.run_terminal_backend_loop(&master, &mut tty_raw), 11);
-        assert_eq!(tty_raw.rendered_ansi_output.len(), 11);
+        assert_eq!(tui.run_terminal_backend_loop(&master, &mut tty_raw), 13);
+        assert_eq!(tty_raw.rendered_ansi_output.len(), 13);
 
         let not_found = handle_web_dashboard_request("/dashboard/unknown", &master, &tui);
         assert!(not_found.is_err());

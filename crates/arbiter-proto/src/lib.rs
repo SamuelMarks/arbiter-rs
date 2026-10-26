@@ -24,9 +24,9 @@ use arbiter_core::workload::{
     AgentLossReason, AgentMaintenanceState, CheckpointMode, DiskSource, DrainCompletionMode,
     DynamicReservationSpec, ExecutorInfo, InverseOffer, InverseOfferResponse, KillPolicy,
     MaintenanceSchedule, MasterInfo, OfferFilter, OfferOperation, OfferRescindReason,
-    OperationState, PreemptionPolicy, Quota, ResourceOffer, ResourceProviderDiskSpec,
+    OperationState, PreemptionPolicy, Quota, QuotaConfig, ResourceOffer, ResourceProviderDiskSpec,
     ResourceProviderInfo, ResourceRequest, Role, TaskGroupSpec, TaskSpec, TaskState,
-    VolumeReservationSpec,
+    TaskStatusDetails, VolumeReservationSpec, WeightInfo,
 };
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
@@ -589,6 +589,49 @@ pub struct TaskStatusUpdate {
     pub message: String,
 }
 
+impl TaskStatusUpdate {
+    /// Constructs a [`TaskStatusUpdate`] with structured Mesos v1 [`TaskStatusDetails`] encoded
+    /// into its diagnostic payload.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - [`TaskId`].
+    /// * `agent_id` - Hosting [`AgentId`].
+    /// * `state` - Target [`TaskState`].
+    /// * `details` - Structured [`TaskStatusDetails`].
+    ///
+    /// # Returns
+    ///
+    /// [`TaskStatusUpdate`] carrying the serialized [`TaskStatusDetails`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::JsonCodec`] if `details` cannot be serialized.
+    pub fn with_details(
+        task_id: TaskId,
+        agent_id: AgentId,
+        state: TaskState,
+        details: &TaskStatusDetails,
+    ) -> ArbiterResult<Self> {
+        let json = serde_json::to_string(details).map_err(JsonCodecError::from)?;
+        Ok(Self {
+            task_id,
+            agent_id,
+            state,
+            message: json,
+        })
+    }
+
+    /// Parses structured Mesos v1 [`TaskStatusDetails`] from `self.message` if present.
+    ///
+    /// # Returns
+    ///
+    /// `Some(TaskStatusDetails)` if `self.message` contains valid JSON [`TaskStatusDetails`], otherwise `None`.
+    pub fn parsed_details(&self) -> Option<TaskStatusDetails> {
+        serde_json::from_str(&self.message).ok()
+    }
+}
+
 /// Framework subscription request (`/api/v1/scheduler`).
 #[derive(
     Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
@@ -933,7 +976,156 @@ impl SchedulerCall {
     }
 }
 
+/// Strongly-typed Mesos v1 `scheduler::Call::Accept` payload (`SchedulerAcceptCall`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerAcceptCall {
+    /// Offer acceptance specification (`framework_id`, `offer_ids`, `operations`).
+    pub accept: AcceptOffers,
+    /// Optional idempotency operation identifier (`OperationId`).
+    pub operation_id: Option<OperationId>,
+    /// Offer filter applied to any residual unconsumed resources.
+    pub filters: OfferFilter,
+}
+
+impl SchedulerAcceptCall {
+    /// Converts this [`SchedulerAcceptCall`] into a [`SchedulerCall::Accept`].
+    ///
+    /// # Returns
+    ///
+    /// [`SchedulerCall::Accept`].
+    pub fn into_scheduler_call(self) -> SchedulerCall {
+        SchedulerCall::Accept(self.accept, self.operation_id, self.filters)
+    }
+}
+
+/// Strongly-typed Mesos v1 `scheduler::Call::Revive` payload (`SchedulerReviveCall`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerReviveCall {
+    /// Subscribed Framework identifier.
+    pub framework_id: FrameworkId,
+    /// Specific roles to revive (`empty` revives all subscribed roles).
+    pub roles: Vec<RoleName>,
+}
+
+impl SchedulerReviveCall {
+    /// Converts this [`SchedulerReviveCall`] into a [`SchedulerCall::Revive`].
+    ///
+    /// # Returns
+    ///
+    /// [`SchedulerCall::Revive`].
+    pub fn into_scheduler_call(self) -> SchedulerCall {
+        SchedulerCall::Revive(self.framework_id, self.roles)
+    }
+}
+
+/// Strongly-typed Mesos v1 `scheduler::Call::Suppress` payload (`SchedulerSuppressCall`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerSuppressCall {
+    /// Subscribed Framework identifier.
+    pub framework_id: FrameworkId,
+    /// Specific roles to suppress (`empty` suppresses all subscribed roles).
+    pub roles: Vec<RoleName>,
+}
+
+impl SchedulerSuppressCall {
+    /// Converts this [`SchedulerSuppressCall`] into a [`SchedulerCall::Suppress`].
+    ///
+    /// # Returns
+    ///
+    /// [`SchedulerCall::Suppress`].
+    pub fn into_scheduler_call(self) -> SchedulerCall {
+        SchedulerCall::Suppress(self.framework_id, self.roles)
+    }
+}
+
+/// Strongly-typed Mesos v1 `scheduler::Call::Request` payload (`SchedulerRequestCall`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerRequestCall {
+    /// Subscribed Framework identifier.
+    pub framework_id: FrameworkId,
+    /// Requested resource shapes (`Vec<ResourceRequest>`).
+    pub requests: Vec<ResourceRequest>,
+}
+
+impl SchedulerRequestCall {
+    /// Converts this [`SchedulerRequestCall`] into a [`SchedulerCall::Request`].
+    ///
+    /// # Returns
+    ///
+    /// [`SchedulerCall::Request`].
+    pub fn into_scheduler_call(self) -> SchedulerCall {
+        SchedulerCall::Request(self.framework_id, self.requests)
+    }
+}
+
+/// Strongly-typed Mesos v1 `scheduler::Call::Message` payload (`SchedulerMessageCall`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SchedulerMessageCall {
+    /// Subscribed Framework identifier.
+    pub framework_id: FrameworkId,
+    /// Target Agent identifier.
+    pub agent_id: AgentId,
+    /// Target Executor identifier.
+    pub executor_id: ExecutorId,
+    /// Opaque binary message payload (`Vec<u8>`).
+    pub data: Vec<u8>,
+}
+
+impl SchedulerMessageCall {
+    /// Converts this [`SchedulerMessageCall`] into a [`SchedulerCall::Message`].
+    ///
+    /// # Returns
+    ///
+    /// [`SchedulerCall::Message`].
+    pub fn into_scheduler_call(self) -> SchedulerCall {
+        SchedulerCall::Message(
+            self.framework_id,
+            self.agent_id,
+            self.executor_id,
+            self.data,
+        )
+    }
+}
+
 impl OperatorCall {
+    /// Constructs an [`OperatorCall::UpdateQuota`] from a validated [`QuotaConfig`].
+    ///
+    /// # Arguments
+    ///
+    /// * `config` - Strongly-typed [`QuotaConfig`].
+    /// * `quota_id` - [`arbiter_core::ids::QuotaId`] for the resulting [`Quota`].
+    /// * `weight` - [`WeightBasisPoints`] for the role.
+    ///
+    /// # Returns
+    ///
+    /// Validated [`OperatorCall::UpdateQuota`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidQuotaBounds`] if `config` bounds are invalid and `force` is `false`.
+    pub fn update_quota_from_config(
+        config: QuotaConfig,
+        quota_id: arbiter_core::ids::QuotaId,
+        weight: WeightBasisPoints,
+    ) -> ArbiterResult<Self> {
+        let role = config.role.clone();
+        let quota = config.into_quota(quota_id, weight)?;
+        Ok(Self::UpdateQuota(role, quota))
+    }
+
+    /// Constructs an [`OperatorCall::UpdateWeights`] from a slice of [`WeightInfo`] items.
+    ///
+    /// # Arguments
+    ///
+    /// * `weights` - Slice of [`WeightInfo`] entries.
+    ///
+    /// # Returns
+    ///
+    /// [`OperatorCall::UpdateWeights`].
+    pub fn update_weights_from_infos(weights: &[WeightInfo]) -> Self {
+        Self::UpdateWeights(weights.iter().map(|w| (w.role.clone(), w.weight)).collect())
+    }
+
     /// Constructs an [`OperatorCall::SetLoggingLevel`] from a strongly-typed [`LoggingLevel`].
     ///
     /// # Arguments
@@ -3372,7 +3564,155 @@ mod tests {
             prop_assert_eq!(WireEnvelope::from_rkyv_bytes(&bin), Ok(env.clone()));
 
             let json = env.to_json_string().unwrap_or_default();
-            prop_assert_eq!(WireEnvelope::from_json_str(&json), Ok(env));
+            prop_assert_eq!(WireEnvelope::from_json_str(&json), Ok(env.clone()));
+
+            let pb = encode_protobuf_envelope(&env).unwrap_or_default();
+            prop_assert_eq!(decode_protobuf_envelope(&pb), Ok(env));
+        }
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::items_after_statements)]
+    fn test_scheduler_call_typed_wrappers_and_task_status_details() {
+        use arbiter_core::units::WallClockUnixMillis;
+        use arbiter_core::workload::{CheckStatusInfo, TaskStatusReason, TaskStatusSource};
+
+        let tid = TaskId::new("t-det-1").unwrap_or_default();
+        let aid = AgentId::new("a-det-1").unwrap_or_default();
+        let details = TaskStatusDetails {
+            source: TaskStatusSource::SourceExecutor,
+            reason: Some(TaskStatusReason::ReasonTaskHealthCheckStatusUpdated),
+            uuid: Some(StatusUpdateUuid::new("u-det-1").unwrap_or_default()),
+            healthy: Some(true),
+            check_status: Some(CheckStatusInfo::Tcp(true)),
+            limitation: None,
+            container_id: Some(ContainerId::new("c-det-1").unwrap_or_default()),
+            timestamp: WallClockUnixMillis::new(1_700_000_000_123),
+            unreachable_time: None,
+        };
+        let upd = TaskStatusUpdate::with_details(tid, aid.clone(), TaskState::Running, &details)
+            .unwrap_or(TaskStatusUpdate {
+                task_id: TaskId::default(),
+                agent_id: AgentId::default(),
+                state: TaskState::Pending,
+                message: String::new(),
+            });
+        assert_eq!(upd.parsed_details(), Some(details));
+
+        let plain_upd = TaskStatusUpdate {
+            task_id: TaskId::default(),
+            agent_id: aid.clone(),
+            state: TaskState::Running,
+            message: "not-json".to_owned(),
+        };
+        assert_eq!(plain_upd.parsed_details(), None);
+
+        let fid = FrameworkId::new("fw-typed-1").unwrap_or_default();
+        let role = RoleName::new("role-typed-1").unwrap_or_default();
+        let exid = ExecutorId::new("ex-typed-1").unwrap_or_default();
+
+        let accept_typed = SchedulerAcceptCall {
+            accept: AcceptOffers {
+                framework_id: fid.clone(),
+                offer_ids: Vec::new(),
+                operations: Vec::new(),
+            },
+            operation_id: None,
+            filters: OfferFilter::default(),
+        };
+        let revive_typed = SchedulerReviveCall {
+            framework_id: fid.clone(),
+            roles: vec![role.clone()],
+        };
+        let suppress_typed = SchedulerSuppressCall {
+            framework_id: fid.clone(),
+            roles: vec![role],
+        };
+        let request_typed = SchedulerRequestCall {
+            framework_id: fid.clone(),
+            requests: Vec::new(),
+        };
+        let message_typed = SchedulerMessageCall {
+            framework_id: fid,
+            agent_id: aid,
+            executor_id: exid,
+            data: vec![1, 2, 3],
+        };
+
+        type SchedTypedTuple = (
+            SchedulerAcceptCall,
+            SchedulerReviveCall,
+            SchedulerSuppressCall,
+            SchedulerRequestCall,
+            SchedulerMessageCall,
+        );
+        let orig_tuple: SchedTypedTuple = (
+            accept_typed.clone(),
+            revive_typed.clone(),
+            suppress_typed.clone(),
+            request_typed.clone(),
+            message_typed.clone(),
+        );
+        let json_tuple = serde_json::to_string(&orig_tuple).unwrap_or_default();
+        let decoded_tuple: Result<SchedTypedTuple, serde_json::Error> =
+            serde_json::from_str(&json_tuple);
+        assert_eq!(decoded_tuple.ok(), Some(orig_tuple));
+
+        let q_cfg = QuotaConfig {
+            role: RoleName::default(),
+            guarantees: ResourceBundle::zero(),
+            limits: ResourceBundle::zero(),
+            force: false,
+        };
+        assert!(
+            OperatorCall::update_quota_from_config(
+                q_cfg,
+                arbiter_core::ids::QuotaId::default(),
+                WeightBasisPoints::STANDARD,
+            )
+            .is_ok()
+        );
+        let mut bad_guarantees = ResourceBundle::zero();
+        bad_guarantees.cpu = arbiter_core::units::Millicores::new(4_000);
+        let bad_q_cfg = QuotaConfig {
+            role: RoleName::default(),
+            guarantees: bad_guarantees,
+            limits: ResourceBundle::zero(),
+            force: false,
+        };
+        assert!(
+            OperatorCall::update_quota_from_config(
+                bad_q_cfg,
+                arbiter_core::ids::QuotaId::default(),
+                WeightBasisPoints::STANDARD,
+            )
+            .is_err()
+        );
+        let w_call = OperatorCall::update_weights_from_infos(&[WeightInfo {
+            role: RoleName::default(),
+            weight: WeightBasisPoints::STANDARD,
+        }]);
+        assert_eq!(
+            w_call,
+            OperatorCall::UpdateWeights(vec![(RoleName::default(), WeightBasisPoints::STANDARD)])
+        );
+
+        for sc in [
+            accept_typed.into_scheduler_call(),
+            revive_typed.into_scheduler_call(),
+            suppress_typed.into_scheduler_call(),
+            request_typed.into_scheduler_call(),
+            message_typed.into_scheduler_call(),
+        ] {
+            let env = WireEnvelope::new(1, WireMessage::SchedulerCall(Box::new(sc)));
+            for ct in [
+                WireCodecContentType::ApplicationJson,
+                WireCodecContentType::ApplicationProtobuf,
+                WireCodecContentType::ApplicationRkyv,
+            ] {
+                let encoded = ct.encode_envelope(&env).unwrap_or_default();
+                assert_eq!(ct.decode_envelope(&encoded), Ok(env.clone()));
+            }
         }
     }
 

@@ -194,7 +194,7 @@ define_string_id!(
 );
 
 define_string_id!(
-    /// Unique identifier for an atomic Gang / TaskGroup workload.
+    /// Unique identifier for an atomic Gang / `TaskGroup` workload.
     TaskGroupId,
     "TaskGroupId"
 );
@@ -206,7 +206,7 @@ define_string_id!(
 );
 
 define_string_id!(
-    /// Unique identifier for a Mesos v1 maintenance drain InverseOffer sent to a Framework.
+    /// Unique identifier for a Mesos v1 maintenance drain `InverseOffer` sent to a Framework.
     InverseOfferId,
     "InverseOfferId"
 );

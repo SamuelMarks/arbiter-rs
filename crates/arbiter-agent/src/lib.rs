@@ -313,6 +313,8 @@ pub struct AgentSupervisor {
     pub resource_estimator: ResourceEstimator,
     /// `QoS` controller protecting latency-sensitive production tasks from revocable interference.
     pub qos_controller: QoSController,
+    /// Co-located logical cluster slices (`ClusterId -> dedicated ResourceBundle`) partitioned on this physical Agent.
+    pub logical_cluster_slices: BTreeMap<arbiter_core::ids::ClusterId, ResourceBundle>,
 }
 
 impl AgentSupervisor {
@@ -348,7 +350,49 @@ impl AgentSupervisor {
             completed_task_timestamps: BTreeMap::new(),
             resource_estimator: ResourceEstimator::default(),
             qos_controller: QoSController::default(),
+            logical_cluster_slices: BTreeMap::new(),
         }
+    }
+
+    /// Registers a dedicated [`ResourceBundle`] slice for a co-located logical [`arbiter_core::ids::ClusterId`]
+    /// on this physical Agent, verifying that the sum of all co-located logical cluster slices
+    /// does not exceed `physical_capacity`.
+    ///
+    /// # Arguments
+    ///
+    /// * `cluster_id` - Logical [`arbiter_core::ids::ClusterId`].
+    /// * `slice_resources` - Dedicated [`ResourceBundle`] assigned to `cluster_id`.
+    /// * `physical_capacity` - Total physical hardware [`ResourceBundle`] of this Agent.
+    ///
+    /// # Returns
+    ///
+    /// Aggregate [`ResourceBundle`] reserved across all logical clusters on this Agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InsufficientResources`] if the sum of logical slices exceeds `physical_capacity`.
+    pub fn register_logical_cluster_slice(
+        &mut self,
+        cluster_id: arbiter_core::ids::ClusterId,
+        slice_resources: ResourceBundle,
+        physical_capacity: &ResourceBundle,
+    ) -> ArbiterResult<ResourceBundle> {
+        let mut total = slice_resources.clone();
+        for (cid, existing) in &self.logical_cluster_slices {
+            if *cid != cluster_id {
+                total = total.try_add(existing)?;
+            }
+        }
+        if !physical_capacity.contains(&total) {
+            return Err(ArbiterError::InsufficientResources {
+                resource: "logical_cluster_slice".to_owned(),
+                requested: total.cpu.get(),
+                available: physical_capacity.cpu.get(),
+            });
+        }
+        self.logical_cluster_slices
+            .insert(cluster_id, slice_resources);
+        Ok(total)
     }
 
     /// Estimates currently available `Revocable` oversubscription slack on this Agent by comparing
@@ -1129,12 +1173,15 @@ impl AgentSupervisor {
                 output_paths.append(&mut extracted);
             } else {
                 let filename = art.uri.rsplit('/').next().unwrap_or("artifact.bin");
+                let entries = [(filename, payload.as_slice())];
+                let tid_str = task.task_id.as_str();
+                let cache_ref = &mut self.artifact_cache;
                 let mut written = materializer.fetch_and_materialize_archive(
                     storage_backend,
-                    &mut self.artifact_cache,
-                    task.task_id.as_str(),
+                    cache_ref,
+                    tid_str,
                     art,
-                    &[(filename, &payload)],
+                    &entries,
                 )?;
                 output_paths.append(&mut written);
             }
@@ -2469,6 +2516,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_agent_fetcher_and_sandbox_files() {
         let aid = AgentId::new("agent-wire-1").unwrap_or_default();
         let mut agent = AgentSupervisor::new(aid, Bytes::new(65_536), [0x22_u8; 32], 500);
@@ -2539,6 +2587,23 @@ mod tests {
                     .is_err()
             );
         }
+
+        let mut bad_sbox_t = task.clone();
+        bad_sbox_t.artifacts = vec![ArtifactSpec {
+            uri: format!("file://{}", raw_file.display()),
+            sha256_hex: compute_sha256_hex(&raw_bytes),
+            extract: false,
+            executable: false,
+        }];
+        assert!(
+            agent
+                .fetch_and_materialize_task_artifacts(
+                    &bad_sbox_t,
+                    &storage,
+                    "/dev/null/impossible_sbox"
+                )
+                .is_err()
+        );
 
         let root_sp = arbiter_core::ids::SandboxPath::new("/").unwrap_or_default();
         let sub_sp = arbiter_core::ids::SandboxPath::new("t-wire-1").unwrap_or_default();
@@ -3046,5 +3111,83 @@ mod tests {
                 .is_err()
         );
         let _ = std::fs::remove_dir_all(&psi_dir);
+
+        // 5. register_logical_cluster_slice co-location partitioning & overflow checks
+        let phys_cap = ResourceBundle {
+            cpu: Millicores::new(16_000),
+            memory: Bytes::new(32_000),
+            ..ResourceBundle::zero()
+        };
+        let c_prod = arbiter_core::ids::ClusterId::new("prod").unwrap_or_default();
+        let c_stage = arbiter_core::ids::ClusterId::new("staging").unwrap_or_default();
+        assert!(
+            agent
+                .register_logical_cluster_slice(
+                    c_prod.clone(),
+                    ResourceBundle {
+                        cpu: Millicores::new(8_000),
+                        memory: Bytes::new(16_000),
+                        ..ResourceBundle::zero()
+                    },
+                    &phys_cap,
+                )
+                .is_ok()
+        );
+        // Updating existing cluster slice in-place
+        assert!(
+            agent
+                .register_logical_cluster_slice(
+                    c_prod,
+                    ResourceBundle {
+                        cpu: Millicores::new(10_000),
+                        memory: Bytes::new(16_000),
+                        ..ResourceBundle::zero()
+                    },
+                    &phys_cap,
+                )
+                .is_ok()
+        );
+        // Adding second slice that fits
+        assert!(
+            agent
+                .register_logical_cluster_slice(
+                    c_stage.clone(),
+                    ResourceBundle {
+                        cpu: Millicores::new(6_000),
+                        memory: Bytes::new(16_000),
+                        ..ResourceBundle::zero()
+                    },
+                    &phys_cap,
+                )
+                .is_ok()
+        );
+        // Exceeding physical capacity rejected
+        assert!(
+            agent
+                .register_logical_cluster_slice(
+                    c_stage.clone(),
+                    ResourceBundle {
+                        cpu: Millicores::new(8_000),
+                        memory: Bytes::new(16_000),
+                        ..ResourceBundle::zero()
+                    },
+                    &phys_cap,
+                )
+                .is_err()
+        );
+        // Overflow rejected
+        assert!(
+            agent
+                .register_logical_cluster_slice(
+                    c_stage,
+                    ResourceBundle {
+                        cpu: Millicores::new(u64::MAX),
+                        memory: Bytes::ZERO,
+                        ..ResourceBundle::zero()
+                    },
+                    &phys_cap,
+                )
+                .is_err()
+        );
     }
 }

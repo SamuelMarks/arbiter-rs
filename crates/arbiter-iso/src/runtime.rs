@@ -135,9 +135,98 @@ impl OciContainerDriver {
         Ok(serde_json::to_string(&spec).unwrap_or_default())
     }
 
+    /// Constructs a strongly-typed `oci_spec::runtime::Spec` v1.2.0 document containing
+    /// `ociVersion`, `root`, `process`, and `linux` (`cgroupsPath`, `namespaces`, `resources`)
+    /// structures using the `oci-spec` crate.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Container [`TaskId`].
+    /// * `limits` - Task [`ResourceBundle`] limits.
+    ///
+    /// # Returns
+    ///
+    /// Strongly-typed `oci_spec::runtime::Spec`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ContainerRuntimeError`] if `rootfs_path` is empty, or
+    /// [`ArbiterError::OciSpec`] if building any `oci-spec` builder fails.
+    pub fn build_oci_spec_v1_2(
+        &self,
+        task_id: &TaskId,
+        limits: &ResourceBundle,
+    ) -> ArbiterResult<oci_spec::runtime::Spec> {
+        if self.rootfs_path.is_empty() {
+            return Err(ArbiterError::ContainerRuntimeError {
+                runtime: self.engine.binary_name().to_owned(),
+                container_id: task_id.to_string(),
+                reason: "container rootfs_path cannot be empty".to_owned(),
+            });
+        }
+        let cpu_quota = i64::try_from(limits.cpu.get().saturating_mul(100)).unwrap_or(i64::MAX);
+        let mem_limit = i64::try_from(limits.memory.get()).unwrap_or(i64::MAX);
+
+        let root = oci_spec::runtime::RootBuilder::default()
+            .path(std::path::PathBuf::from(&self.rootfs_path))
+            .readonly(false)
+            .build()?;
+        let user = oci_spec::runtime::UserBuilder::default()
+            .uid(0_u32)
+            .gid(0_u32)
+            .build()?;
+        let process = oci_spec::runtime::ProcessBuilder::default()
+            .terminal(false)
+            .user(user)
+            .args(self.command_args.clone())
+            .cwd(std::path::PathBuf::from("/"))
+            .no_new_privileges(true)
+            .build()?;
+        let linux_cpu = oci_spec::runtime::LinuxCpuBuilder::default()
+            .quota(cpu_quota)
+            .period(100_000_u64)
+            .build()?;
+        let linux_mem = oci_spec::runtime::LinuxMemoryBuilder::default()
+            .limit(mem_limit)
+            .build()?;
+        let linux_res = oci_spec::runtime::LinuxResourcesBuilder::default()
+            .cpu(linux_cpu)
+            .memory(linux_mem)
+            .build()?;
+        let namespaces = [
+            oci_spec::runtime::LinuxNamespaceType::Pid,
+            oci_spec::runtime::LinuxNamespaceType::Network,
+            oci_spec::runtime::LinuxNamespaceType::Ipc,
+            oci_spec::runtime::LinuxNamespaceType::Uts,
+            oci_spec::runtime::LinuxNamespaceType::Mount,
+            oci_spec::runtime::LinuxNamespaceType::Cgroup,
+        ]
+        .into_iter()
+        .map(|ns_ty| {
+            oci_spec::runtime::LinuxNamespaceBuilder::default()
+                .typ(ns_ty)
+                .build()
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+        let linux = oci_spec::runtime::LinuxBuilder::default()
+            .cgroups_path(std::path::PathBuf::from(format!(
+                "/arbiter.slice/{task_id}"
+            )))
+            .resources(linux_res)
+            .namespaces(namespaces)
+            .build()?;
+        let spec = oci_spec::runtime::SpecBuilder::default()
+            .version("1.2.0")
+            .root(root)
+            .process(process)
+            .linux(linux)
+            .build()?;
+        Ok(spec)
+    }
+
     /// Generates a nested OCI Runtime Specification v1.2.0 `config.json` document containing
     /// canonical `ociVersion`, `root`, `process`, `mounts`, and `linux` (`cgroupsPath`,
-    /// `namespaces`, `resources`, `devices`) objects for direct consumption by `crun` / `runc`.
+    /// `namespaces`, `resources`, `devices`) objects via [`Self::build_oci_spec_v1_2`] (`oci-spec`).
     ///
     /// # Arguments
     ///
@@ -156,20 +245,8 @@ impl OciContainerDriver {
         task_id: &TaskId,
         limits: &ResourceBundle,
     ) -> ArbiterResult<String> {
-        if self.rootfs_path.is_empty() {
-            return Err(ArbiterError::ContainerRuntimeError {
-                runtime: self.engine.binary_name().to_owned(),
-                container_id: task_id.to_string(),
-                reason: "container rootfs_path cannot be empty".to_owned(),
-            });
-        }
-        let cpu_quota = limits.cpu.get().saturating_mul(100);
-        let mem_limit = limits.memory.get();
-        let args_json = serde_json::to_string(&self.command_args).unwrap_or_default();
-        Ok(format!(
-            r#"{{"ociVersion":"1.2.0","root":{{"path":"{}","readonly":false}},"process":{{"terminal":false,"user":{{"uid":0,"gid":0}},"args":{args_json},"cwd":"/","noNewPrivileges":true}},"linux":{{"cgroupsPath":"/arbiter.slice/{task_id}","resources":{{"memory":{{"limit":{mem_limit}}},"cpu":{{"quota":{cpu_quota},"period":100000}}}},"namespaces":[{{"type":"pid"}},{{"type":"network"}},{{"type":"ipc"}},{{"type":"uts"}},{{"type":"mount"}},{{"type":"cgroup"}}]}}}}"#,
-            self.rootfs_path
-        ))
+        let spec = self.build_oci_spec_v1_2(task_id, limits)?;
+        Ok(serde_json::to_string(&spec).unwrap_or_default())
     }
 
     /// Writes the generated OCI `config.json` to `<bundle_dir>/config.json` and returns the

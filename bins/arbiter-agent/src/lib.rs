@@ -433,8 +433,39 @@ impl AgentCliConfig {
                 100,
             );
             let mut pipeline = arbiter_iso::pipeline::IsolatorPipeline::new();
+            let udp_sock = std::net::UdpSocket::bind("127.0.0.1:0").map_err(ArbiterError::from)?;
+            let _ = udp_sock.set_read_timeout(Some(std::time::Duration::from_millis(2)));
             let mut executed = 0_u64;
             while executed < max_ticks {
+                let hb_env = arbiter_proto::WireEnvelope::new(
+                    executed.saturating_add(1),
+                    arbiter_proto::WireMessage::AgentHeartbeat(arbiter_proto::AgentHeartbeat {
+                        agent_id: self.agent_id.clone(),
+                        tick: executed,
+                        healthy_tasks: Vec::new(),
+                    }),
+                );
+                let arbw = arbiter_net::quic::encode_arbiter_wire_frame(
+                    arbiter_net::quic::QuicStreamKind::Control,
+                    &hb_env,
+                )
+                .unwrap_or_default();
+                let _ = udp_sock.send_to(&arbw, &self.master_endpoint);
+                let mut rx_buf = [0_u8; 4096];
+                let ack_seq = udp_sock
+                    .recv_from(&mut rx_buf)
+                    .ok()
+                    .and_then(|(n, _)| {
+                        let slice = rx_buf.get(..n).unwrap_or(&[]);
+                        arbiter_net::quic::decode_arbiter_wire_frame(slice)
+                            .ok()
+                            .map(|(_, e)| e.sequence)
+                    })
+                    .unwrap_or(executed);
+                tcp_caas
+                    .ipc_server
+                    .cache
+                    .apply_heartbeat_renewals(ack_seq.saturating_add(100), &[]);
                 let _ = tcp_caas.poll_once(executed)?;
                 let _ = sup.run_qos_correction_cycle(&[], &mut pipeline)?;
                 let _ = tcp_caas
@@ -617,6 +648,37 @@ mod tests {
         assert_eq!(async_ticks, 2);
         assert!(!caas_addr.is_empty());
         assert!(async_summary.contains("arbiter-agent"));
+
+        let _ = std::net::UdpSocket::bind("127.0.0.1:0").map(|arbw_srv| {
+            let _ = arbw_srv.local_addr().map(|m_addr| {
+                let mut arbw_cfg = custom.clone();
+                m_addr.to_string().clone_into(&mut arbw_cfg.master_endpoint);
+                let srv_h = std::thread::spawn(move || {
+                    let mut buf = [0_u8; 8192];
+                    let _ = arbw_srv.recv_from(&mut buf).map(|(_, peer)| {
+                        let reply = arbiter_proto::WireEnvelope::new(
+                            1,
+                            arbiter_proto::WireMessage::AgentHeartbeat(
+                                arbiter_proto::AgentHeartbeat {
+                                    agent_id: arbiter_core::ids::AgentId::new("node-42")
+                                        .unwrap_or_default(),
+                                    tick: 1,
+                                    healthy_tasks: Vec::new(),
+                                },
+                            ),
+                        );
+                        let frame = arbiter_net::quic::encode_arbiter_wire_frame(
+                            arbiter_net::quic::QuicStreamKind::Control,
+                            &reply,
+                        )
+                        .unwrap_or_default();
+                        let _ = arbw_srv.send_to(&frame, peer);
+                    });
+                });
+                assert!(arbw_cfg.run_async_tokio_supervisor_daemon(2).is_ok());
+                let _ = srv_h.join();
+            });
+        });
 
         let (code_err, _) = run_agent_main(&["--bogus"]);
         assert!(!code_err.is_success());

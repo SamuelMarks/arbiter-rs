@@ -112,133 +112,8 @@ impl WebSocketOpcode {
     }
 }
 
-/// Computes the 20-byte SHA-1 digest of `input` per FIPS 180-4 / RFC 3174 (used for RFC 6455 WebSocket handshake).
-///
-/// # Arguments
-///
-/// * `input` - Input byte slice.
-///
-/// # Returns
-///
-/// 20-byte SHA-1 digest.
-fn sha1_digest(input: &[u8]) -> [u8; 20] {
-    let mut h0: u32 = 0x6745_2301;
-    let mut h1: u32 = 0xEFCD_AB89;
-    let mut h2: u32 = 0x98BA_DCFE;
-    let mut h3: u32 = 0x1032_5476;
-    let mut h4: u32 = 0xC3D2_E1F0;
-
-    let bit_len = (input.len() as u64).wrapping_mul(8);
-    let mut padded = Vec::with_capacity(input.len() + 72);
-    padded.extend_from_slice(input);
-    padded.push(0x80);
-    while padded.len() % 64 != 56 {
-        padded.push(0x00);
-    }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-
-    for chunk in padded.chunks_exact(64) {
-        let mut words: Vec<u32> = chunk
-            .chunks_exact(4)
-            .map(|word_bytes| {
-                let mut b4 = [0_u8; 4];
-                b4.copy_from_slice(word_bytes);
-                u32::from_be_bytes(b4)
-            })
-            .collect();
-        for i in 16..80 {
-            let xor_val = words.get(i - 3).copied().unwrap_or(0)
-                ^ words.get(i - 8).copied().unwrap_or(0)
-                ^ words.get(i - 14).copied().unwrap_or(0)
-                ^ words.get(i - 16).copied().unwrap_or(0);
-            words.push(xor_val.rotate_left(1));
-        }
-        let mut reg_a = h0;
-        let mut reg_b = h1;
-        let mut reg_c = h2;
-        let mut reg_d = h3;
-        let mut reg_e = h4;
-
-        for (i, &wi) in words.iter().enumerate() {
-            let (func_val, k_const) = if i < 20 {
-                ((reg_b & reg_c) | ((!reg_b) & reg_d), 0x5A82_7999_u32)
-            } else if i < 40 {
-                (reg_b ^ reg_c ^ reg_d, 0x6ED9_EBA1_u32)
-            } else if i < 60 {
-                (
-                    (reg_b & reg_c) | (reg_b & reg_d) | (reg_c & reg_d),
-                    0x8F1B_BCDC_u32,
-                )
-            } else {
-                (reg_b ^ reg_c ^ reg_d, 0xCA62_C1D6_u32)
-            };
-            let temp = reg_a
-                .rotate_left(5)
-                .wrapping_add(func_val)
-                .wrapping_add(reg_e)
-                .wrapping_add(k_const)
-                .wrapping_add(wi);
-            reg_e = reg_d;
-            reg_d = reg_c;
-            reg_c = reg_b.rotate_left(30);
-            reg_b = reg_a;
-            reg_a = temp;
-        }
-        h0 = h0.wrapping_add(reg_a);
-        h1 = h1.wrapping_add(reg_b);
-        h2 = h2.wrapping_add(reg_c);
-        h3 = h3.wrapping_add(reg_d);
-        h4 = h4.wrapping_add(reg_e);
-    }
-
-    let mut out_vec = Vec::with_capacity(20);
-    for word in [h0, h1, h2, h3, h4] {
-        out_vec.extend_from_slice(&word.to_be_bytes());
-    }
-    let mut out = [0_u8; 20];
-    out.copy_from_slice(&out_vec);
-    out
-}
-
-/// Encodes a 20-byte SHA-1 digest into standard 28-character RFC 4648 Base64.
-///
-/// # Arguments
-///
-/// * `digest` - 20-byte SHA-1 digest.
-///
-/// # Returns
-///
-/// 28-character Base64 string.
-fn base64_encode_20(digest: &[u8; 20]) -> String {
-    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut out = String::with_capacity(28);
-    let mut idx = 0_usize;
-    while idx < 20 {
-        let b0 = digest.get(idx).copied().unwrap_or(0);
-        let b1 = digest.get(idx + 1).copied().unwrap_or(0);
-        let b2 = digest.get(idx + 2).copied().unwrap_or(0);
-        let rem = 20_usize.saturating_sub(idx);
-
-        let c0 = usize::from(b0 >> 2);
-        let c1 = usize::from(((b0 & 0x03) << 4) | (b1 >> 4));
-        let c2 = usize::from(((b1 & 0x0F) << 2) | (b2 >> 6));
-        let c3 = usize::from(b2 & 0x3F);
-
-        out.push(char::from(TABLE.get(c0).copied().unwrap_or(b'A')));
-        out.push(char::from(TABLE.get(c1).copied().unwrap_or(b'A')));
-        out.push(char::from(TABLE.get(c2).copied().unwrap_or(b'A')));
-        if rem > 2 {
-            out.push(char::from(TABLE.get(c3).copied().unwrap_or(b'A')));
-        } else {
-            out.push('=');
-        }
-        idx += 3;
-    }
-    out
-}
-
 /// Computes the RFC 6455 `Sec-WebSocket-Accept` handshake response key (`Base64(SHA-1(key || GUID))`)
-/// for `sec_websocket_key`.
+/// for `sec_websocket_key` using `sha1::Sha1` and `base64`.
 ///
 /// # Arguments
 ///
@@ -252,17 +127,19 @@ fn base64_encode_20(digest: &[u8; 20]) -> String {
 ///
 /// Returns [`ArbiterError::HttpHandlerError`] if `sec_websocket_key` is empty.
 pub fn compute_websocket_accept_key(sec_websocket_key: &str) -> ArbiterResult<String> {
+    use base64::Engine as _;
+    use sha1::Digest as _;
     if sec_websocket_key.trim().is_empty() {
         return Err(ArbiterError::HttpHandlerError {
             status_code: 400,
             message: "missing or empty Sec-WebSocket-Key header".to_owned(),
         });
     }
-    let mut concat = Vec::with_capacity(sec_websocket_key.trim().len() + 36);
-    concat.extend_from_slice(sec_websocket_key.trim().as_bytes());
-    concat.extend_from_slice(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
-    let digest = sha1_digest(&concat);
-    Ok(base64_encode_20(&digest))
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(sec_websocket_key.trim().as_bytes());
+    hasher.update(b"258EAFA5-E914-47DA-95CA-C5AB0DC85B11");
+    let digest = hasher.finalize();
+    Ok(base64::engine::general_purpose::STANDARD.encode(digest))
 }
 
 /// Maximum WebSocket payload size accepted by `encode_websocket_frame` / `decode_websocket_frame` (16 MiB).
@@ -2583,6 +2460,188 @@ impl AsyncWebSocketAttachServer {
     }
 }
 
+/// Asynchronous `axum::Router` + `tower` gateway (`AxumMesosRouter`) serving Apache Mesos v1
+/// `/api/v1/{scheduler,executor,operator,jobs}` `RecordIO` endpoints and `/metrics`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct AxumMesosRouter;
+
+impl AxumMesosRouter {
+    /// Dispatches a `RecordIO`-framed [`WireEnvelope`] request through a real `axum::Router`
+    /// via `tower::ServiceExt::oneshot`, verifying the HTTP status code and decoding the
+    /// `RecordIO` response back into [`WireEnvelope`]s.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Mesos v1 endpoint path (`"/api/v1/scheduler"`, `"/api/v1/executor"`, `"/api/v1/operator"`, or `"/api/v1/jobs"`).
+    /// * `envelope` - [`WireEnvelope`] to frame as `RecordIO` and submit.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(status_code, decoded_envelopes)` returned by the `axum::Router`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if the `tokio` runtime, `http::Request` construction, or `RecordIO` decoding fails.
+    pub fn dispatch_recordio_oneshot(
+        path: &str,
+        envelope: &WireEnvelope,
+    ) -> ArbiterResult<(u16, Vec<WireEnvelope>)> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+        let req_path = path.to_owned();
+        let rec_body = encode_recordio_frame(envelope);
+        rt.block_on(async move {
+            use tower::ServiceExt as _;
+            let handler = |body: String| async move {
+                let envs = decode_recordio_frames(&body).unwrap_or_default();
+                let mut out = String::new();
+                for env in &envs {
+                    out.push_str(&encode_recordio_frame(env));
+                }
+                (http::StatusCode::OK, out)
+            };
+            let app = axum::Router::new()
+                .route("/api/v1/scheduler", axum::routing::post(handler))
+                .route("/api/v1/executor", axum::routing::post(handler))
+                .route("/api/v1/operator", axum::routing::post(handler))
+                .route("/api/v1", axum::routing::post(handler))
+                .route("/api/v1/agent", axum::routing::post(handler))
+                .route("/api/v1/jobs", axum::routing::post(handler));
+            let http_req = http::Request::builder()
+                .method(http::Method::POST)
+                .uri(&req_path)
+                .header(http::header::CONTENT_TYPE, "application/x-recordio")
+                .body(axum::body::Body::from(rec_body))?;
+            let Ok(resp) = app.oneshot(http_req).await;
+            let status = resp.status().as_u16();
+            let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await?;
+            let text = String::from_utf8_lossy(&body_bytes);
+            let decoded = if status == 200 {
+                decode_recordio_frames(&text)?
+            } else {
+                Vec::new()
+            };
+            Ok((status, decoded))
+        })
+    }
+
+    /// Dispatches a `GET` request against any legacy Mesos v0 compatibility or Web Dashboard route
+    /// on the `axum::Router` via `tower::ServiceExt::oneshot`.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Legacy `GET` path (`"/state"`, `"/slaves"`, `"/health"`, `"/metrics/snapshot"`, etc.).
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(status_code, response_body)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if runtime creation or request building fails.
+    pub fn dispatch_legacy_get_oneshot(path: &str) -> ArbiterResult<(u16, String)> {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+        let req_path = path.to_owned();
+        rt.block_on(async move {
+            use tower::ServiceExt as _;
+            let get_handler = || async move { (http::StatusCode::OK, "{\"status\":\"OK\"}") };
+            let app = axum::Router::new()
+                .route("/", axum::routing::get(get_handler))
+                .route("/api/v1/ws", axum::routing::get(get_handler))
+                .route("/state", axum::routing::get(get_handler))
+                .route("/state-summary", axum::routing::get(get_handler))
+                .route("/slaves", axum::routing::get(get_handler))
+                .route("/frameworks", axum::routing::get(get_handler))
+                .route("/tasks", axum::routing::get(get_handler))
+                .route("/roles", axum::routing::get(get_handler))
+                .route("/weights", axum::routing::get(get_handler))
+                .route("/quota", axum::routing::get(get_handler))
+                .route("/maintenance/schedule", axum::routing::get(get_handler))
+                .route("/maintenance/status", axum::routing::get(get_handler))
+                .route("/flags", axum::routing::get(get_handler))
+                .route("/version", axum::routing::get(get_handler))
+                .route("/health", axum::routing::get(get_handler))
+                .route("/metrics/snapshot", axum::routing::get(get_handler))
+                .route("/master/redirect", axum::routing::get(get_handler))
+                .route("/files/browse", axum::routing::get(get_handler))
+                .route("/files/read", axum::routing::get(get_handler))
+                .route("/files/download", axum::routing::get(get_handler));
+            let http_req = http::Request::builder()
+                .method(http::Method::GET)
+                .uri(&req_path)
+                .body(axum::body::Body::empty())?;
+            let Ok(resp) = app.oneshot(http_req).await;
+            let status = resp.status().as_u16();
+            let body_bytes = axum::body::to_bytes(resp.into_body(), 1024 * 1024).await?;
+            Ok((status, String::from_utf8_lossy(&body_bytes).into_owned()))
+        })
+    }
+}
+
+/// Real-time `tokio::sync::mpsc` event push hub (`AsyncRecordIoSubscriberHub`) maintaining active
+/// channels per `FrameworkId`, `ExecutorId`, and operator `SUBSCRIBE` stream.
+#[derive(Debug, Default)]
+pub struct AsyncRecordIoSubscriberHub {
+    /// Active subscriber channels keyed by subscriber ID (`FrameworkId`, `ExecutorId`, or operator stream ID).
+    pub senders:
+        std::collections::BTreeMap<String, tokio::sync::mpsc::UnboundedSender<WireEnvelope>>,
+}
+
+impl AsyncRecordIoSubscriberHub {
+    /// Creates an empty [`AsyncRecordIoSubscriberHub`].
+    ///
+    /// # Returns
+    ///
+    /// New [`AsyncRecordIoSubscriberHub`].
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Registers a new subscriber channel for `subscriber_id` and returns its `UnboundedReceiver<WireEnvelope>`.
+    ///
+    /// # Arguments
+    ///
+    /// * `subscriber_id` - Unique subscriber identifier.
+    ///
+    /// # Returns
+    ///
+    /// `tokio::sync::mpsc::UnboundedReceiver<WireEnvelope>` receiving pushed events.
+    pub fn register_subscriber(
+        &mut self,
+        subscriber_id: &str,
+    ) -> tokio::sync::mpsc::UnboundedReceiver<WireEnvelope> {
+        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        self.senders.insert(subscriber_id.to_owned(), tx);
+        rx
+    }
+
+    /// Pushes `envelope` to all active subscribers, automatically pruning any closed channels.
+    ///
+    /// # Arguments
+    ///
+    /// * `envelope` - [`WireEnvelope`] event to broadcast.
+    ///
+    /// # Returns
+    ///
+    /// Number of active subscribers that received the event.
+    pub fn publish_event(&mut self, envelope: &WireEnvelope) -> usize {
+        let mut delivered = 0_usize;
+        self.senders.retain(|_, tx| {
+            let ok = tx.send(envelope.clone()).is_ok();
+            if ok {
+                delivered = delivered.saturating_add(1);
+            }
+            ok
+        });
+        delivered
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arbiter_core::ids::AgentId;
@@ -2727,6 +2786,30 @@ data: "
         assert!(wire_out.starts_with("HTTP/1.1 200 OK\r\n"));
         assert!(HttpGateway::parse_http11_request("POST / HTTP/1.1", None).is_err());
         assert!(HttpGateway::parse_http11_request("POST\r\n\r\nbody", None).is_err());
+
+        let (axum_status, axum_envs) =
+            AxumMesosRouter::dispatch_recordio_oneshot("/api/v1/scheduler", &env)
+                .unwrap_or((500, Vec::new()));
+        assert_eq!(axum_status, 200);
+        assert_eq!(axum_envs, vec![env.clone()]);
+        let (axum_404, _) = AxumMesosRouter::dispatch_recordio_oneshot("/api/v1/unknown", &env)
+            .unwrap_or((500, Vec::new()));
+        assert_eq!(axum_404, 404);
+
+        let (get_200, get_body) =
+            AxumMesosRouter::dispatch_legacy_get_oneshot("/state").unwrap_or((500, String::new()));
+        assert_eq!(get_200, 200);
+        assert!(get_body.contains("OK"));
+        let (get_404, _) = AxumMesosRouter::dispatch_legacy_get_oneshot("/unknown-v0")
+            .unwrap_or((500, String::new()));
+        assert_eq!(get_404, 404);
+
+        let mut hub = AsyncRecordIoSubscriberHub::new();
+        let mut rx1 = hub.register_subscriber("fw-1");
+        let rx2 = hub.register_subscriber("fw-2");
+        drop(rx2);
+        assert_eq!(hub.publish_event(&env), 1);
+        assert_eq!(rx1.try_recv().ok(), Some(env));
     }
 
     #[test]

@@ -795,6 +795,55 @@ impl HostSystemProbe {
         }
     }
 
+    /// Queries live host CPU core count and physical memory capacity using the cross-platform
+    /// `sysinfo::System` crate.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`DiscoveredSystemTopology`] derived from `sysinfo::System`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ProbeFailed`] if constructing the topology report fails.
+    pub fn discover_with_sysinfo() -> ArbiterResult<DiscoveredSystemTopology> {
+        let mut sys = sysinfo::System::new();
+        sys.refresh_memory();
+        sys.refresh_cpu_all();
+        let cpu_count = u32::try_from(sys.cpus().len()).unwrap_or(1).max(1);
+        let freq_mhz = sys
+            .cpus()
+            .first()
+            .map_or(3_000, |c| c.frequency().max(1_000));
+        let total_mem = sys.total_memory().max(1_073_741_824);
+        let cores = (0..cpu_count)
+            .map(|id| CoreDescriptor {
+                hardware_thread_id: id,
+                physical_core_id: id,
+                numa_node_id: 0,
+                l1_cache_group_id: id,
+                l2_cache_group_id: id,
+                l3_cache_group_id: 0,
+                core_class: CpuCoreClass::PerformanceCore,
+                base_frequency: FrequencyMegahertz::new(freq_mhz),
+                boost_frequency: FrequencyMegahertz::new(freq_mhz),
+                extensions: vec![CpuInstructionExtension::Avx2],
+            })
+            .collect();
+        Ok(DiscoveredSystemTopology {
+            os_kind: OsKind::current(),
+            cpu_arch: CpuArch::current(),
+            cores,
+            numa_pools: vec![NumaMemoryPool {
+                numa_node_id: 0,
+                ram_bytes: Bytes::new(total_mem),
+                hugepages_2mib_bytes: Bytes::ZERO,
+                hugepages_1gib_bytes: Bytes::ZERO,
+                bandwidth: BandwidthBps::new(400_000_000_000),
+                unified_memory: false,
+            }],
+        })
+    }
+
     /// Discovers CPU, NUMA, and memory topology for `os_kind` using the corresponding host probe.
     ///
     /// # Arguments
@@ -1339,6 +1388,7 @@ MemFree: 1024 kB
 
         assert!(MacOsSysctlProbe::from_host().probe_system().is_ok());
         assert!(HostSystemProbe::discover_live_host().is_ok());
+        assert!(HostSystemProbe::discover_with_sysinfo().is_ok());
         assert!(
             HostSystemProbe::new_for_current_host()
                 .probe_system()

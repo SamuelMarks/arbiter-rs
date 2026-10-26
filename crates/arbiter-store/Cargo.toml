@@ -24,7 +24,10 @@ prost = { workspace = true }
 h2 = { workspace = true }
 http = { workspace = true }
 crc32fast = { workspace = true }
+base64 = { workspace = true }
 rusqlite = { workspace = true }
+redb = { workspace = true }
+openraft = { workspace = true }
 
 [dev-dependencies]
 proptest = { workspace = true }

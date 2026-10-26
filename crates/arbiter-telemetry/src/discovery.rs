@@ -865,6 +865,223 @@ impl ServiceDiscoveryRegistry {
         };
         Ok((tx_id, rcode, qname, qtype, ancount))
     }
+
+    /// Encodes a standard RFC 1035 DNS response packet (`A`, `AAAA`, `SRV`) using the official
+    /// `hickory-proto` crate (`hickory_proto::op::Message` + `BinEncodable::to_bytes`).
+    ///
+    /// # Arguments
+    ///
+    /// * `tx_id` - 16-bit DNS transaction ID.
+    /// * `qtype` - [`DnsRecordType`] (`A`, `AAAA`, `SRV`).
+    /// * `qname` - Queried domain name.
+    ///
+    /// # Returns
+    ///
+    /// Binary RFC 1035 DNS wire packet produced by `hickory-proto`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::HickoryDns`] if `qname` is not a valid DNS [`hickory_proto::rr::Name`]
+    /// or binary serialization fails.
+    pub fn encode_hickory_dns_response_packet(
+        &self,
+        tx_id: u16,
+        qtype: DnsRecordType,
+        qname: &str,
+    ) -> ArbiterResult<Vec<u8>> {
+        use core::str::FromStr as _;
+        use hickory_proto::serialize::binary::BinEncodable as _;
+        let name = hickory_proto::rr::Name::from_str(qname)?;
+        let rr_type = match qtype {
+            DnsRecordType::A => hickory_proto::rr::RecordType::A,
+            DnsRecordType::Aaaa => hickory_proto::rr::RecordType::AAAA,
+            DnsRecordType::Srv => hickory_proto::rr::RecordType::SRV,
+        };
+        let normalized = qname.trim_end_matches('.');
+        let rec_opt = self.records.get(normalized);
+
+        let mut msg = hickory_proto::op::Message::new(
+            tx_id,
+            hickory_proto::op::MessageType::Response,
+            hickory_proto::op::OpCode::Query,
+        );
+        msg.metadata.authoritative = true;
+        msg.metadata.response_code = if rec_opt.is_some() {
+            hickory_proto::op::ResponseCode::NoError
+        } else {
+            hickory_proto::op::ResponseCode::NXDomain
+        };
+        msg.add_query(hickory_proto::op::Query::query(name.clone(), rr_type));
+
+        if let Some(rec) = rec_opt {
+            let ipv4 = rec
+                .ip_address
+                .parse::<std::net::Ipv4Addr>()
+                .unwrap_or(std::net::Ipv4Addr::LOCALHOST);
+            let rdata = match qtype {
+                DnsRecordType::A => hickory_proto::rr::RData::A(hickory_proto::rr::rdata::A(ipv4)),
+                DnsRecordType::Aaaa => hickory_proto::rr::RData::AAAA(
+                    hickory_proto::rr::rdata::AAAA(ipv4.to_ipv6_mapped()),
+                ),
+                DnsRecordType::Srv => hickory_proto::rr::RData::SRV(
+                    hickory_proto::rr::rdata::SRV::new(10, 100, rec.port.get(), name.clone()),
+                ),
+            };
+            msg.add_answer(hickory_proto::rr::Record::from_rdata(name, 0, rdata));
+        }
+        Ok(msg.to_bytes()?)
+    }
+
+    /// Decodes a binary DNS response packet using the official `hickory-proto` crate
+    /// (`hickory_proto::op::Message::from_bytes`).
+    ///
+    /// # Arguments
+    ///
+    /// * `packet` - Raw DNS wire bytes.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(tx_id, rcode_u8, qname, qtype, answer_count)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::HickoryDns`] if `hickory_proto::op::Message::from_bytes` fails.
+    pub fn decode_hickory_dns_response_packet(
+        packet: &[u8],
+    ) -> ArbiterResult<(u16, u8, String, DnsRecordType, usize)> {
+        use hickory_proto::serialize::binary::BinDecodable as _;
+        let msg = hickory_proto::op::Message::from_bytes(packet).map_err(|e| {
+            arbiter_core::error::HickoryDnsError::new("hickory-dns", &e.to_string())
+        })?;
+        let tx_id = msg.metadata.id;
+        let rcode = msg.metadata.response_code.low();
+        let q = msg.queries.first();
+        let qname = q
+            .map(|query| query.name().to_utf8().trim_end_matches('.').to_owned())
+            .unwrap_or_default();
+        let qtype = match q.map(hickory_proto::op::Query::query_type) {
+            Some(hickory_proto::rr::RecordType::AAAA) => DnsRecordType::Aaaa,
+            Some(hickory_proto::rr::RecordType::SRV) => DnsRecordType::Srv,
+            _ => DnsRecordType::A,
+        };
+        Ok((tx_id, rcode, qname, qtype, msg.answers.len()))
+    }
+}
+
+/// Persistent non-blocking UDP and TCP DNS/SRV responder (`PersistentDnsServer`) serving
+/// `*.arbiter.internal` queries (`A`, `AAAA`, `SRV`) continuously inside the Master/Agent event loop.
+#[derive(Debug)]
+pub struct PersistentDnsServer {
+    /// Bound non-blocking UDP DNS socket.
+    pub udp_socket: std::net::UdpSocket,
+    /// Bound non-blocking TCP DNS listener.
+    pub tcp_listener: std::net::TcpListener,
+    /// Bound UDP local address string.
+    pub udp_local_addr: String,
+    /// Bound TCP local address string.
+    pub tcp_local_addr: String,
+    /// Backing [`ServiceDiscoveryRegistry`].
+    pub registry: ServiceDiscoveryRegistry,
+}
+
+impl PersistentDnsServer {
+    /// Binds non-blocking UDP and TCP DNS listeners at `bind_addr` (`"127.0.0.1:0"`).
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - Socket address to bind for both UDP and TCP DNS responders.
+    /// * `registry` - Initial [`ServiceDiscoveryRegistry`].
+    ///
+    /// # Returns
+    ///
+    /// Bound [`PersistentDnsServer`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketBindError`] if binding the UDP or TCP socket fails.
+    pub fn bind(bind_addr: &str, registry: ServiceDiscoveryRegistry) -> ArbiterResult<Self> {
+        let udp_socket =
+            std::net::UdpSocket::bind(bind_addr).map_err(|err| ArbiterError::SocketBindError {
+                endpoint: bind_addr.to_owned(),
+                reason: err.to_string(),
+            })?;
+        let _ = udp_socket.set_read_timeout(Some(std::time::Duration::from_millis(15)));
+        let udp_local_addr = udp_socket
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+
+        let tcp_listener = std::net::TcpListener::bind(bind_addr)
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+        let _ = tcp_listener.set_nonblocking(true);
+        let tcp_local_addr = tcp_listener
+            .local_addr()
+            .map(|a| a.to_string())
+            .unwrap_or_default();
+
+        Ok(Self {
+            udp_socket,
+            tcp_listener,
+            udp_local_addr,
+            tcp_local_addr,
+            registry,
+        })
+    }
+
+    /// Polls both the non-blocking UDP socket and TCP listener once, answering any pending
+    /// RFC 1035 DNS queries (`encode_rfc1035_dns_packet`).
+    ///
+    /// # Returns
+    ///
+    /// Number of DNS queries answered during this poll cycle (`0`, `1`, or `2`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::DnsProtocolError`] if a received query packet is malformed.
+    pub fn poll_once(&self) -> ArbiterResult<usize> {
+        use std::io::{Read, Write};
+
+        let mut answered = 0_usize;
+        let mut udp_buf = [0_u8; 1024];
+        if let Ok((n, peer)) = self.udp_socket.recv_from(&mut udp_buf) {
+            let pkt = udp_buf.get(..n).unwrap_or(&[]);
+            let (tx_id, _, qtype, qname, _) =
+                ServiceDiscoveryRegistry::decode_rfc1035_dns_packet(pkt)?;
+            let resp = self.registry.answer_dns_query(&qname, qtype);
+            let wire = ServiceDiscoveryRegistry::encode_rfc1035_dns_packet(
+                tx_id,
+                true,
+                qtype,
+                &qname,
+                Some(&resp),
+            );
+            let _ = self.udp_socket.send_to(&wire, peer);
+            answered = answered.saturating_add(1);
+        }
+
+        if let Ok((mut stream, _)) = self.tcp_listener.accept() {
+            let _ = stream.set_nonblocking(false);
+            let _ = stream.set_read_timeout(Some(std::time::Duration::from_millis(250)));
+            let mut tcp_buf = [0_u8; 1024];
+            let n = stream.read(&mut tcp_buf).unwrap_or(0);
+            let pkt = tcp_buf.get(..n).unwrap_or(&[]);
+            let (tx_id, _, qtype, qname, _) =
+                ServiceDiscoveryRegistry::decode_rfc1035_dns_packet(pkt)?;
+            let resp = self.registry.answer_dns_query(&qname, qtype);
+            let wire = ServiceDiscoveryRegistry::encode_rfc1035_dns_packet(
+                tx_id,
+                true,
+                qtype,
+                &qname,
+                Some(&resp),
+            );
+            let _ = stream.write_all(&wire);
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            answered = answered.saturating_add(1);
+        }
+
+        Ok(answered)
+    }
 }
 
 /// Trait abstracting active TCP, HTTP, and QUIC readiness/liveness network probers.
@@ -1486,6 +1703,75 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn test_hickory_proto_dns_response_codec() {
+        let mut dns = ServiceDiscoveryRegistry::new();
+        let role = RoleName::new("prod").unwrap_or_default();
+        let _ = dns.register_endpoint(
+            &TaskId::new("db-0").unwrap_or_default(),
+            "pg",
+            &role,
+            "10.1.0.9".to_owned(),
+            PortNumber::new(5432).unwrap_or_default(),
+        );
+        for qt in [DnsRecordType::A, DnsRecordType::Aaaa, DnsRecordType::Srv] {
+            let hickory_pkt = dns
+                .encode_hickory_dns_response_packet(77, qt, "db-0.pg.prod.arbiter.internal.")
+                .unwrap_or_default();
+            assert_eq!(
+                ServiceDiscoveryRegistry::decode_hickory_dns_response_packet(&hickory_pkt),
+                Ok((77, 0, "db-0.pg.prod.arbiter.internal".to_owned(), qt, 1))
+            );
+        }
+        let hickory_nx = dns
+            .encode_hickory_dns_response_packet(88, DnsRecordType::A, "missing.arbiter.internal")
+            .unwrap_or_default();
+        assert_eq!(
+            ServiceDiscoveryRegistry::decode_hickory_dns_response_packet(&hickory_nx),
+            Ok((
+                88,
+                3,
+                "missing.arbiter.internal".to_owned(),
+                DnsRecordType::A,
+                0
+            ))
+        );
+        assert!(
+            dns.encode_hickory_dns_response_packet(1, DnsRecordType::A, "bad..label")
+                .is_err()
+        );
+        assert!(ServiceDiscoveryRegistry::decode_hickory_dns_response_packet(&[0, 1]).is_err());
+    }
+
+    #[test]
+    fn test_persistent_dns_server() {
+        let dns = ServiceDiscoveryRegistry::new();
+        assert!(PersistentDnsServer::bind("invalid-addr", dns.clone()).is_err());
+        let srv_res = PersistentDnsServer::bind("127.0.0.1:0", dns).map(|srv| {
+            assert_eq!(srv.poll_once(), Ok(0));
+
+            let q_pkt = ServiceDiscoveryRegistry::encode_rfc1035_dns_packet(
+                99,
+                false,
+                DnsRecordType::A,
+                "db-0.pg.prod.arbiter.internal",
+                None,
+            );
+            let _ = std::net::UdpSocket::bind("127.0.0.1:0").map(|cli_udp| {
+                let _ = std::net::TcpStream::connect(&srv.tcp_local_addr).map(|mut s| {
+                    use std::io::Write;
+                    let _ = s.write_all(&q_pkt);
+                    let _ = s.flush();
+                    let _ = cli_udp.send_to(&q_pkt, &srv.udp_local_addr);
+                    assert!(srv.poll_once().unwrap_or(0) >= 1);
+                });
+                let _ = cli_udp.send_to(b"short", &srv.udp_local_addr);
+                assert!(srv.poll_once().is_err());
+            });
+        });
+        assert!(srv_res.is_ok());
     }
 
     #[test]

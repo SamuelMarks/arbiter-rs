@@ -1169,20 +1169,18 @@ impl CaasLocalIpcServer {
         match os_kind {
             arbiter_core::platform::OsKind::Linux => {
                 let _ = executor.execute_stonith_command("kill", &["-9", &task_str])?;
-                let _ = executor.execute_stonith_command(
-                    "nft",
-                    &[
-                        "add",
-                        "rule",
-                        "inet",
-                        "arbiter_fence",
-                        "output",
-                        "meta",
-                        "cgroup",
-                        &task_str,
-                        "drop",
-                    ],
-                )?;
+                let nft_args = [
+                    "add",
+                    "rule",
+                    "inet",
+                    "arbiter_fence",
+                    "output",
+                    "meta",
+                    "cgroup",
+                    &task_str,
+                    "drop",
+                ];
+                let _ = executor.execute_stonith_command("nft", &nft_args)?;
                 let _ = executor.execute_stonith_command("umount", &["-f", "-l", &mount_path])?;
             }
             arbiter_core::platform::OsKind::FreeBsd | arbiter_core::platform::OsKind::MacOs => {
@@ -1198,22 +1196,19 @@ impl CaasLocalIpcServer {
             }
             arbiter_core::platform::OsKind::Windows => {
                 let rule_name = format!("name=ArbiterFence_{task_str}");
-                let _ = executor.execute_stonith_command(
-                    "netsh",
-                    &[
-                        "advfirewall",
-                        "firewall",
-                        "add",
-                        "rule",
-                        &rule_name,
-                        "dir=out",
-                        "action=block",
-                    ],
-                )?;
-                let _ = executor.execute_stonith_command(
-                    "taskkill",
-                    &["/F", "/FI", &format!("WINDOWTITLE eq {task_str}")],
-                )?;
+                let netsh_args = [
+                    "advfirewall",
+                    "firewall",
+                    "add",
+                    "rule",
+                    &rule_name,
+                    "dir=out",
+                    "action=block",
+                ];
+                let _ = executor.execute_stonith_command("netsh", &netsh_args)?;
+                let filter_arg = format!("WINDOWTITLE eq {task_str}");
+                let _ =
+                    executor.execute_stonith_command("taskkill", &["/F", "/FI", &filter_arg])?;
             }
         }
         Ok(self.execute_tier1_inband_stonith(group_id, fenced_task_id, revoked_token))
@@ -2171,6 +2166,61 @@ impl PostgresCaasPromotionHook {
     }
 }
 
+/// Linux eBPF (`BPF_PROG_TYPE_CGROUP_SKB` / `BPF_PROG_TYPE_CGROUP_DEVICE`) Tier-1 fencing bytecode
+/// generator (`EbpfSocketCgroupFencingFilter`).
+///
+/// Synthesizes canonical 8-byte `bpf_insn` instructions (`BPF_MOV64_IMM(BPF_REG_0, 0)` + `BPF_EXIT_INSN()`)
+/// that immediately drop all outbound packets and block storage device access from a fenced task's cgroup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EbpfSocketCgroupFencingFilter {
+    /// Target `cgroup v2` directory path (`/sys/fs/cgroup/arbiter.slice/<task_id>`).
+    pub cgroup_path: String,
+    /// Revoked [`FencingToken`].
+    pub revoked_token: FencingToken,
+    /// Compiled 16-byte Linux eBPF instruction stream (`r0 = 0; exit`).
+    pub bpf_bytecode: [u8; 16],
+}
+
+impl EbpfSocketCgroupFencingFilter {
+    /// Compiles a 2-instruction Linux eBPF `CGROUP_SKB` egress drop filter for `cgroup_path`.
+    ///
+    /// # Arguments
+    ///
+    /// * `cgroup_path` - Target `cgroup v2` directory path.
+    /// * `revoked_token` - Revoked [`FencingToken`].
+    ///
+    /// # Returns
+    ///
+    /// Compiled [`EbpfSocketCgroupFencingFilter`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::EbpfLoader`] if `cgroup_path` is empty.
+    pub fn compile_cgroup_egress_drop(
+        cgroup_path: &str,
+        revoked_token: FencingToken,
+    ) -> ArbiterResult<Self> {
+        if cgroup_path.trim().is_empty() {
+            return Err(arbiter_core::error::EbpfLoaderError::new(
+                "cgroup_skb_egress_drop",
+                "cgroup_path must not be empty",
+            )
+            .into());
+        }
+        // Instruction 0: BPF_MOV64_IMM(BPF_REG_0, 0) -> [0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        // Instruction 1: BPF_EXIT_INSN()              -> [0x95, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        let bpf_bytecode = [
+            0xb7, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x95, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00,
+        ];
+        Ok(Self {
+            cgroup_path: cgroup_path.to_owned(),
+            revoked_token,
+            bpf_bytecode,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2957,5 +3007,18 @@ mod tests {
                 .is_err()
         );
         let _ = std::fs::remove_dir_all(&pg_dir);
+
+        assert!(EbpfSocketCgroupFencingFilter::compile_cgroup_egress_drop("  ", tok3).is_err());
+        let ebpf_prog = EbpfSocketCgroupFencingFilter::compile_cgroup_egress_drop(
+            "/sys/fs/cgroup/arbiter.slice/pg-node-1",
+            tok3,
+        )
+        .unwrap_or(EbpfSocketCgroupFencingFilter {
+            cgroup_path: String::new(),
+            revoked_token: tok3,
+            bpf_bytecode: [0; 16],
+        });
+        assert_eq!(ebpf_prog.bpf_bytecode[0], 0xb7);
+        assert_eq!(ebpf_prog.bpf_bytecode[8], 0x95);
     }
 }

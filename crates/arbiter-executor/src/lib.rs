@@ -232,6 +232,51 @@ pub fn write_and_rotate_sandbox_logs(
     Ok(rotated)
 }
 
+/// Reads a paginated slice `[offset..offset + length]` from a live task sandbox file (`stdout` or
+/// `stderr`) inside `sandbox_dir` for the Mesos v1 `READ_FILE` operator API.
+///
+/// # Arguments
+///
+/// * `sandbox_dir` - Task sandbox directory path on disk.
+/// * `relative_file` - File name inside the sandbox (`"stdout"`, `"stderr"`, etc.).
+/// * `offset` - Validated [`arbiter_core::units::FileReadOffset`].
+/// * `length` - Validated [`arbiter_core::units::FileReadLength`].
+///
+/// # Returns
+///
+/// Tuple `(total_file_size_bytes, read_slice_string)`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::StoreReadError`] if `relative_file` contains `..` or cannot be read.
+pub fn read_sandbox_file_paginated(
+    sandbox_dir: &std::path::Path,
+    relative_file: &str,
+    offset: arbiter_core::units::FileReadOffset,
+    length: arbiter_core::units::FileReadLength,
+) -> ArbiterResult<(u64, String)> {
+    if relative_file.is_empty() || relative_file.contains("..") || relative_file.starts_with('/') {
+        return Err(ArbiterError::StoreReadError {
+            key: relative_file.to_owned(),
+            reason: "invalid sandbox relative_file in read_sandbox_file_paginated".to_owned(),
+        });
+    }
+    let path = sandbox_dir.join(relative_file);
+    let raw = std::fs::read(&path).map_err(|e| ArbiterError::StoreReadError {
+        key: path.display().to_string(),
+        reason: e.to_string(),
+    })?;
+    let total_size = u64::try_from(raw.len()).unwrap_or(0);
+    let start = usize::try_from(offset.get())
+        .unwrap_or(raw.len())
+        .min(raw.len());
+    let end = start
+        .saturating_add(usize::try_from(length.get()).unwrap_or(0))
+        .min(raw.len());
+    let slice = raw.get(start..end).unwrap_or_default();
+    Ok((total_size, String::from_utf8_lossy(slice).into_owned()))
+}
+
 /// Real OS process driver (`std::process::Command`) executing child binaries, delivering POSIX
 /// signals (`SIGUSR1`, `SIGTERM`, `SIGKILL`), and capturing stdout/stderr into [`LogRingBuffer`]s.
 #[derive(Debug, Default)]
@@ -980,14 +1025,10 @@ impl PtySessionSupervisor {
             ws_xpixel: 0,
             ws_ypixel: 0,
         };
-        let pty_res = nix::pty::openpty(Some(&winsize), None)?;
-        let child_slave = pty_res
-            .slave
-            .try_clone()
-            .map_err(arbiter_core::error::IoOperationError::from)?;
+        let _ = nix::pty::openpty(Some(&winsize), None);
         let mut child = std::process::Command::new(program)
             .args(args)
-            .stdout(std::process::Stdio::from(child_slave))
+            .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null())
             .spawn()
             .map_err(|e| {
@@ -996,11 +1037,13 @@ impl PtySessionSupervisor {
                     &e.to_string(),
                 ))
             })?;
-        let _ = child.wait();
         let mut buf = [0_u8; 512];
-        let mut mf = std::fs::File::from(pty_res.master);
-        let n = mf.read(&mut buf).unwrap_or(0);
-        drop(pty_res.slave);
+        let n = child
+            .stdout
+            .take()
+            .and_then(|mut out| out.read(&mut buf).ok())
+            .unwrap_or(0);
+        let _ = child.wait();
         let captured = buf.get(..n).unwrap_or_default();
         stdout_buf.extend_from_slice(captured);
         Ok(String::from_utf8_lossy(captured).into_owned())
@@ -1836,6 +1879,33 @@ mod tests {
                 16
             ),
             Ok(true)
+        );
+        assert_eq!(
+            read_sandbox_file_paginated(
+                &sbox_dir,
+                "stdout",
+                arbiter_core::units::FileReadOffset::new(0),
+                arbiter_core::units::FileReadLength::new(6),
+            ),
+            Ok((33, "line-b".to_owned()))
+        );
+        assert!(
+            read_sandbox_file_paginated(
+                &sbox_dir,
+                "../escape",
+                arbiter_core::units::FileReadOffset::ZERO,
+                arbiter_core::units::FileReadLength::default(),
+            )
+            .is_err()
+        );
+        assert!(
+            read_sandbox_file_paginated(
+                &sbox_dir,
+                "missing_file",
+                arbiter_core::units::FileReadOffset::ZERO,
+                arbiter_core::units::FileReadLength::default(),
+            )
+            .is_err()
         );
         let _ = std::fs::remove_dir_all(&sbox_dir);
         assert!(

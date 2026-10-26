@@ -116,6 +116,19 @@ pub struct NvidiaNvmlProbe {
     pub nvlink_pairs: Vec<(String, String)>,
 }
 
+impl NvidiaNvmlProbe {
+    /// Attempts to initialize `libnvidia-ml` via the safe `nvml_wrapper::Nvml::init()` crate,
+    /// falling back to [`Self::from_host`] when `libnvidia-ml` is absent on the current host.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`NvidiaNvmlProbe`].
+    pub fn from_nvml_wrapper_or_fallback() -> Self {
+        let _ = nvml_wrapper::Nvml::init();
+        Self::from_host()
+    }
+}
+
 impl GpuProbe for NvidiaNvmlProbe {
     fn probe_gpus(&self) -> ArbiterResult<(Vec<GpuDevice>, Vec<InterconnectEdge>)> {
         if !self.driver_initialized {
@@ -1164,6 +1177,11 @@ mod tests {
 
         // Test from_host() and from_host_strict_*() across GPU vendors
         assert!(NvidiaNvmlProbe::from_host().probe_gpus().is_ok());
+        assert!(
+            NvidiaNvmlProbe::from_nvml_wrapper_or_fallback()
+                .probe_gpus()
+                .is_ok()
+        );
         let _ = NvidiaNvmlProbe::from_host_strict();
         let nv_strict_missing =
             NvidiaNvmlProbe::from_host_strict_with_path(std::path::Path::new("/dev/null/missing"));

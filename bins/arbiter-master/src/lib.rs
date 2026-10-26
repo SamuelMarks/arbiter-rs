@@ -418,12 +418,44 @@ impl MasterCliConfig {
                 let store = arbiter_store::external::PostgresStore::new("arbiter_kv", drv);
                 self.run_daemon_loop_with_store(store, signal_source)
             }
+            "zookeeper" => {
+                let drv = arbiter_store::external::ZooKeeperJuteDriver::connect(
+                    "zk://127.0.0.1:2181/arbiter",
+                )
+                .unwrap_or_default();
+                let store = arbiter_store::external::ZooKeeperStateStore::new("/arbiter", drv);
+                self.run_daemon_loop_with_store(store, signal_source)
+            }
+            "consul" => {
+                let drv =
+                    arbiter_store::external::ConsulHttpDriver::connect("http://127.0.0.1:8500")
+                        .unwrap_or_default();
+                let store = arbiter_store::external::ConsulStateStore::new("/arbiter", drv);
+                self.run_daemon_loop_with_store(store, signal_source)
+            }
+            "sqlite" => {
+                let db_file = std::path::Path::new(&self.wal_dir).join("arbiter_master_state.db");
+                let _ = std::fs::create_dir_all(&self.wal_dir);
+                let drv =
+                    arbiter_store::external::SqliteWalDriver::open_wal(&db_file.to_string_lossy())
+                        .unwrap_or_default();
+                let store = arbiter_store::external::SqliteStateStore::new("/arbiter", drv);
+                self.run_daemon_loop_with_store(store, signal_source)
+            }
             "raft" => {
                 let node_id = format!("raft-node-{}", self.raft_node_id);
                 let mut raft =
                     arbiter_store::raft::RaftStateStore::new(&node_id, vec![node_id.clone()])
                         .unwrap_or_default();
-                raft.start_election(10_000);
+                let _ = std::fs::create_dir_all(&self.wal_dir);
+                let redb_path = std::path::Path::new(&self.wal_dir).join("raft_wal.redb");
+                if let Ok(mut redb_wal) = arbiter_store::raft::RedbWalBackend::open(&redb_path) {
+                    let _ = raft.recover_from_wal_backend(&redb_wal);
+                    raft.start_election(10_000);
+                    let _ = raft.persist_to_wal_backend(&mut redb_wal);
+                } else {
+                    raft.start_election(10_000);
+                }
                 self.run_daemon_loop_with_store(raft, signal_source)
             }
             _ => {
@@ -686,9 +718,25 @@ impl<S: arbiter_store::traits::StateStore> PersistentMasterNetworkDaemon<S> {
             .map(|a| a.to_string())
             .unwrap_or_default();
 
+        let mut hierarchy = arbiter_core::workload::RoleHierarchy::new();
+        let prod_name = arbiter_core::ids::RoleName::new("prod").unwrap_or_default();
+        if let Ok(q) = arbiter_core::workload::Quota::new(
+            arbiter_core::ids::QuotaId::new("q-prod-default").unwrap_or_default(),
+            &prod_name,
+            arbiter_core::resources::ResourceBundle::zero(),
+            arbiter_core::resources::ResourceBundle::zero(),
+            true,
+            arbiter_core::units::WeightBasisPoints::STANDARD,
+        ) {
+            let _ = hierarchy.add_role(arbiter_core::workload::Role {
+                name: prod_name,
+                parent: None,
+                quota: q,
+            });
+        }
         let mut master = arbiter_master::MasterNode::new(
             store,
-            arbiter_core::workload::RoleHierarchy::new(),
+            hierarchy,
             cfg.agent_lease_ttl_ticks,
             cfg.offer_ttl_ticks,
         );
@@ -706,6 +754,88 @@ impl<S: arbiter_store::traits::StateStore> PersistentMasterNetworkDaemon<S> {
         })
     }
 
+    /// Transmits either a binary `ARBW` [`arbiter_proto::AgentHeartbeat`] acknowledgement frame or
+    /// a text `"MASTER_ACK:<agent_id>"` datagram back to `peer_addr`.
+    ///
+    /// # Arguments
+    ///
+    /// * `aid` - Acknowledged [`arbiter_core::ids::AgentId`].
+    /// * `peer_addr` - Peer UDP socket address.
+    /// * `is_arbw` - Whether the request arrived as a binary `ARBW` frame.
+    fn send_udp_agent_ack(
+        &self,
+        aid: arbiter_core::ids::AgentId,
+        peer_addr: std::net::SocketAddr,
+        is_arbw: bool,
+    ) {
+        if is_arbw {
+            let reply = arbiter_proto::WireEnvelope::new(
+                self.current_tick,
+                arbiter_proto::WireMessage::AgentHeartbeat(arbiter_proto::AgentHeartbeat {
+                    agent_id: aid,
+                    tick: self.current_tick,
+                    healthy_tasks: Vec::new(),
+                }),
+            );
+            if let Ok(arbw_out) = arbiter_net::quic::encode_arbiter_wire_frame(
+                arbiter_net::quic::QuicStreamKind::Control,
+                &reply,
+            ) {
+                let _ = self.udp_socket.send_to(&arbw_out, peer_addr);
+            }
+        } else {
+            let ack = format!("MASTER_ACK:{aid}");
+            let _ = self.udp_socket.send_to(ack.as_bytes(), peer_addr);
+        }
+    }
+
+    /// Dispatches a decoded `/api/v1/*` [`arbiter_proto::WireEnvelope`] against `self.master`.
+    ///
+    /// # Arguments
+    ///
+    /// * `env` - Decoded [`arbiter_proto::WireEnvelope`].
+    ///
+    /// # Returns
+    ///
+    /// Formatted HTTP response body string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if the underlying Master handler fails.
+    fn dispatch_http_api_envelope(
+        &mut self,
+        env: arbiter_proto::WireEnvelope,
+    ) -> ArbiterResult<String> {
+        match env.message {
+            arbiter_proto::WireMessage::OperatorCall(op) => self
+                .master
+                .handle_operator_call(*op, self.current_tick)
+                .map(|resp| format!("{resp:?}")),
+            arbiter_proto::WireMessage::SubmitDirectJob(job) => {
+                self.master.submit_direct_job(job);
+                Ok("JOB_SUBMITTED".to_owned())
+            }
+            arbiter_proto::WireMessage::SchedulerCall(call) => {
+                let events = self
+                    .master
+                    .handle_scheduler_call(*call, self.current_tick)?;
+                if let Some(first_ev) = events.first() {
+                    let out_env = arbiter_proto::WireEnvelope::new(
+                        self.current_tick,
+                        arbiter_proto::WireMessage::SchedulerEvent(Box::new(first_ev.clone())),
+                    );
+                    Ok(arbiter_proto::encode_recordio_frame(&out_env))
+                } else {
+                    Ok("SCHEDULER_CALL_HANDLED".to_owned())
+                }
+            }
+            arbiter_proto::WireMessage::ResourceProviderCall(rp_call) => {
+                let _ = self.master.handle_resource_provider_call(*rp_call)?;
+                Ok("RESOURCE_PROVIDER_CALL_HANDLED".to_owned())
+            }
+            _ => Ok("OPERATOR_IGNORED".to_owned()),
+        }
+    }
     /// Executes one non-blocking daemon tick: drains inbound UDP [`arbiter_proto::WireEnvelope`]
     /// frames (`RegisterAgent`, `AgentHeartbeat`, `TaskStatusUpdate`), serves any pending HTTP
     /// operator/dashboard requests, serves any pending UDP DNS discovery queries, and advances
@@ -726,17 +856,22 @@ impl<S: arbiter_store::traits::StateStore> PersistentMasterNetworkDaemon<S> {
         let mut rx_buf = [0_u8; 8192];
         while let Ok((n, peer_addr)) = self.udp_socket.recv_from(&mut rx_buf) {
             let slice = rx_buf.get(..n).unwrap_or(&[]);
-            let env = arbiter_proto::WireEnvelope::from_json_str(&String::from_utf8_lossy(slice))?;
+            let is_arbw = slice.starts_with(b"ARBW");
+            let env = if is_arbw {
+                arbiter_net::quic::decode_arbiter_wire_frame(slice).map(|(_, e)| e)?
+            } else {
+                arbiter_proto::WireEnvelope::from_json_str(&String::from_utf8_lossy(slice))?
+            };
             match env.message {
                 arbiter_proto::WireMessage::RegisterAgent(reg) => {
-                    let ack = format!("MASTER_ACK:{}", reg.agent_id);
+                    let aid = reg.agent_id.clone();
                     let _ = self.master.register_agent(*reg, self.current_tick);
-                    let _ = self.udp_socket.send_to(ack.as_bytes(), peer_addr);
+                    self.send_udp_agent_ack(aid, peer_addr, is_arbw);
                 }
                 arbiter_proto::WireMessage::AgentHeartbeat(hb) => {
-                    let ack = format!("MASTER_ACK:{}", hb.agent_id);
+                    let aid = hb.agent_id.clone();
                     let _ = self.master.process_agent_heartbeat(&hb);
-                    let _ = self.udp_socket.send_to(ack.as_bytes(), peer_addr);
+                    self.send_udp_agent_ack(aid, peer_addr, is_arbw);
                 }
                 arbiter_proto::WireMessage::TaskStatusUpdate(upd) => {
                     let _ = self.master.update_task_status(&upd);
@@ -771,24 +906,30 @@ impl<S: arbiter_store::traits::StateStore> PersistentMasterNetworkDaemon<S> {
                 .split_whitespace()
                 .nth(1)
                 .unwrap_or("/master/state");
-            let body = if path == "/api/v1/operator" {
+            let body = if matches!(
+                path,
+                "/api/v1/operator"
+                    | "/api/v1/scheduler"
+                    | "/api/v1/executor"
+                    | "/api/v1/resource_provider"
+                    | "/api/v1/jobs"
+            ) {
                 let (_, req_body) = req_str.split_once("\r\n\r\n").unwrap_or(("", ""));
-                arbiter_proto::WireEnvelope::from_json_str(req_body)
-                    .and_then(|env| match env.message {
-                        arbiter_proto::WireMessage::OperatorCall(op) => self
-                            .master
-                            .handle_operator_call(*op, self.current_tick)
-                            .map(|resp| format!("{resp:?}")),
-                        arbiter_proto::WireMessage::SubmitDirectJob(job) => {
-                            self.master.submit_direct_job(job);
-                            Ok("JOB_SUBMITTED".to_owned())
-                        }
-                        arbiter_proto::WireMessage::SchedulerCall(call) => {
-                            let _ = self.master.handle_scheduler_call(*call, self.current_tick);
-                            Ok("SCHEDULER_CALL_HANDLED".to_owned())
-                        }
-                        _ => Ok("OPERATOR_IGNORED".to_owned()),
-                    })
+                let decoded_env =
+                    arbiter_proto::WireEnvelope::from_json_str(req_body).or_else(|_| {
+                        arbiter_proto::decode_recordio_frames(req_body).map(|mut v| {
+                            v.pop().unwrap_or_else(|| {
+                                arbiter_proto::WireEnvelope::new(
+                                    0,
+                                    arbiter_proto::WireMessage::SchedulerEvent(Box::new(
+                                        arbiter_proto::SchedulerEvent::Heartbeat,
+                                    )),
+                                )
+                            })
+                        })
+                    });
+                decoded_env
+                    .and_then(|env| self.dispatch_http_api_envelope(env))
                     .unwrap_or_else(|e| e.to_string())
             } else {
                 arbiter_tui::handle_web_dashboard_request(path, &self.master, &tui_model)
@@ -922,8 +1063,21 @@ mod tests {
         assert_eq!(reloads, 1);
         assert!(report.contains("arbiter-master"));
 
-        for store_kind in ["postgres", "raft", "memory"] {
+        let wal_tmp = std::env::temp_dir().join("arbiter_master_bin_wal_test");
+        let _ = std::fs::remove_dir_all(&wal_tmp);
+        for store_kind in [
+            "postgres",
+            "zookeeper",
+            "consul",
+            "sqlite",
+            "raft",
+            "memory",
+        ] {
             let mut cfg_s = custom.clone();
+            wal_tmp
+                .to_string_lossy()
+                .into_owned()
+                .clone_into(&mut cfg_s.wal_dir);
             store_kind.clone_into(&mut cfg_s.state_store);
             let mut sig_s = BoundedTickSignalSource {
                 max_ticks: 2,
@@ -932,6 +1086,16 @@ mod tests {
             };
             assert!(cfg_s.run_daemon_loop(&mut sig_s).is_ok());
         }
+        let _ = std::fs::remove_dir_all(&wal_tmp);
+        let mut cfg_raft_ro = custom.clone();
+        "/dev/null/impossible_wal_dir".clone_into(&mut cfg_raft_ro.wal_dir);
+        "raft".clone_into(&mut cfg_raft_ro.state_store);
+        let mut sig_ro = BoundedTickSignalSource {
+            max_ticks: 1,
+            reload_at_tick: None,
+            fail_signal: false,
+        };
+        assert!(cfg_raft_ro.run_daemon_loop(&mut sig_ro).is_ok());
 
         let mut bad_sig = BoundedTickSignalSource {
             max_ticks: 1,
@@ -1019,6 +1183,18 @@ mod tests {
                     other_env.to_json_string().unwrap_or_default().as_bytes(),
                     &daemon.bound_udp_addr,
                 );
+                let arbw_reg = arbiter_net::quic::encode_arbiter_wire_frame(
+                    arbiter_net::quic::QuicStreamKind::Control,
+                    &reg_env,
+                )
+                .unwrap_or_default();
+                let arbw_hb = arbiter_net::quic::encode_arbiter_wire_frame(
+                    arbiter_net::quic::QuicStreamKind::Control,
+                    &hb_env,
+                )
+                .unwrap_or_default();
+                let _ = cli_udp.send_to(&arbw_reg, &daemon.bound_udp_addr);
+                let _ = cli_udp.send_to(&arbw_hb, &daemon.bound_udp_addr);
                 let _ = std::net::TcpStream::connect(&daemon.bound_http_addr).map(|mut s| {
                     use std::io::Write;
                     let _ = s.write_all(b"GET /master/state HTTP/1.1\r\n\r\n");
@@ -1086,8 +1262,16 @@ mod tests {
                 let sched_env = arbiter_proto::WireEnvelope::new(
                     7,
                     arbiter_proto::WireMessage::SchedulerCall(Box::new(
-                        arbiter_proto::SchedulerCall::Teardown(
-                            arbiter_core::ids::FrameworkId::new("fw-none").unwrap_or_default(),
+                        arbiter_proto::SchedulerCall::Subscribe(
+                            arbiter_proto::SubscribeFramework {
+                                framework_id: arbiter_core::ids::FrameworkId::new("fw-sub-1")
+                                    .unwrap_or_default(),
+                                role: arbiter_core::ids::RoleName::new("prod").unwrap_or_default(),
+                                failover_timeout_ms: 1000,
+                            },
+                            arbiter_core::workload::CheckpointMode::Enabled,
+                            Vec::new(),
+                            Vec::new(),
                         ),
                     )),
                 );
@@ -1114,9 +1298,57 @@ mod tests {
                     let _ =
                         s.write_all(b"POST /api/v1/operator HTTP/1.1\r\n\r\n{bad_operator_json");
                 });
+                let revive_env = arbiter_proto::WireEnvelope::new(
+                    8,
+                    arbiter_proto::WireMessage::SchedulerCall(Box::new(
+                        arbiter_proto::SchedulerCall::Revive(
+                            arbiter_core::ids::FrameworkId::new("fw-sub-1").unwrap_or_default(),
+                            vec![arbiter_core::ids::RoleName::new("prod").unwrap_or_default()],
+                        ),
+                    )),
+                );
+                let sub_recordio = arbiter_proto::encode_recordio_frame(&revive_env);
+                let _ = std::net::TcpStream::connect(&daemon.bound_http_addr).map(|mut s| {
+                    use std::io::Write;
+                    let req = format!(
+                        "POST /api/v1/scheduler HTTP/1.1\r\nContent-Length: {}\r\n\r\n{sub_recordio}",
+                        sub_recordio.len()
+                    );
+                    let _ = s.write_all(req.as_bytes());
+                });
+                let rp_env = arbiter_proto::WireEnvelope::new(
+                    9,
+                    arbiter_proto::WireMessage::ResourceProviderCall(Box::new(
+                        arbiter_proto::ResourceProviderCall::Subscribe(
+                            arbiter_core::workload::ResourceProviderInfo {
+                                provider_id: arbiter_core::ids::ResourceProviderId::new("rp-sub-1")
+                                    .unwrap_or_default(),
+                                agent_id: None,
+                                provider_type: "org.apache.mesos.rp.local.storage".to_owned(),
+                                provider_name: "csi-lvm".to_owned(),
+                                default_role: arbiter_core::ids::RoleName::new("prod")
+                                    .unwrap_or_default(),
+                                advertised_disks: Vec::new(),
+                            },
+                        ),
+                    )),
+                );
+                let rp_json = rp_env.to_json_string().unwrap_or_default();
+                let _ = std::net::TcpStream::connect(&daemon.bound_http_addr).map(|mut s| {
+                    use std::io::Write;
+                    let req = format!(
+                        "POST /api/v1/resource_provider HTTP/1.1\r\nContent-Length: {}\r\n\r\n{rp_json}",
+                        rp_json.len()
+                    );
+                    let _ = s.write_all(req.as_bytes());
+                });
+                let _ = std::net::TcpStream::connect(&daemon.bound_http_addr).map(|mut s| {
+                    use std::io::Write;
+                    let _ = s.write_all(b"POST /api/v1/scheduler HTTP/1.1\r\n\r\n");
+                });
                 let (u_cnt, h_cnt) = daemon.poll_network_and_tick().unwrap_or_default();
-                assert_eq!(u_cnt, 4);
-                assert_eq!(h_cnt, 7);
+                assert_eq!(u_cnt, 6);
+                assert_eq!(h_cnt, 10);
                 assert_eq!(daemon.master.agents.len(), 1);
             });
         });
@@ -1128,6 +1360,8 @@ mod tests {
                 .set_read_timeout(Some(std::time::Duration::from_millis(50)));
             let _ = std::net::UdpSocket::bind("127.0.0.1:0").map(|bad_udp| {
                 let _ = bad_udp.send_to(b"{bad_json", &err_daemon.bound_udp_addr);
+                assert!(err_daemon.poll_network_and_tick().is_err());
+                let _ = bad_udp.send_to(b"ARBW_corrupt", &err_daemon.bound_udp_addr);
                 assert!(err_daemon.poll_network_and_tick().is_err());
             });
         });

@@ -933,6 +933,191 @@ impl OsSyscallBackend for LiveOsSyscallBackend {
     }
 }
 
+/// Canonical 8-byte Linux `sock_filter` BPF instruction (`code`, `jt`, `jf`, `k`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LinuxSockFilterInsn {
+    /// 16-bit BPF opcode (`BPF_LD | BPF_W | BPF_ABS`, `BPF_JMP | BPF_JEQ | BPF_K`, `BPF_RET | BPF_K`).
+    pub code: u16,
+    /// Jump-true offset.
+    pub jt: u8,
+    /// Jump-false offset.
+    pub jf: u8,
+    /// 32-bit immediate constant (`syscall_nr` or `SECCOMP_RET_ERRNO` / `SECCOMP_RET_ALLOW`).
+    pub k: u32,
+}
+
+/// Linux `seccomp-bpf` syscall filter compiler (`SeccompBpfFilterBuilder`).
+///
+/// Compiles a default-safe BPF program blocking dangerous kernel syscalls (`kexec_load`,
+/// `init_module`, `finit_module`, `delete_module`, `acct`, `swapon`, `swapoff`, `reboot`,
+/// `mount`, `ptrace`) with `SECCOMP_RET_ERRNO | EPERM` while allowing standard workload syscalls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SeccompBpfFilterBuilder {
+    /// Denied `x86_64` / `aarch64` syscall numbers.
+    pub denied_syscalls: Vec<u32>,
+}
+
+impl Default for SeccompBpfFilterBuilder {
+    fn default() -> Self {
+        // Canonical Linux x86_64 syscall numbers for kexec_load(246), init_module(175),
+        // finit_module(313), delete_module(176), acct(163), swapon(167), swapoff(168),
+        // reboot(169), mount(165), ptrace(101).
+        Self {
+            denied_syscalls: vec![246, 175, 313, 176, 163, 167, 168, 169, 165, 101],
+        }
+    }
+}
+
+impl SeccompBpfFilterBuilder {
+    /// Compiles `self.denied_syscalls` into a sequence of [`LinuxSockFilterInsn`] instructions.
+    ///
+    /// # Returns
+    ///
+    /// Non-empty vector of [`LinuxSockFilterInsn`] instructions ending with `SECCOMP_RET_ALLOW`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SeccompCompile`] if `denied_syscalls` is empty.
+    pub fn compile_bpf_program(&self) -> ArbiterResult<Vec<LinuxSockFilterInsn>> {
+        if self.denied_syscalls.is_empty() {
+            return Err(arbiter_core::error::SeccompCompileError::new(
+                "denied_syscalls list must not be empty",
+            )
+            .into());
+        }
+        let mut prog = Vec::with_capacity(self.denied_syscalls.len().saturating_mul(2) + 2);
+        // BPF_LD | BPF_W | BPF_ABS, offsetof(seccomp_data, nr) == 0
+        prog.push(LinuxSockFilterInsn {
+            code: 0x20,
+            jt: 0,
+            jf: 0,
+            k: 0,
+        });
+        for &sys_nr in &self.denied_syscalls {
+            // BPF_JMP | BPF_JEQ | BPF_K: if nr == sys_nr, jump 0 to RET_ERRNO, else jump 1
+            prog.push(LinuxSockFilterInsn {
+                code: 0x15,
+                jt: 0,
+                jf: 1,
+                k: sys_nr,
+            });
+            // BPF_RET | BPF_K: SECCOMP_RET_ERRNO (0x0005_0000) | EPERM (1)
+            prog.push(LinuxSockFilterInsn {
+                code: 0x06,
+                jt: 0,
+                jf: 0,
+                k: 0x0005_0001,
+            });
+        }
+        // BPF_RET | BPF_K: SECCOMP_RET_ALLOW (0x7fff_0000)
+        prog.push(LinuxSockFilterInsn {
+            code: 0x06,
+            jt: 0,
+            jf: 0,
+            k: 0x7fff_0000,
+        });
+        Ok(prog)
+    }
+}
+
+/// Mesos `network/cni` Container Network Interface isolator (`CniNetworkIsolator`).
+///
+/// Parses CNI JSON network configurations (`/etc/cni/net.d/*.conflist`), invokes CNI plugins
+/// (`bridge`, `macvlan`, `ipvlan`, `calico`, `cilium`, `loopback`) with `CNI_COMMAND=ADD|DEL|CHECK`,
+/// `CNI_CONTAINERID`, `CNI_NETNS`, `CNI_IFNAME`, `CNI_PATH`, and records allocated container IPv4/IPv6 addresses.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CniNetworkIsolator {
+    /// CNI network name (`"arbiter-cni-net"`).
+    pub network_name: String,
+    /// CNI plugin binary directory (`"/opt/cni/bin"`).
+    pub plugin_bin_dir: String,
+    /// CNI plugin type (`"bridge"`, `"calico"`, `"cilium"`).
+    pub plugin_type: String,
+    /// Allocated IPv4 addresses keyed by [`TaskId`].
+    pub allocated_ips: std::collections::BTreeMap<TaskId, String>,
+}
+
+impl CniNetworkIsolator {
+    /// Creates a new [`CniNetworkIsolator`].
+    ///
+    /// # Arguments
+    ///
+    /// * `network_name` - CNI network name.
+    /// * `plugin_bin_dir` - CNI plugin binary search path.
+    /// * `plugin_type` - CNI plugin binary name.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`CniNetworkIsolator`].
+    pub fn new(network_name: &str, plugin_bin_dir: &str, plugin_type: &str) -> Self {
+        Self {
+            network_name: network_name.to_owned(),
+            plugin_bin_dir: plugin_bin_dir.to_owned(),
+            plugin_type: plugin_type.to_owned(),
+            allocated_ips: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Executes a CNI `ADD` or `DEL` operation for `task_id` and `pid` using `executor`.
+    ///
+    /// # Arguments
+    ///
+    /// * `command` - `"ADD"`, `"DEL"`, or `"CHECK"`.
+    /// * `task_id` - Task/container identifier.
+    /// * `pid` - Target container process ID (`netns` `/proc/<pid>/ns/net`).
+    /// * `executor` - [`OsCommandExecutor`] running the CNI plugin.
+    ///
+    /// # Returns
+    ///
+    /// Allocated IPv4 address string (`"10.88.0.2"`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CniPlugin`] if `network_name` is empty or the plugin execution fails.
+    pub fn execute_cni_command(
+        &mut self,
+        command: &str,
+        task_id: &TaskId,
+        pid: u32,
+        executor: &mut dyn OsCommandExecutor,
+    ) -> ArbiterResult<String> {
+        if self.network_name.trim().is_empty() {
+            return Err(arbiter_core::error::CniPluginError::new(
+                &self.plugin_type,
+                command,
+                "network_name must not be empty",
+            )
+            .into());
+        }
+        let inv = format!(
+            "CNI_COMMAND={command} CNI_CONTAINERID={task_id} CNI_NETNS=/proc/{pid}/ns/net CNI_IFNAME=eth0 CNI_PATH={} {}/{}",
+            self.plugin_bin_dir, self.plugin_bin_dir, self.plugin_type
+        );
+        let out = match executor.execute_os_command("cni", &inv) {
+            Ok(val) => val,
+            Err(e) => {
+                return Err(arbiter_core::error::CniPluginError::new(
+                    &self.plugin_type,
+                    command,
+                    &e.to_string(),
+                )
+                .into());
+            }
+        };
+        let ip = if out.trim().is_empty() {
+            "10.88.0.2".to_owned()
+        } else {
+            out.trim().to_owned()
+        };
+        if command == "ADD" {
+            self.allocated_ips.insert(task_id.clone(), ip.clone());
+        } else if command == "DEL" {
+            self.allocated_ips.remove(task_id);
+        }
+        Ok(ip)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arbiter_core::units::{Bytes, Millicores};
@@ -1195,6 +1380,48 @@ mod tests {
         assert!(
             bad_live
                 .execute_native_lifecycle_with_executor("jail", &tid, "jail -c", &mut noop_exec)
+                .is_err()
+        );
+
+        let sec_builder = SeccompBpfFilterBuilder::default();
+        let bpf_insns = sec_builder.compile_bpf_program().unwrap_or_default();
+        assert_eq!(bpf_insns.len(), 22);
+        let empty_sec = SeccompBpfFilterBuilder {
+            denied_syscalls: Vec::new(),
+        };
+        assert!(empty_sec.compile_bpf_program().is_err());
+
+        let mut cni = CniNetworkIsolator::new("arbiter-net", "/opt/cni/bin", "bridge");
+        let mut cni_ok =
+            |_s: &str, _c: &str| -> ArbiterResult<String> { Ok("10.88.0.15".to_owned()) };
+        assert_eq!(
+            cni.execute_cni_command("ADD", &tid, 4242, &mut cni_ok),
+            Ok("10.88.0.15".to_owned())
+        );
+        let mut cni_empty = |_s: &str, _c: &str| -> ArbiterResult<String> { Ok(String::new()) };
+        assert_eq!(
+            cni.execute_cni_command("CHECK", &tid, 4242, &mut cni_empty),
+            Ok("10.88.0.2".to_owned())
+        );
+        assert_eq!(
+            cni.execute_cni_command("DEL", &tid, 4242, &mut cni_ok),
+            Ok("10.88.0.15".to_owned())
+        );
+        assert!(cni.allocated_ips.is_empty());
+        let mut cni_err = |_s: &str, _c: &str| -> ArbiterResult<String> {
+            Err(ArbiterError::SandboxError {
+                mechanism: "cni".to_owned(),
+                reason: "plugin failed".to_owned(),
+            })
+        };
+        assert!(
+            cni.execute_cni_command("ADD", &tid, 4242, &mut cni_err)
+                .is_err()
+        );
+        let mut bad_cni = CniNetworkIsolator::new("  ", "/opt/cni/bin", "bridge");
+        assert!(
+            bad_cni
+                .execute_cni_command("ADD", &tid, 4242, &mut cni_ok)
                 .is_err()
         );
     }

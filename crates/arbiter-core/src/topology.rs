@@ -323,10 +323,38 @@ impl HardwareTopologyGraph {
         &self.edges
     }
 
+    /// Builds a `petgraph::graph::DiGraph` representation of this hardware topology graph
+    /// along with a lookup table mapping each [`DeviceId`] to its `petgraph::graph::NodeIndex`.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(DiGraph<DeviceId, InterconnectEdge>, BTreeMap<DeviceId, NodeIndex>)`.
+    pub fn to_petgraph(
+        &self,
+    ) -> (
+        petgraph::graph::DiGraph<DeviceId, InterconnectEdge>,
+        BTreeMap<DeviceId, petgraph::graph::NodeIndex>,
+    ) {
+        let mut pg = petgraph::graph::DiGraph::with_capacity(self.nodes.len(), self.edges.len());
+        let mut idx_map = BTreeMap::new();
+        for id in self.nodes.keys() {
+            let idx = pg.add_node(id.clone());
+            idx_map.insert(id.clone(), idx);
+        }
+        for edge in &self.edges {
+            if let (Some(&src_idx), Some(&dst_idx)) =
+                (idx_map.get(&edge.source), idx_map.get(&edge.target))
+            {
+                pg.add_edge(src_idx, dst_idx, edge.clone());
+            }
+        }
+        (pg, idx_map)
+    }
+
     /// Validates that the directed graph is a strict Directed Acyclic Graph (DAG) when hierarchical
     /// containment is required (e.g., `Socket -> Numa -> PcieRootComplex -> PcieSwitch -> Device`).
     ///
-    /// Uses Kahn's topological sort algorithm.
+    /// Uses `petgraph::algo::is_cyclic_directed` to detect directed cycles.
     ///
     /// # Returns
     ///
@@ -336,35 +364,105 @@ impl HardwareTopologyGraph {
     ///
     /// Returns [`ArbiterError::InvalidTopologyGraph`] if a directed cycle is detected.
     pub fn validate_dag(&self) -> ArbiterResult<()> {
-        let mut in_degree: BTreeMap<&DeviceId, usize> =
-            self.nodes.keys().map(|id| (id, 0_usize)).collect();
-        for edge in &self.edges {
-            *in_degree.entry(&edge.target).or_insert(0) += 1;
-        }
-        let mut queue: VecDeque<&DeviceId> = in_degree
-            .iter()
-            .filter_map(|(&id, &deg)| if deg == 0 { Some(id) } else { None })
-            .collect();
-
-        let mut visited_count = 0_usize;
-        while let Some(current) = queue.pop_front() {
-            visited_count += 1;
-            for edge in &self.edges {
-                if &edge.source == current {
-                    let deg = in_degree.entry(&edge.target).or_insert(1);
-                    *deg = deg.saturating_sub(1);
-                    if *deg == 0 {
-                        queue.push_back(&edge.target);
-                    }
-                }
-            }
-        }
-        if visited_count != self.nodes.len() {
+        let (pg, _) = self.to_petgraph();
+        if petgraph::algo::is_cyclic_directed(&pg) {
             return Err(ArbiterError::InvalidTopologyGraph {
                 reason: "cycle detected in directed topology graph".to_owned(),
             });
         }
         Ok(())
+    }
+
+    /// Computes the minimum cumulative hop latency in nanoseconds between `source` and `target`
+    /// using `petgraph::algo::dijkstra`.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - Starting [`DeviceId`].
+    /// * `target` - Destination [`DeviceId`].
+    ///
+    /// # Returns
+    ///
+    /// Minimum cumulative [`LatencyNanoseconds`] from `source` to `target`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::DeviceNotFound`] if `source` or `target` is not in the graph, or
+    /// [`ArbiterError::IncompatibleInterconnect`] if `target` is unreachable from `source`.
+    pub fn shortest_latency_nanoseconds(
+        &self,
+        source: &DeviceId,
+        target: &DeviceId,
+    ) -> ArbiterResult<LatencyNanoseconds> {
+        let (pg, idx_map) = self.to_petgraph();
+        let &src_idx = idx_map
+            .get(source)
+            .ok_or_else(|| ArbiterError::DeviceNotFound {
+                device_id: source.to_string(),
+            })?;
+        let &dst_idx = idx_map
+            .get(target)
+            .ok_or_else(|| ArbiterError::DeviceNotFound {
+                device_id: target.to_string(),
+            })?;
+        let costs =
+            petgraph::algo::dijkstra(&pg, src_idx, Some(dst_idx), |e| e.weight().latency.get());
+        costs
+            .get(&dst_idx)
+            .copied()
+            .map(LatencyNanoseconds::new)
+            .ok_or_else(|| ArbiterError::IncompatibleInterconnect {
+                interconnect: "dijkstra".to_owned(),
+                source_node: source.to_string(),
+                target_node: target.to_string(),
+            })
+    }
+
+    /// Discovers strongly connected hardware islands (e.g., `NVLink` cliques, `xGMI` rings, or
+    /// `TPU ICI` sub-tori) using `petgraph::algo::tarjan_scc`.
+    ///
+    /// # Arguments
+    ///
+    /// * `kind_filter` - Optional [`InterconnectKind`] filter; when `Some(kind)`, only edges matching
+    ///   `kind` are traversed.
+    ///
+    /// # Returns
+    ///
+    /// Vector of strongly connected component node groups (each sorted by [`DeviceId`]).
+    pub fn discover_interconnect_islands(
+        &self,
+        kind_filter: Option<InterconnectKind>,
+    ) -> Vec<Vec<DeviceId>> {
+        let mut pg = petgraph::graph::DiGraph::<DeviceId, ()>::with_capacity(
+            self.nodes.len(),
+            self.edges.len(),
+        );
+        let mut idx_map = BTreeMap::new();
+        for id in self.nodes.keys() {
+            let idx = pg.add_node(id.clone());
+            idx_map.insert(id.clone(), idx);
+        }
+        for edge in &self.edges {
+            if kind_filter.is_none_or(|k| edge.kind == k)
+                && let (Some(&s), Some(&t)) = (idx_map.get(&edge.source), idx_map.get(&edge.target))
+            {
+                pg.add_edge(s, t, ());
+            }
+        }
+        let sccs = petgraph::algo::tarjan_scc(&pg);
+        let mut islands: Vec<Vec<DeviceId>> = sccs
+            .into_iter()
+            .map(|comp| {
+                let mut ids: Vec<DeviceId> = comp
+                    .into_iter()
+                    .filter_map(|idx| pg.node_weight(idx).cloned())
+                    .collect();
+                ids.sort();
+                ids
+            })
+            .collect();
+        islands.sort();
+        islands
     }
 
     /// Computes the highest-affinity path between `source` and `target`.
@@ -683,7 +781,7 @@ mod tests {
         assert!(
             graph
                 .add_bidirectional_link(
-                    unknown,
+                    unknown.clone(),
                     gpu0.clone(),
                     InterconnectKind::NvLink,
                     BandwidthBps::new(100),
@@ -703,6 +801,23 @@ mod tests {
             affinity.bottleneck_bandwidth,
             BandwidthBps::new(7_200_000_000_000)
         );
+        assert_eq!(
+            graph.shortest_latency_nanoseconds(&gpu0, &gpu1),
+            Ok(LatencyNanoseconds::new(50))
+        );
+        assert!(graph.shortest_latency_nanoseconds(&unknown, &gpu0).is_err());
+        assert!(graph.shortest_latency_nanoseconds(&gpu0, &unknown).is_err());
+        assert!(
+            graph
+                .shortest_latency_nanoseconds(&gpu0, &isolated)
+                .is_err()
+        );
+
+        let nvlink_islands = graph.discover_interconnect_islands(Some(InterconnectKind::NvLink));
+        assert!(nvlink_islands.contains(&vec![gpu0, gpu1]));
+        let all_islands = graph.discover_interconnect_islands(None);
+        assert_eq!(all_islands.len(), 2);
+
         let _ = rkyv::to_bytes::<rkyv::rancor::Error>(&(graph, affinity));
     }
 }

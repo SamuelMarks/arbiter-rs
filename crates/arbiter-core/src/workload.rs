@@ -4,22 +4,26 @@
 //! gang-scheduled (`TaskGroupSpec`) workloads with strict state transition validation.
 
 use core::fmt;
+use std::collections::BTreeMap;
 
 use rkyv::{Archive, Deserialize as RkyvDeserialize, Serialize as RkyvSerialize};
 use serde::{Deserialize, Serialize};
 
 use crate::error::{ArbiterError, ArbiterResult};
 use crate::ids::{
-    AgentId, ElectionGroupId, ExecutorId, FrameworkId, MaintenanceWindowId, OfferId, OperationId,
-    QuotaId, RegionName, ResourceProviderId, RoleName, SecretId, TaskGroupId, TaskId, VolumeId,
-    ZoneName,
+    AgentId, ContainerId, ElectionGroupId, ExecutorId, ExitCode, FrameworkId, MaintenanceWindowId,
+    OfferId, OperationId, PrincipalName, QuotaId, RegionName, ResourceProviderId, RoleName,
+    SecretId, StatusUpdateUuid, TaskGroupId, TaskId, VolumeId, ZoneName,
 };
 use crate::platform::IsolationCapability;
 use crate::resources::{
     CpuResource, GpuPartition, GpuVendor, MemoryResource, NetworkResource, ResourceBundle,
     StorageResource, TpuTopologySlice,
 };
-use crate::units::{BenchmarkTicks, Bytes, PortNumber, WeightBasisPoints};
+use crate::units::{
+    BenchmarkTicks, Bytes, FailoverTimeoutMillis, PortNumber, WallClockUnixMillis,
+    WeightBasisPoints,
+};
 
 /// Resource quota policy attached to a [`Role`].
 #[derive(
@@ -1906,6 +1910,526 @@ pub enum DiskSource {
     CsiVolume(String, String),
 }
 
+/// Capabilities advertised by a Mesos v1 Framework (`FrameworkInfo::Capability::Type`).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum FrameworkCapability {
+    /// Framework can accept and launch tasks on `REVOCABLE_RESOURCES` (oversubscribed / borrowed quota).
+    RevocableResources,
+    /// Framework handles the `TASK_KILLING` intermediate state prior to `TASK_KILLED`.
+    TaskKillingState,
+    /// Framework requests and schedules `GPU_RESOURCES` (`nvidia.com/gpu`, `amd.com/gpu`, etc.).
+    GpuResources,
+    /// Framework can mount `SHARED_RESOURCES` (`SharedVolumeMode::SharedReadOnly` / `SharedReadWrite`).
+    SharedResources,
+    /// Framework is `PARTITION_AWARE` and handles `TASK_UNREACHABLE`, `TASK_GONE`, and `TASK_GONE_BY_OPERATOR`.
+    PartitionAware,
+    /// Framework subscribes to multiple scheduling roles simultaneously (`MULTI_ROLE`).
+    MultiRole,
+    /// Framework supports hierarchical `RESERVATION_REFINEMENT` stacks.
+    ReservationRefinement,
+    /// Framework can receive offers from remote fault-domain regions (`REGION_AWARE`).
+    RegionAware,
+}
+
+/// Complete Mesos v1 `FrameworkInfo` descriptor registered with the Master.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
+)]
+pub struct FrameworkInfo {
+    /// Unique Framework identifier (`FrameworkID`).
+    pub id: FrameworkId,
+    /// OS user account under which tasks and executors are launched.
+    pub user: String,
+    /// Human-readable Framework name.
+    pub name: String,
+    /// Authenticated security principal of the Framework (`PrincipalName`).
+    pub principal: PrincipalName,
+    /// Duration the Master retains tasks/state after Framework disconnection (`FailoverTimeoutMillis`).
+    pub failover_timeout: FailoverTimeoutMillis,
+    /// Whether the Agent checkpoints Framework executor pids and status updates to disk.
+    pub checkpoint: CheckpointMode,
+    /// Subscribed scheduling roles (`MULTI_ROLE` compatible).
+    pub roles: Vec<RoleName>,
+    /// Enabled [`FrameworkCapability`] flags.
+    pub capabilities: Vec<FrameworkCapability>,
+    /// Key-value metadata labels attached to the Framework.
+    pub labels: Vec<(String, String)>,
+    /// Optional external Web UI URL for operator inspection.
+    pub webui_url: Option<String>,
+    /// Per-role [`OfferFilter`] configurations active for this Framework.
+    pub offer_filters: BTreeMap<RoleName, OfferFilter>,
+}
+
+impl FrameworkInfo {
+    /// Checks whether this Framework advertises the specified [`FrameworkCapability`].
+    ///
+    /// # Arguments
+    ///
+    /// * `capability` - Capability flag to check.
+    ///
+    /// # Returns
+    ///
+    /// `true` if `capability` is present in `self.capabilities`.
+    pub fn has_capability(&self, capability: FrameworkCapability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+}
+
+/// Capabilities advertised by a Mesos v1 Agent (`AgentInfo::Capability::Type`).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum AgentCapability {
+    /// Agent supports multi-role frameworks (`MULTI_ROLE`).
+    MultiRole,
+    /// Agent supports hierarchical scheduling roles (`HIERARCHICAL_ROLE`).
+    HierarchicalRole,
+    /// Agent supports stacked reservation refinement (`RESERVATION_REFINEMENT`).
+    ReservationRefinement,
+    /// Agent hosts local CSI / storage resource providers (`RESOURCE_PROVIDER`).
+    ResourceProvider,
+    /// Agent supports growing and shrinking persistent volumes (`RESIZE_VOLUME`).
+    ResizeVolume,
+    /// Agent supports nested container hierarchies (`CONTAINERIZER_NESTED`).
+    ContainerizerNested,
+}
+
+/// Complete Mesos v1 `AgentInfo` descriptor registered with the Master.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
+)]
+pub struct AgentInfo {
+    /// Unique Agent identifier (`AgentID`).
+    pub id: AgentId,
+    /// Routable hostname or IP address of the Agent.
+    pub hostname: String,
+    /// Control-plane port number of the Agent (`PortNumber`).
+    pub port: PortNumber,
+    /// Total hardware capacity bundle advertised by the Agent.
+    pub resources: ResourceBundle,
+    /// Static key-value/scalar/range/set attributes attached to the Agent.
+    pub attributes: Vec<AgentAttribute>,
+    /// Optional fault domain (`region` and `zone`) of the Agent.
+    pub domain: Option<DomainInfo>,
+    /// Enabled [`AgentCapability`] flags.
+    pub capabilities: Vec<AgentCapability>,
+    /// Local storage [`ResourceProviderInfo`] instances hosted on this Agent.
+    pub resource_providers: Vec<ResourceProviderInfo>,
+}
+
+impl AgentInfo {
+    /// Checks whether this Agent advertises the specified [`AgentCapability`].
+    ///
+    /// # Arguments
+    ///
+    /// * `capability` - Capability flag to check.
+    ///
+    /// # Returns
+    ///
+    /// `true` if `capability` is present in `self.capabilities`.
+    pub fn has_capability(&self, capability: AgentCapability) -> bool {
+        self.capabilities.contains(&capability)
+    }
+}
+
+/// Component that originated a [`TaskStatusDetails`] update (`TaskStatus::Source`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum TaskStatusSource {
+    /// Generated by the Master (e.g., reconciliation, agent lost, invalid offers).
+    SourceMaster,
+    /// Generated by the Agent (e.g., container launch failure, cgroup OOM limitation).
+    #[default]
+    SourceAgent,
+    /// Generated by the Executor (e.g., process exit code, health check transition).
+    SourceExecutor,
+}
+
+/// Canonical Apache Mesos v1 `TaskStatus::Reason` enumeration.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum TaskStatusReason {
+    /// Built-in command executor failed (`REASON_COMMAND_EXECUTOR_FAILED`).
+    ReasonCommandExecutorFailed,
+    /// Containerizer failed to launch the container (`REASON_CONTAINER_LAUNCH_FAILED`).
+    ReasonContainerLaunchFailed,
+    /// Container exceeded its hard CPU quota (`REASON_CONTAINER_LIMITATION_CPU`).
+    ReasonContainerLimitationCpu,
+    /// Container exceeded its sandbox or volume disk quota (`REASON_CONTAINER_LIMITATION_DISK`).
+    ReasonContainerLimitationDisk,
+    /// Container triggered a cgroup/job memory OOM limitation (`REASON_CONTAINER_LIMITATION_MEMORY`).
+    ReasonContainerLimitationMemory,
+    /// Pre-launch hook, artifact fetch, or volume stage failed (`REASON_CONTAINER_PRE_LAUNCH_FAILED`).
+    ReasonContainerPreLaunchFailed,
+    /// Executor was preempted by the `QoS` or HDRF preemption controller (`REASON_EXECUTOR_PREEMPTED`).
+    ReasonExecutorPreempted,
+    /// Executor timed out during initial registration (`REASON_EXECUTOR_REGISTRATION_TIMEOUT`).
+    ReasonExecutorRegistrationTimeout,
+    /// Executor timed out during agent recovery re-registration (`REASON_EXECUTOR_REREGISTRATION_TIMEOUT`).
+    ReasonExecutorReregistrationTimeout,
+    /// Executor process terminated (`REASON_EXECUTOR_TERMINATED`).
+    ReasonExecutorTerminated,
+    /// Executor unregistered cleanly (`REASON_EXECUTOR_UNREGISTERED`).
+    ReasonExecutorUnregistered,
+    /// Owning Framework was torn down or removed (`REASON_FRAMEWORK_REMOVED`).
+    ReasonFrameworkRemoved,
+    /// Sandbox garbage collection error (`REASON_GC_ERROR`).
+    ReasonGcError,
+    /// Invalid `FrameworkID` supplied (`REASON_INVALID_FRAMEWORKID`).
+    ReasonInvalidFrameworkId,
+    /// Offer IDs were expired, rescinded, or invalid (`REASON_INVALID_OFFERS`).
+    ReasonInvalidOffers,
+    /// Container I/O switchboard process exited unexpectedly (`REASON_IO_SWITCHBOARD_EXITED`).
+    ReasonIoSwitchboardExited,
+    /// Agent disconnected from Master (`REASON_MASTER_DISCONNECTED`).
+    ReasonMasterDisconnected,
+    /// Task exceeded its configured `max_completion_time` (`REASON_MAX_COMPLETION_TIME_REACHED`).
+    ReasonMaxCompletionTimeReached,
+    /// Status update emitted in response to explicit or implicit reconciliation (`REASON_RECONCILIATION`).
+    ReasonReconciliation,
+    /// Requested resources are unknown on the Agent (`REASON_RESOURCES_UNKNOWN`).
+    ReasonResourcesUnknown,
+    /// Agent disconnected (`REASON_SLAVE_DISCONNECTED`).
+    ReasonAgentDisconnected,
+    /// Agent was removed or marked gone (`REASON_SLAVE_REMOVED`).
+    ReasonAgentRemoved,
+    /// Agent restarted without checkpointing this task (`REASON_SLAVE_RESTARTED`).
+    ReasonAgentRestarted,
+    /// Agent ID is unknown to the Master (`REASON_SLAVE_UNKNOWN`).
+    ReasonAgentUnknown,
+    /// General task check (`CheckSpec`) status updated (`REASON_TASK_CHECK_STATUS_UPDATED`).
+    ReasonTaskCheckStatusUpdated,
+    /// `TaskGroup` specification was invalid (`REASON_TASK_GROUP_INVALID`).
+    ReasonTaskGroupInvalid,
+    /// Principal is unauthorized to launch the `TaskGroup` (`REASON_TASK_GROUP_UNAUTHORIZED`).
+    ReasonTaskGroupUnauthorized,
+    /// Task health check (`HealthCheckSpec`) status updated (`REASON_TASK_HEALTH_CHECK_STATUS_UPDATED`).
+    ReasonTaskHealthCheckStatusUpdated,
+    /// Task specification failed validation (`REASON_TASK_INVALID`).
+    ReasonTaskInvalid,
+    /// Task was killed while still staging/launching (`REASON_TASK_KILLED_DURING_LAUNCH`).
+    ReasonTaskKilledDuringLaunch,
+    /// Principal is unauthorized to run the task (`REASON_TASK_UNAUTHORIZED`).
+    ReasonTaskUnauthorized,
+    /// Task ID is unknown to the Master (`REASON_TASK_UNKNOWN`).
+    ReasonTaskUnknown,
+}
+
+impl TaskStatusReason {
+    /// Returns the canonical Mesos v1 `REASON_*` string identifier for this [`TaskStatusReason`].
+    ///
+    /// # Returns
+    ///
+    /// Static Mesos v1 reason code string.
+    pub const fn as_mesos_str(self) -> &'static str {
+        match self {
+            Self::ReasonCommandExecutorFailed => "REASON_COMMAND_EXECUTOR_FAILED",
+            Self::ReasonContainerLaunchFailed => "REASON_CONTAINER_LAUNCH_FAILED",
+            Self::ReasonContainerLimitationCpu => "REASON_CONTAINER_LIMITATION_CPU",
+            Self::ReasonContainerLimitationDisk => "REASON_CONTAINER_LIMITATION_DISK",
+            Self::ReasonContainerLimitationMemory => "REASON_CONTAINER_LIMITATION_MEMORY",
+            Self::ReasonContainerPreLaunchFailed => "REASON_CONTAINER_PRE_LAUNCH_FAILED",
+            Self::ReasonExecutorPreempted => "REASON_EXECUTOR_PREEMPTED",
+            Self::ReasonExecutorRegistrationTimeout => "REASON_EXECUTOR_REGISTRATION_TIMEOUT",
+            Self::ReasonExecutorReregistrationTimeout => "REASON_EXECUTOR_REREGISTRATION_TIMEOUT",
+            Self::ReasonExecutorTerminated => "REASON_EXECUTOR_TERMINATED",
+            Self::ReasonExecutorUnregistered => "REASON_EXECUTOR_UNREGISTERED",
+            Self::ReasonFrameworkRemoved => "REASON_FRAMEWORK_REMOVED",
+            Self::ReasonGcError => "REASON_GC_ERROR",
+            Self::ReasonInvalidFrameworkId => "REASON_INVALID_FRAMEWORKID",
+            Self::ReasonInvalidOffers => "REASON_INVALID_OFFERS",
+            Self::ReasonIoSwitchboardExited => "REASON_IO_SWITCHBOARD_EXITED",
+            Self::ReasonMasterDisconnected => "REASON_MASTER_DISCONNECTED",
+            Self::ReasonMaxCompletionTimeReached => "REASON_MAX_COMPLETION_TIME_REACHED",
+            Self::ReasonReconciliation => "REASON_RECONCILIATION",
+            Self::ReasonResourcesUnknown => "REASON_RESOURCES_UNKNOWN",
+            Self::ReasonAgentDisconnected => "REASON_SLAVE_DISCONNECTED",
+            Self::ReasonAgentRemoved => "REASON_SLAVE_REMOVED",
+            Self::ReasonAgentRestarted => "REASON_SLAVE_RESTARTED",
+            Self::ReasonAgentUnknown => "REASON_SLAVE_UNKNOWN",
+            Self::ReasonTaskCheckStatusUpdated => "REASON_TASK_CHECK_STATUS_UPDATED",
+            Self::ReasonTaskGroupInvalid => "REASON_TASK_GROUP_INVALID",
+            Self::ReasonTaskGroupUnauthorized => "REASON_TASK_GROUP_UNAUTHORIZED",
+            Self::ReasonTaskHealthCheckStatusUpdated => "REASON_TASK_HEALTH_CHECK_STATUS_UPDATED",
+            Self::ReasonTaskInvalid => "REASON_TASK_INVALID",
+            Self::ReasonTaskKilledDuringLaunch => "REASON_TASK_KILLED_DURING_LAUNCH",
+            Self::ReasonTaskUnauthorized => "REASON_TASK_UNAUTHORIZED",
+            Self::ReasonTaskUnknown => "REASON_TASK_UNKNOWN",
+        }
+    }
+}
+
+/// Command check payload for [`CheckSpec::Command`] (`CheckInfo::Command`).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct CheckCommandSpec {
+    /// Command binary or shell string.
+    pub command: String,
+    /// Command-line arguments.
+    pub args: Vec<String>,
+    /// Check execution interval in milliseconds.
+    pub interval_ms: u64,
+    /// Per-invocation timeout in milliseconds.
+    pub timeout_ms: u64,
+}
+
+/// HTTP GET check payload for [`CheckSpec::Http`] (`CheckInfo::Http`).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct CheckHttpSpec {
+    /// Target TCP port (`PortNumber`).
+    pub port: PortNumber,
+    /// Request URI path (e.g., `"/readyz"`).
+    pub path: String,
+    /// Check execution interval in milliseconds.
+    pub interval_ms: u64,
+    /// Per-invocation timeout in milliseconds.
+    pub timeout_ms: u64,
+}
+
+/// TCP handshake check payload for [`CheckSpec::Tcp`] (`CheckInfo::Tcp`).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct CheckTcpSpec {
+    /// Target TCP port (`PortNumber`).
+    pub port: PortNumber,
+    /// Check execution interval in milliseconds.
+    pub interval_ms: u64,
+    /// Per-invocation timeout in milliseconds.
+    pub timeout_ms: u64,
+}
+
+/// General task check specification (`Mesos CheckInfo`, distinct from kill-triggering `HealthCheckSpec`).
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum CheckSpec {
+    /// Executes a command inside the task's mount/network namespace (`CheckInfo::Command`).
+    Command(CheckCommandSpec),
+    /// Performs an HTTP GET request against the task (`CheckInfo::Http`).
+    Http(CheckHttpSpec),
+    /// Performs a TCP 3-way handshake probe against the task (`CheckInfo::Tcp`).
+    Tcp(CheckTcpSpec),
+}
+
+/// Latest observed result of a [`CheckSpec`] (`Mesos CheckStatusInfo`).
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub enum CheckStatusInfo {
+    /// Exit status code from a `CheckSpec::Command` (`CheckStatusInfo::Command`).
+    Command(ExitCode),
+    /// HTTP status code (`u16`) from a `CheckSpec::Http` (`CheckStatusInfo::Http`).
+    Http(u16),
+    /// Whether the TCP handshake succeeded (`CheckStatusInfo::Tcp`).
+    Tcp(bool),
+}
+
+/// Enriched Mesos v1 `TaskStatus` metadata (`TaskStatusDetails`) carrying source, reason,
+/// check results, cgroup limitations, container IP/IDs, and partition timestamps.
+#[derive(
+    Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Archive, RkyvSerialize, RkyvDeserialize,
+)]
+pub struct TaskStatusDetails {
+    /// Component that generated the status update (`SourceMaster`, `SourceAgent`, `SourceExecutor`).
+    pub source: TaskStatusSource,
+    /// Optional structured [`TaskStatusReason`].
+    pub reason: Option<TaskStatusReason>,
+    /// Optional idempotency UUID requiring Framework `ACKNOWLEDGE`.
+    pub uuid: Option<StatusUpdateUuid>,
+    /// Optional latest health check state (`true` = healthy, `false` = unhealthy).
+    pub healthy: Option<bool>,
+    /// Optional latest general check result (`CheckStatusInfo`).
+    pub check_status: Option<CheckStatusInfo>,
+    /// Optional resource bundle that triggered a container limitation (`REASON_CONTAINER_LIMITATION_*`).
+    pub limitation: Option<ResourceBundle>,
+    /// Optional container ID associated with the running task.
+    pub container_id: Option<ContainerId>,
+    /// Wall-clock timestamp when the status update was generated (`WallClockUnixMillis`).
+    pub timestamp: WallClockUnixMillis,
+    /// Optional wall-clock timestamp when the hosting Agent became unreachable (`WallClockUnixMillis`).
+    pub unreachable_time: Option<WallClockUnixMillis>,
+}
+
+/// Strongly-typed Mesos v1 `WeightInfo` operator entry pairing a [`RoleName`] with its [`WeightBasisPoints`].
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct WeightInfo {
+    /// Scheduling role name.
+    pub role: RoleName,
+    /// Relative HDRF fairness weight in basis points (`WeightBasisPoints`).
+    pub weight: WeightBasisPoints,
+}
+
+/// Strongly-typed Mesos v1 `QuotaConfig` operator specification for `UPDATE_QUOTA`.
+#[derive(
+    Debug,
+    Clone,
+    PartialEq,
+    Eq,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct QuotaConfig {
+    /// Scheduling role name to which this quota applies.
+    pub role: RoleName,
+    /// Guaranteed minimum resource bundle (`guarantees`).
+    pub guarantees: ResourceBundle,
+    /// Hard maximum resource bundle (`limits`).
+    pub limits: ResourceBundle,
+    /// Whether the Master should apply the quota even if currently overcommitted (`force`).
+    pub force: bool,
+}
+
+impl QuotaConfig {
+    /// Validates and converts this [`QuotaConfig`] into a [`Quota`] policy.
+    ///
+    /// # Arguments
+    ///
+    /// * `quota_id` - Unique [`QuotaId`] for the resulting [`Quota`].
+    /// * `weight` - Role fairness weight in [`WeightBasisPoints`].
+    ///
+    /// # Returns
+    ///
+    /// Validated [`Quota`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidQuotaBounds`] if `limits` does not contain `guarantees` (unless `self.force` is true).
+    pub fn into_quota(self, quota_id: QuotaId, weight: WeightBasisPoints) -> ArbiterResult<Quota> {
+        if self.force {
+            Ok(Quota {
+                id: quota_id,
+                guaranteed_min: self.guarantees,
+                hard_max: self.limits,
+                allow_burst_borrowing: true,
+                weight,
+            })
+        } else {
+            Quota::new(
+                quota_id,
+                &self.role,
+                self.guarantees,
+                self.limits,
+                true,
+                weight,
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2741,5 +3265,213 @@ mod tests {
         assert_eq!(enriched.shared_volume_mounts().len(), 1);
         assert_eq!(enriched.kill_policy().grace_period_ticks.get(), 15);
         assert!(enriched.executor_info().is_some());
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines, clippy::items_after_statements)]
+    fn test_mesos_v1_framework_agent_info_reasons_checks_and_quota_config() {
+        let role = RoleName::new("ml-prod").unwrap_or_default();
+        let fw_info = FrameworkInfo {
+            id: FrameworkId::new("fw-mesos-1").unwrap_or_default(),
+            user: "root".to_owned(),
+            name: "PyTorch-Elastic".to_owned(),
+            principal: PrincipalName::new("spiffe://cluster.local/ns/ml/sa/trainer")
+                .unwrap_or_default(),
+            failover_timeout: FailoverTimeoutMillis::new(60_000),
+            checkpoint: CheckpointMode::Enabled,
+            roles: vec![role.clone()],
+            capabilities: vec![
+                FrameworkCapability::RevocableResources,
+                FrameworkCapability::TaskKillingState,
+                FrameworkCapability::GpuResources,
+                FrameworkCapability::SharedResources,
+                FrameworkCapability::PartitionAware,
+                FrameworkCapability::MultiRole,
+                FrameworkCapability::ReservationRefinement,
+                FrameworkCapability::RegionAware,
+            ],
+            labels: vec![("env".to_owned(), "prod".to_owned())],
+            webui_url: Some("https://fw.arbiter.internal".to_owned()),
+            offer_filters: BTreeMap::from([(role.clone(), OfferFilter::default())]),
+        };
+        assert!(fw_info.has_capability(FrameworkCapability::GpuResources));
+
+        let ag_info = AgentInfo {
+            id: AgentId::new("agent-mesos-1").unwrap_or_default(),
+            hostname: "node01.arbiter.internal".to_owned(),
+            port: PortNumber::new(5051).unwrap_or_default(),
+            resources: ResourceBundle::zero(),
+            attributes: Vec::new(),
+            domain: Some(DomainInfo::default()),
+            capabilities: vec![
+                AgentCapability::MultiRole,
+                AgentCapability::HierarchicalRole,
+                AgentCapability::ReservationRefinement,
+                AgentCapability::ResourceProvider,
+                AgentCapability::ResizeVolume,
+                AgentCapability::ContainerizerNested,
+            ],
+            resource_providers: Vec::new(),
+        };
+        assert!(ag_info.has_capability(AgentCapability::ContainerizerNested));
+
+        let all_reasons = [
+            TaskStatusReason::ReasonCommandExecutorFailed,
+            TaskStatusReason::ReasonContainerLaunchFailed,
+            TaskStatusReason::ReasonContainerLimitationCpu,
+            TaskStatusReason::ReasonContainerLimitationDisk,
+            TaskStatusReason::ReasonContainerLimitationMemory,
+            TaskStatusReason::ReasonContainerPreLaunchFailed,
+            TaskStatusReason::ReasonExecutorPreempted,
+            TaskStatusReason::ReasonExecutorRegistrationTimeout,
+            TaskStatusReason::ReasonExecutorReregistrationTimeout,
+            TaskStatusReason::ReasonExecutorTerminated,
+            TaskStatusReason::ReasonExecutorUnregistered,
+            TaskStatusReason::ReasonFrameworkRemoved,
+            TaskStatusReason::ReasonGcError,
+            TaskStatusReason::ReasonInvalidFrameworkId,
+            TaskStatusReason::ReasonInvalidOffers,
+            TaskStatusReason::ReasonIoSwitchboardExited,
+            TaskStatusReason::ReasonMasterDisconnected,
+            TaskStatusReason::ReasonMaxCompletionTimeReached,
+            TaskStatusReason::ReasonReconciliation,
+            TaskStatusReason::ReasonResourcesUnknown,
+            TaskStatusReason::ReasonAgentDisconnected,
+            TaskStatusReason::ReasonAgentRemoved,
+            TaskStatusReason::ReasonAgentRestarted,
+            TaskStatusReason::ReasonAgentUnknown,
+            TaskStatusReason::ReasonTaskCheckStatusUpdated,
+            TaskStatusReason::ReasonTaskGroupInvalid,
+            TaskStatusReason::ReasonTaskGroupUnauthorized,
+            TaskStatusReason::ReasonTaskHealthCheckStatusUpdated,
+            TaskStatusReason::ReasonTaskInvalid,
+            TaskStatusReason::ReasonTaskKilledDuringLaunch,
+            TaskStatusReason::ReasonTaskUnauthorized,
+            TaskStatusReason::ReasonTaskUnknown,
+        ];
+        for r in all_reasons {
+            assert!(r.as_mesos_str().starts_with("REASON_"));
+        }
+
+        assert_eq!(TaskStatusSource::default(), TaskStatusSource::SourceAgent);
+        let checks = vec![
+            CheckSpec::Command(CheckCommandSpec {
+                command: "/bin/true".to_owned(),
+                args: Vec::new(),
+                interval_ms: 1000,
+                timeout_ms: 500,
+            }),
+            CheckSpec::Http(CheckHttpSpec {
+                port: PortNumber::new(8080).unwrap_or_default(),
+                path: "/readyz".to_owned(),
+                interval_ms: 1000,
+                timeout_ms: 500,
+            }),
+            CheckSpec::Tcp(CheckTcpSpec {
+                port: PortNumber::new(5432).unwrap_or_default(),
+                interval_ms: 1000,
+                timeout_ms: 500,
+            }),
+        ];
+        let details = TaskStatusDetails {
+            source: TaskStatusSource::SourceExecutor,
+            reason: Some(TaskStatusReason::ReasonTaskCheckStatusUpdated),
+            uuid: Some(StatusUpdateUuid::new("uuid-1").unwrap_or_default()),
+            healthy: Some(true),
+            check_status: Some(CheckStatusInfo::Http(200)),
+            limitation: None,
+            container_id: Some(ContainerId::new("c-1").unwrap_or_default()),
+            timestamp: WallClockUnixMillis::new(1_700_000_000_000),
+            unreachable_time: None,
+        };
+        let weight_info = WeightInfo {
+            role: role.clone(),
+            weight: WeightBasisPoints::STANDARD,
+        };
+
+        let mut g_bundle = ResourceBundle::zero();
+        g_bundle.cpu = Millicores::new(4_000);
+        let mut l_bundle = ResourceBundle::zero();
+        l_bundle.cpu = Millicores::new(2_000);
+
+        let qc_unforced = QuotaConfig {
+            role: role.clone(),
+            guarantees: g_bundle.clone(),
+            limits: l_bundle.clone(),
+            force: false,
+        };
+        assert!(
+            qc_unforced
+                .into_quota(QuotaId::default(), WeightBasisPoints::STANDARD)
+                .is_err()
+        );
+
+        let qc_forced = QuotaConfig {
+            role: role.clone(),
+            guarantees: g_bundle.clone(),
+            limits: l_bundle,
+            force: true,
+        };
+        assert!(
+            qc_forced
+                .into_quota(QuotaId::default(), WeightBasisPoints::STANDARD)
+                .is_ok()
+        );
+
+        let mut ok_limits = ResourceBundle::zero();
+        ok_limits.cpu = Millicores::new(8_000);
+        let qc_valid = QuotaConfig {
+            role,
+            guarantees: g_bundle,
+            limits: ok_limits,
+            force: false,
+        };
+        let valid_quota = qc_valid
+            .clone()
+            .into_quota(QuotaId::default(), WeightBasisPoints::STANDARD);
+        assert!(valid_quota.is_ok());
+
+        let rkyv_extra = (
+            fw_info,
+            ag_info,
+            checks,
+            vec![
+                CheckStatusInfo::Command(ExitCode::SUCCESS),
+                CheckStatusInfo::Http(200),
+                CheckStatusInfo::Tcp(true),
+            ],
+            details,
+            weight_info,
+            qc_valid,
+            vec![
+                TaskStatusSource::SourceMaster,
+                TaskStatusSource::SourceAgent,
+                TaskStatusSource::SourceExecutor,
+            ],
+            all_reasons.to_vec(),
+        );
+        let extra_bytes = rkyv::to_bytes::<rkyv::rancor::Error>(&rkyv_extra).unwrap_or_default();
+        type ExtraRkyvTuple = (
+            FrameworkInfo,
+            AgentInfo,
+            Vec<CheckSpec>,
+            Vec<CheckStatusInfo>,
+            TaskStatusDetails,
+            WeightInfo,
+            QuotaConfig,
+            Vec<TaskStatusSource>,
+            Vec<TaskStatusReason>,
+        );
+        for i in 0..extra_bytes.len() {
+            let mut corrupted = extra_bytes.clone();
+            for (j, b) in corrupted.iter_mut().enumerate() {
+                if i == j {
+                    *b ^= 0xFF;
+                }
+            }
+            let _: Result<ExtraRkyvTuple, rkyv::rancor::Error> = rkyv::from_bytes(&corrupted);
+        }
+        let decoded: Result<ExtraRkyvTuple, rkyv::rancor::Error> = rkyv::from_bytes(&extra_bytes);
+        assert!(decoded.is_ok());
     }
 }

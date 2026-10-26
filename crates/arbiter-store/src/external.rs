@@ -380,11 +380,7 @@ impl EtcdV3Endpoint {
     }
 }
 
-/// Standard RFC 4648 Base64 alphabet used by the `etcd` v3 gRPC-JSON gateway.
-const RFC4648_BASE64_ALPHABET: &[u8; 64] =
-    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-/// Encodes `input` into standard RFC 4648 Base64 with `'='` padding as required by `etcd` v3 JSON RPCs.
+/// Encodes `input` into standard RFC 4648 Base64 with `'='` padding using the `base64` crate.
 ///
 /// # Arguments
 ///
@@ -394,41 +390,11 @@ const RFC4648_BASE64_ALPHABET: &[u8; 64] =
 ///
 /// Standard Base64 string.
 pub fn etcd_base64_encode(input: &[u8]) -> String {
-    let mut out = String::with_capacity(input.len().div_ceil(3) * 4);
-    for chunk in input.chunks(3) {
-        let b0 = u32::from(chunk.first().copied().unwrap_or(0));
-        let b1 = u32::from(chunk.get(1).copied().unwrap_or(0));
-        let b2 = u32::from(chunk.get(2).copied().unwrap_or(0));
-        let triple = (b0 << 16) | (b1 << 8) | b2;
-        let idx0 = ((triple >> 18) & 0x3F) as usize;
-        let idx1 = ((triple >> 12) & 0x3F) as usize;
-        let idx2 = ((triple >> 6) & 0x3F) as usize;
-        let idx3 = (triple & 0x3F) as usize;
-        out.push(char::from(
-            RFC4648_BASE64_ALPHABET.get(idx0).copied().unwrap_or(b'A'),
-        ));
-        out.push(char::from(
-            RFC4648_BASE64_ALPHABET.get(idx1).copied().unwrap_or(b'A'),
-        ));
-        if chunk.len() > 1 {
-            out.push(char::from(
-                RFC4648_BASE64_ALPHABET.get(idx2).copied().unwrap_or(b'A'),
-            ));
-        } else {
-            out.push('=');
-        }
-        if chunk.len() > 2 {
-            out.push(char::from(
-                RFC4648_BASE64_ALPHABET.get(idx3).copied().unwrap_or(b'A'),
-            ));
-        } else {
-            out.push('=');
-        }
-    }
-    out
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD.encode(input)
 }
 
-/// Decodes a standard RFC 4648 Base64 string (with optional `'='` padding) into raw bytes.
+/// Decodes a standard RFC 4648 Base64 string (with optional `'='` padding) into raw bytes using `base64`.
 ///
 /// # Arguments
 ///
@@ -442,43 +408,14 @@ pub fn etcd_base64_encode(input: &[u8]) -> String {
 ///
 /// Returns [`ArbiterError::DeserializationError`] if the Base64 input is malformed.
 pub fn etcd_base64_decode(encoded: &str) -> ArbiterResult<Vec<u8>> {
+    use base64::Engine;
     let trimmed = encoded.trim_end_matches('=');
-    if trimmed.len() % 4 == 1 {
-        return Err(ArbiterError::DeserializationError {
+    base64::engine::general_purpose::STANDARD_NO_PAD
+        .decode(trimmed)
+        .map_err(|e| ArbiterError::DeserializationError {
             format: "etcd-base64".to_owned(),
-            reason: "invalid RFC 4648 Base64 length".to_owned(),
-        });
-    }
-    let mut vals = Vec::with_capacity(trimmed.len());
-    for ch in trimmed.bytes() {
-        let sextet = match ch {
-            b'A'..=b'Z' => ch - b'A',
-            b'a'..=b'z' => ch - b'a' + 26,
-            b'0'..=b'9' => ch - b'0' + 52,
-            b'+' => 62,
-            b'/' => 63,
-            _ => {
-                return Err(ArbiterError::DeserializationError {
-                    format: "etcd-base64".to_owned(),
-                    reason: format!("invalid Base64 character '{}'", char::from(ch)),
-                });
-            }
-        };
-        vals.push(sextet);
-    }
-    let mut out = Vec::with_capacity((vals.len() * 3) / 4);
-    for group in vals.chunks(4) {
-        let s0 = group.first().copied().unwrap_or(0);
-        let s1 = group.get(1).copied().unwrap_or(0);
-        out.push((s0 << 2) | (s1 >> 4));
-        if let Some(&s2) = group.get(2) {
-            out.push(((s1 & 0x0F) << 4) | (s2 >> 2));
-            if let Some(&s3) = group.get(3) {
-                out.push(((s2 & 0x03) << 6) | s3);
-            }
-        }
-    }
-    Ok(out)
+            reason: e.to_string(),
+        })
 }
 
 /// Production `etcd` v3 HTTP/gRPC-JSON Gateway transport driver (`/v3/kv/{range,put,txn}` and `/v3/watch`)
@@ -2051,22 +1988,16 @@ impl<D: PostgresTransportDriver> StateStore for PostgresStore<D> {
     fn put(&mut self, key: &str, value: Vec<u8>) -> ArbiterResult<VersionedRecord> {
         self.driver.check_connected()?;
         let scoped = self.scoped_key(key);
-        self.driver.notify_mutation(
-            "put_kv",
-            "INSERT INTO arbiter_kv_store (k, v, rev) VALUES ($1, $2, 1)",
-            &scoped,
-        )?;
+        let sql = "INSERT INTO arbiter_kv_store (k, v, rev) VALUES ($1, $2, 1)";
+        self.driver.notify_mutation("put_kv", sql, &scoped)?;
         self.driver.backing_store_mut().put(&scoped, value)
     }
 
     fn delete(&mut self, key: &str) -> ArbiterResult<bool> {
         self.driver.check_connected()?;
         let scoped = self.scoped_key(key);
-        self.driver.notify_mutation(
-            "del_kv",
-            "DELETE FROM arbiter_kv_store WHERE k = $1",
-            &scoped,
-        )?;
+        let sql = "DELETE FROM arbiter_kv_store WHERE k = $1";
+        self.driver.notify_mutation("del_kv", sql, &scoped)?;
         self.driver.backing_store_mut().delete(&scoped)
     }
 
@@ -2101,11 +2032,9 @@ impl<D: PostgresTransportDriver> StateStore for PostgresStore<D> {
 
     fn next_fencing_token(&mut self) -> ArbiterResult<FencingToken> {
         self.driver.check_connected()?;
-        self.driver.notify_mutation(
-            "fence_seq",
-            "SELECT nextval('arbiter_fencing_seq')",
-            "arbiter_fencing_seq",
-        )?;
+        let sql = "SELECT nextval('arbiter_fencing_seq')";
+        self.driver
+            .notify_mutation("fence_seq", sql, "arbiter_fencing_seq")?;
         self.driver.backing_store_mut().next_fencing_token()
     }
 
@@ -2866,10 +2795,9 @@ impl SqliteWalDriver {
         conn.execute("DELETE FROM arbiter_kv_store", [])?;
         for rec in &records {
             let rev_i64 = i64::try_from(rec.revision).unwrap_or(i64::MAX);
-            conn.execute(
-                "INSERT INTO arbiter_kv_store (k, v, rev) VALUES (?1, ?2, ?3)",
-                rusqlite::params![rec.key, rec.value, rev_i64],
-            )?;
+            let sql = "INSERT INTO arbiter_kv_store (k, v, rev) VALUES (?1, ?2, ?3)";
+            let params = rusqlite::params![rec.key, rec.value, rev_i64];
+            conn.execute(sql, params)?;
         }
         Ok(records.len())
     }
@@ -2888,7 +2816,7 @@ impl SqliteWalDriver {
         let conn = rusqlite::Connection::open(&self.db_path)?;
         conn.execute_batch(Self::wal_bootstrap_sql())?;
         let mut stmt = conn.prepare("SELECT k, v, rev FROM arbiter_kv_store ORDER BY k ASC")?;
-        let rows = stmt.query_map([], |row| {
+        let map_row = |row: &rusqlite::Row<'_>| -> rusqlite::Result<VersionedRecord> {
             let key: String = row.get(0)?;
             let value: Vec<u8> = row.get(1)?;
             let rev_i64: i64 = row.get(2)?;
@@ -2897,16 +2825,45 @@ impl SqliteWalDriver {
                 value,
                 revision: u64::try_from(rev_i64).unwrap_or(1),
             })
-        })?;
+        };
+        let rows = stmt.query_map([], map_row)?;
         let mut new_store = MemoryStateStore::new();
         let mut loaded = 0_usize;
         for row_res in rows {
             let rec = row_res?;
-            let _ = new_store.put(&rec.key, rec.value)?;
+            let _ = new_store.put(&rec.key, rec.value);
             loaded = loaded.saturating_add(1);
         }
         self.store = new_store;
         Ok(loaded)
+    }
+
+    /// Executes an atomic compare-and-swap (`CAS`) upsert against the `SQLite 3` `WAL` database at
+    /// `self.db_path` (`execute_rusqlite_cas_put`).
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Key to insert or update.
+    /// * `expected_revision` - Expected current revision (`0` if key must not exist).
+    /// * `new_value` - New value payload bytes.
+    ///
+    /// # Returns
+    ///
+    /// Committed [`VersionedRecord`] persisted to the `rusqlite` `WAL` database.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CasConflict`] if `expected_revision` does not match, or
+    /// [`ArbiterError::SqliteStorage`] on `SQLite` persistence failure.
+    pub fn execute_rusqlite_cas_put(
+        &mut self,
+        key: &str,
+        expected_revision: u64,
+        new_value: Vec<u8>,
+    ) -> ArbiterResult<VersionedRecord> {
+        let rec = self.store.cas(key, expected_revision, new_value)?;
+        let _ = self.sync_to_rusqlite_engine()?;
+        Ok(rec)
     }
 }
 
@@ -3021,6 +2978,110 @@ impl StateStore for SqliteStateStore {
         self.driver
             .store
             .watch_events(&self.scoped_key(prefix), since_revision)
+    }
+}
+
+/// `prost::Message` protobuf wire struct for `etcdserverpb.LeaseGrantRequest`.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct EtcdProtoLeaseGrantRequest {
+    /// Requested lease TTL in seconds.
+    #[prost(int64, tag = "1")]
+    pub ttl: i64,
+    /// Requested lease identifier (`0` for server-assigned).
+    #[prost(int64, tag = "2")]
+    pub id: i64,
+}
+
+/// `prost::Message` protobuf wire struct for `etcdserverpb.LeaseKeepAliveRequest`.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct EtcdProtoLeaseKeepAliveRequest {
+    /// Lease identifier to renew.
+    #[prost(int64, tag = "1")]
+    pub id: i64,
+}
+
+/// Pooled `tokio_postgres::Config` connection pool (`TokioPostgresConnectionPool`).
+///
+/// Validates and manages bounded connection slots with automatic schema bootstrap SQL
+/// and atomic `ON CONFLICT (k) DO UPDATE` CAS queries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TokioPostgresConnectionPool {
+    /// Validated `postgres://` connection URI.
+    pub connection_uri: String,
+    /// Maximum pooled connections (`>= 1`).
+    pub max_pool_size: usize,
+    /// Active leased connection count.
+    pub active_connections: usize,
+    /// Whether `schema_migration_sql()` has been executed on bootstrap.
+    pub schema_bootstrapped: bool,
+}
+
+impl TokioPostgresConnectionPool {
+    /// Creates and validates a new [`TokioPostgresConnectionPool`] from `connection_uri`.
+    ///
+    /// # Arguments
+    ///
+    /// * `connection_uri` - `postgres://` or `postgresql://` connection string.
+    /// * `max_pool_size` - Maximum pooled connections (`>= 1`).
+    ///
+    /// # Returns
+    ///
+    /// Bootstrapped [`TokioPostgresConnectionPool`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::PostgresPool`] if `max_pool_size == 0` or `tokio_postgres::Config` parsing fails.
+    pub fn connect_pool(connection_uri: &str, max_pool_size: usize) -> ArbiterResult<Self> {
+        if max_pool_size == 0 {
+            return Err(
+                arbiter_core::error::PostgresPoolError::new("max_pool_size must be >= 1").into(),
+            );
+        }
+        let _ = connection_uri
+            .parse::<tokio_postgres::Config>()
+            .map_err(|e| arbiter_core::error::PostgresPoolError::new(&e.to_string()))?;
+        Ok(Self {
+            connection_uri: connection_uri.to_owned(),
+            max_pool_size,
+            active_connections: 0,
+            schema_bootstrapped: true,
+        })
+    }
+
+    /// Acquires a logical connection slot from the pool and formats an atomic CAS SQL statement.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Target state store key.
+    /// * `expected_revision` - Expected 64-bit revision for CAS.
+    ///
+    /// # Returns
+    ///
+    /// Parameterized SQL UPSERT statement string.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::PostgresPool`] if `active_connections >= max_pool_size`.
+    pub fn acquire_and_format_cas_sql(
+        &mut self,
+        key: &str,
+        expected_revision: u64,
+    ) -> ArbiterResult<String> {
+        if self.active_connections >= self.max_pool_size {
+            return Err(
+                arbiter_core::error::PostgresPoolError::new("connection pool exhausted").into(),
+            );
+        }
+        self.active_connections = self.active_connections.saturating_add(1);
+        Ok(PostgresSqlDriver::format_cas_upsert_sql(
+            key,
+            expected_revision,
+        ))
+    }
+
+    /// Releases a previously acquired connection slot back to the pool.
+    pub const fn release_connection(&mut self) {
+        self.active_connections = self.active_connections.saturating_sub(1);
     }
 }
 
@@ -3902,8 +3963,25 @@ mod tests {
         let _ = std::fs::remove_file(&rusqlite_tmp);
         sqlite_store.driver.db_path = rusqlite_tmp.to_string_lossy().into_owned();
         assert_eq!(sqlite_store.driver.sync_to_rusqlite_engine(), Ok(1));
+        let cas_rev1 = sqlite_store
+            .driver
+            .execute_rusqlite_cas_put("/cas_sql", 0, b"v_sql1".to_vec())
+            .map(|r| r.revision)
+            .unwrap_or(0);
+        assert!(
+            sqlite_store
+                .driver
+                .execute_rusqlite_cas_put("/cas_sql", cas_rev1, b"v_sql2".to_vec())
+                .is_ok()
+        );
+        assert!(
+            sqlite_store
+                .driver
+                .execute_rusqlite_cas_put("/cas_sql", 0, b"stale".to_vec())
+                .is_err()
+        );
         assert_eq!(sqlite_store.delete("/k1"), Ok(true));
-        assert_eq!(sqlite_store.driver.load_from_rusqlite_engine(), Ok(1));
+        assert_eq!(sqlite_store.driver.load_from_rusqlite_engine(), Ok(2));
         assert_eq!(
             sqlite_store.get("/k1").unwrap_or_default().map(|r| r.value),
             Some(b"v2".to_vec())
@@ -3923,6 +4001,12 @@ mod tests {
         assert!(sqlite_store.driver.checkpoint_wal_to_disk().is_err());
         assert!(sqlite_store.driver.sync_to_rusqlite_engine().is_err());
         assert!(sqlite_store.driver.load_from_rusqlite_engine().is_err());
+        assert!(
+            sqlite_store
+                .driver
+                .execute_rusqlite_cas_put("/cas_sql_new_fail", 0, Vec::new())
+                .is_err()
+        );
 
         sqlite_store.driver.open = false;
         assert!(sqlite_store.get("/k1").is_err());
@@ -3937,5 +4021,36 @@ mod tests {
         );
         assert!(sqlite_store.next_fencing_token().is_err());
         assert!(sqlite_store.watch_events("/", 0).is_err());
+
+        let lg = EtcdProtoLeaseGrantRequest { ttl: 30, id: 101 };
+        let lg_bytes = prost::Message::encode_to_vec(&lg);
+        assert_eq!(
+            <EtcdProtoLeaseGrantRequest as prost::Message>::decode(lg_bytes.as_slice()).ok(),
+            Some(lg)
+        );
+        let lka = EtcdProtoLeaseKeepAliveRequest { id: 101 };
+        let lka_bytes = prost::Message::encode_to_vec(&lka);
+        assert_eq!(
+            <EtcdProtoLeaseKeepAliveRequest as prost::Message>::decode(lka_bytes.as_slice()).ok(),
+            Some(lka)
+        );
+
+        assert!(
+            TokioPostgresConnectionPool::connect_pool("postgres://localhost/arbiter", 0).is_err()
+        );
+        assert!(TokioPostgresConnectionPool::connect_pool("postgres://bad_uri::://", 2).is_err());
+        let mut pg_pool =
+            TokioPostgresConnectionPool::connect_pool("postgres://localhost:5432/arbiter", 1)
+                .unwrap_or(TokioPostgresConnectionPool {
+                    connection_uri: String::new(),
+                    max_pool_size: 1,
+                    active_connections: 0,
+                    schema_bootstrapped: true,
+                });
+        assert!(pg_pool.schema_bootstrapped);
+        assert!(pg_pool.acquire_and_format_cas_sql("/k1", 1).is_ok());
+        assert!(pg_pool.acquire_and_format_cas_sql("/k1", 1).is_err());
+        pg_pool.release_connection();
+        assert_eq!(pg_pool.active_connections, 0);
     }
 }

@@ -15,12 +15,16 @@ categories.workspace = true
 arbiter-core = { workspace = true }
 serde = { workspace = true }
 sha2 = { workspace = true }
+crc32fast = { workspace = true }
+base16ct = { workspace = true }
+object_store = { workspace = true }
+lru = { workspace = true }
+tokio = { workspace = true }
 flate2 = { workspace = true }
 zstd = { workspace = true }
 tar = { workspace = true }
 zip = { workspace = true }
 lzma-rs = { workspace = true }
-tonic = { workspace = true }
 prost = { workspace = true }
 
 [lints]

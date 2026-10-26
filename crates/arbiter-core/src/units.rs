@@ -277,7 +277,7 @@ define_u64_unit!(
 );
 
 define_u64_unit!(
-    /// Network, PCIe, NVLink, ICI, or storage I/O bandwidth measured in bits per second.
+    /// Network, `PCIe`, `NVLink`, ICI, or storage I/O bandwidth measured in bits per second.
     BandwidthBps,
     "bps",
     "BandwidthBps"

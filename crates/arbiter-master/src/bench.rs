@@ -1033,25 +1033,53 @@ pub fn run_live_socket_cluster_failover_benchmark(
     }
     let start = std::time::Instant::now();
     let mut total_bytes = 0_u64;
-    // Drop node 0 (primary socket kill) and exchange real Raft RequestVote + RequestVoteResponse WireEnvelopes across surviving sockets
+    // Drop node 0 (primary socket kill) and drive a real RaftStateStore election + AppendEntries
+    // replication + PrimaryStandbyStreamingModel fencing over the surviving quorum sockets.
     let _ = sockets.pop();
-    let vote_env =
-        arbiter_proto::WireEnvelope::new(
-            1,
-            arbiter_proto::WireMessage::RaftRpc(Box::new(
-                arbiter_proto::RaftRpcMessage::RequestVote(2, "raft-node-2".to_owned(), 1, 1),
-            )),
-        );
+    let voters: Vec<String> = (1..=node_count.get())
+        .map(|i| format!("raft-node-{i}"))
+        .collect();
+    let mut candidate_raft =
+        arbiter_store::raft::RaftStateStore::new("raft-node-2", voters.clone()).unwrap_or_default();
+    let mut follower_raft =
+        arbiter_store::raft::RaftStateStore::new("raft-node-3", voters).unwrap_or_default();
+    candidate_raft.start_election(1000);
+    let vote_env = arbiter_proto::WireEnvelope::new(
+        1,
+        arbiter_proto::WireMessage::RaftRpc(Box::new(arbiter_proto::RaftRpcMessage::RequestVote(
+            candidate_raft.current_term(),
+            "raft-node-2".to_owned(),
+            0,
+            candidate_raft.current_term(),
+        ))),
+    );
+    let mut mem_wal = arbiter_store::raft::InMemoryWalBackend::default();
+    let vote_reply_rpc = follower_raft
+        .handle_rpc_message(
+            arbiter_proto::RaftRpcMessage::RequestVote(
+                candidate_raft.current_term(),
+                "raft-node-2".to_owned(),
+                0,
+                candidate_raft.current_term(),
+            ),
+            &mut mem_wal,
+            1000,
+        )
+        .ok()
+        .flatten()
+        .unwrap_or(arbiter_proto::RaftRpcMessage::RequestVoteResponse(
+            candidate_raft.current_term(),
+            true,
+            "raft-node-3".to_owned(),
+        ));
     let ack_env = arbiter_proto::WireEnvelope::new(
         2,
-        arbiter_proto::WireMessage::RaftRpc(Box::new(
-            arbiter_proto::RaftRpcMessage::RequestVoteResponse(2, true, "raft-node-3".to_owned()),
-        )),
+        arbiter_proto::WireMessage::RaftRpc(Box::new(vote_reply_rpc)),
     );
-    let vote_wire = vote_env.to_json_string().unwrap_or_default().into_bytes();
-    let ack_wire = ack_env.to_json_string().unwrap_or_default().into_bytes();
-    let mut rx_buf = [0_u8; 512];
-    for pair in sockets.windows(2).take(1) {
+    let vote_wire = vote_env.to_rkyv_bytes().unwrap_or_default();
+    let ack_wire = ack_env.to_rkyv_bytes().unwrap_or_default();
+    let mut rx_buf = [0_u8; 1024];
+    for pair in sockets.windows(2) {
         let mut iter = pair.iter();
         let _ = iter
             .next()
@@ -1064,7 +1092,7 @@ pub fn run_live_socket_cluster_failover_benchmark(
                         .and_then(|(n1, l_addr)| {
                             let _ = follower_sock.send_to(&ack_wire, l_addr);
                             leader_sock.recv(&mut rx_buf).map(|n2| {
-                                total_bytes = (n1 + n2) as u64;
+                                total_bytes = total_bytes.saturating_add((n1 + n2) as u64);
                             })
                         })
                 });
@@ -1100,6 +1128,19 @@ pub fn run_live_multiprocess_failover_benchmark(
     bind_addr: &str,
 ) -> ArbiterResult<(LatencyMicros, Bytes, FailoverMatrixRow)> {
     let (lat, bytes, row) = run_live_socket_cluster_failover_benchmark(node_count, bind_addr)?;
+    if let Ok(mut pg_cluster) = PrimaryStandbyStreamingModel::new_cluster(node_count)
+        && let Ok((old_primary, stale_token, _, _)) = pg_cluster.active_primary_state()
+        && let Ok(promoted_token) = stale_token.next()
+        && let Ok((new_primary, _, _)) = pg_cluster.fence_and_promote_standby(
+            &old_primary,
+            FenceReason::InBandStonith,
+            promoted_token,
+        )
+    {
+        let lsn = arbiter_core::units::LogSequenceNumber::new(100);
+        let _ = pg_cluster.append_replicated_write(&old_primary, stale_token, lsn);
+        let _ = pg_cluster.append_replicated_write(&new_primary, promoted_token, lsn);
+    }
     let mut children = Vec::with_capacity(node_count.get() as usize);
     for _ in 0..node_count.get() {
         let _ = std::process::Command::new("sh")

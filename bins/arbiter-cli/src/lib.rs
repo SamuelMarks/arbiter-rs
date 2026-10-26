@@ -575,6 +575,80 @@ impl CliSubcommand {
         }
     }
 
+    /// Constructs the canonical `clap::Command` specification for `arbiter-cli`, registering
+    /// `--master-url` and all 22 operator and benchmark subcommands.
+    ///
+    /// # Returns
+    ///
+    /// Configured `clap::Command`.
+    pub fn build_clap_command() -> clap::Command {
+        let mut cmd = clap::Command::new("arbiter-cli")
+            .no_binary_name(true)
+            .subcommand_required(true)
+            .arg(
+                clap::Arg::new("master-url")
+                    .long("master-url")
+                    .visible_alias("master-http")
+                    .visible_alias("master")
+                    .num_args(1),
+            );
+        for name in [
+            "status",
+            "tui",
+            "submit",
+            "drain",
+            "deactivate",
+            "reactivate",
+            "quota",
+            "weights",
+            "maintenance",
+            "reconcile",
+            "failover-dr",
+            "kill",
+            "files",
+            "exec",
+            "reserve",
+            "unreserve",
+            "create-volumes",
+            "destroy-volumes",
+            "grow-volume",
+            "shrink-volume",
+            "containers",
+            "exec-nested",
+            "attach",
+            "prune-images",
+            "bench-multicluster",
+            "bench-failover-traffic",
+        ] {
+            cmd = cmd.subcommand(
+                clap::Command::new(name)
+                    .allow_hyphen_values(true)
+                    .arg(clap::Arg::new("rest").num_args(0..)),
+            );
+        }
+        cmd
+    }
+
+    /// Validates `args` (excluding `argv[0]`) against [`Self::build_clap_command`] via
+    /// `clap::Command::try_get_matches_from` (converting `clap::Error` into [`ArbiterError::ClapCli`])
+    /// and then parses the strongly-typed [`CliSubcommand`].
+    ///
+    /// # Arguments
+    ///
+    /// * `args` - Slice of CLI argument strings (excluding binary name).
+    ///
+    /// # Returns
+    ///
+    /// Validated [`CliSubcommand`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ClapCli`] on `clap` syntax/help errors or [`ArbiterError`] on domain validation failure.
+    pub fn parse_with_clap(args: &[&str]) -> ArbiterResult<Self> {
+        let _ = Self::build_clap_command().try_get_matches_from(args)?;
+        Self::parse_from_slice(args)
+    }
+
     /// Executes the parsed [`CliSubcommand`] and returns the formatted Markdown + JSON output report.
     ///
     /// # Returns
@@ -1284,6 +1358,11 @@ mod tests {
 
         let (code_ok, _) = run_cli_main(&["status"]);
         assert!(code_ok.is_success());
+        assert_eq!(
+            CliSubcommand::parse_with_clap(&["status"]),
+            Ok(CliSubcommand::Status)
+        );
+        assert!(CliSubcommand::parse_with_clap(&["--unknown-flag"]).is_err());
         let (code_offline, _) = run_cli_main(&["--master-url", "http://127.0.0.1:0", "status"]);
         assert!(code_offline.is_success());
         let _ = std::net::TcpListener::bind("127.0.0.1:0").map(|l| {

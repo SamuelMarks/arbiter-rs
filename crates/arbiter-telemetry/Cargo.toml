@@ -15,7 +15,10 @@ categories.workspace = true
 arbiter-core = { workspace = true }
 serde = { workspace = true }
 prost = { workspace = true }
-prost-types = { workspace = true }
+prometheus-client = { workspace = true }
+opentelemetry = { workspace = true }
+hickory-proto = { workspace = true }
+base16ct = { workspace = true }
 
 [lints]
 workspace = true

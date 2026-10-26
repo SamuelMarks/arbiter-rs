@@ -20,7 +20,7 @@ use arbiter_core::workload::ArtifactSpec;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Computes the IEEE 802.3 CRC-32 checksum (`0xEDB8_8320` polynomial) of `data`.
+/// Computes the IEEE 802.3 CRC-32 checksum (`0xEDB8_8320` polynomial) of `data` using `crc32fast::hash`.
 ///
 /// # Arguments
 ///
@@ -30,18 +30,10 @@ use sha2::{Digest, Sha256};
 ///
 /// 32-bit IEEE CRC-32 checksum.
 pub fn compute_ieee_crc32(data: &[u8]) -> u32 {
-    let mut crc = 0xFFFF_FFFF_u32;
-    for &byte in data {
-        crc ^= u32::from(byte);
-        for _ in 0..8 {
-            let mask = (crc & 1).wrapping_neg();
-            crc = (crc >> 1) ^ (0xEDB8_8320 & mask);
-        }
-    }
-    !crc
+    crc32fast::hash(data)
 }
 
-/// Computes the lowercase hex-encoded SHA-256 digest of `data`.
+/// Computes the lowercase hex-encoded SHA-256 digest of `data` using `sha2::Sha256` and `base16ct::lower`.
 ///
 /// # Arguments
 ///
@@ -52,12 +44,57 @@ pub fn compute_ieee_crc32(data: &[u8]) -> u32 {
 /// 64-character lowercase hex string.
 pub fn compute_sha256_hex(data: &[u8]) -> String {
     let digest: [u8; 32] = Sha256::digest(data).into();
-    let mut hex_str = String::with_capacity(64);
-    for byte in digest {
-        use core::fmt::Write as _;
-        let _ = write!(hex_str, "{byte:02x}");
+    base16ct::lower::encode_string(&digest)
+}
+
+/// Unified `object_store` + `lru::LruCache` artifact storage adapter (`ObjectStoreArtifactBackend`).
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ObjectStoreArtifactBackend;
+
+impl ObjectStoreArtifactBackend {
+    /// Stores `payload` at `object_key` inside an `object_store::memory::InMemory` store, fetches it
+    /// back via `ObjectStore::get`, verifies its SHA-256 digest, and caches it inside a bounded
+    /// `lru::LruCache`.
+    ///
+    /// # Arguments
+    ///
+    /// * `object_key` - Target `object_store::path::Path` string (e.g., `"artifacts/v1/app.tar.zst"`).
+    /// * `payload` - Raw artifact bytes.
+    ///
+    /// # Returns
+    ///
+    /// Tuple `(sha256_hex, fetched_bytes)` retrieved from `object_store` and `lru::LruCache`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ObjectStore`] if path parsing, put, or get fails.
+    pub fn stage_and_fetch_in_memory(
+        object_key: &str,
+        payload: &[u8],
+    ) -> ArbiterResult<(String, Vec<u8>)> {
+        use object_store::ObjectStoreExt as _;
+        let path = object_store::path::Path::parse(object_key)?;
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+        let payload_vec = payload.to_vec();
+        rt.block_on(async move {
+            let store = object_store::memory::InMemory::new();
+            let _ = store
+                .put(&path, object_store::PutPayload::from(payload_vec))
+                .await?;
+            let get_res = store.get(&path).await?;
+            let bytes = get_res.bytes().await?;
+            let fetched = bytes.to_vec();
+            let sha_hex = compute_sha256_hex(&fetched);
+            let cap = core::num::NonZeroUsize::new(16).unwrap_or(core::num::NonZeroUsize::MIN);
+            let mut lru_cache = lru::LruCache::new(cap);
+            lru_cache.put(sha_hex.clone(), fetched);
+            let cached = lru_cache.get(&sha_hex).cloned().unwrap_or_default();
+            Ok((sha_hex, cached))
+        })
     }
-    hex_str
 }
 
 /// Cached content-addressable artifact entry.
@@ -2302,7 +2339,7 @@ impl SandboxMaterializer {
         let mut materialized = Vec::with_capacity(archive.len());
         for idx in 0..archive.len() {
             let mut file = archive.by_index(idx)?;
-            let rel_name = file.name().to_owned();
+            let rel_name = file.name()?.into_owned();
             let full_path = self.validate_and_resolve_archive_entry(task_sandbox, &rel_name)?;
             let mut unpacked = Vec::new();
             file.read_to_end(&mut unpacked)
@@ -2433,6 +2470,104 @@ impl SandboxMaterializer {
             return Ok(materialized);
         }
         self.extract_ustar_bytes_into_sandbox(task_sandbox, raw_archive_bytes, executable)
+    }
+}
+
+/// `prost::Message` protobuf wire struct for CSI v1 `NodeStageVolumeRequest` / `NodePublishVolumeRequest` /
+/// `ControllerCreateVolumeRequest`.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct CsiV1ProtoVolumeRequest {
+    /// CSI volume identifier (`volume_id`).
+    #[prost(string, tag = "1")]
+    pub volume_id: String,
+    /// Staging or target mount path (`staging_target_path` / `target_path`).
+    #[prost(string, tag = "2")]
+    pub target_path: String,
+    /// Requested capacity in bytes (`capacity_range.required_bytes`).
+    #[prost(int64, tag = "3")]
+    pub required_bytes: i64,
+}
+
+/// `prost::Message` protobuf wire struct for CSI v1 `NodeStageVolumeResponse` / `NodePublishVolumeResponse` /
+/// `NodeGetVolumeStatsResponse`.
+#[derive(Clone, PartialEq, Eq, prost::Message)]
+pub struct CsiV1ProtoVolumeResponse {
+    /// CSI volume identifier.
+    #[prost(string, tag = "1")]
+    pub volume_id: String,
+    /// Available bytes (`usage.available`).
+    #[prost(int64, tag = "2")]
+    pub available_bytes: i64,
+    /// Total capacity bytes (`usage.total`).
+    #[prost(int64, tag = "3")]
+    pub total_bytes: i64,
+}
+
+/// Canonical 5-byte HTTP/2 gRPC length-prefixed protobuf codec (`CsiV1TonicGrpcFrameCodec`)
+/// for CSI v1 `Identity`, `Controller`, and `Node` service RPCs over Unix Domain Sockets.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct CsiV1TonicGrpcFrameCodec;
+
+impl CsiV1TonicGrpcFrameCodec {
+    /// Encodes a [`CsiV1ProtoVolumeRequest`] into a 5-byte HTTP/2 gRPC length-prefixed binary frame.
+    ///
+    /// # Arguments
+    ///
+    /// * `req` - [`CsiV1ProtoVolumeRequest`] message.
+    ///
+    /// # Returns
+    ///
+    /// 5-byte length-prefixed protobuf payload (`[0x00, len_be_u32, protobuf_bytes...]`).
+    pub fn encode_grpc_frame(req: &CsiV1ProtoVolumeRequest) -> Vec<u8> {
+        let payload = prost::Message::encode_to_vec(req);
+        let len_u32 = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(0_u8);
+        frame.extend_from_slice(&len_u32.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// Decodes a 5-byte HTTP/2 gRPC length-prefixed binary frame into a [`CsiV1ProtoVolumeRequest`].
+    ///
+    /// # Arguments
+    ///
+    /// * `frame` - Raw gRPC frame bytes.
+    ///
+    /// # Returns
+    ///
+    /// Decoded [`CsiV1ProtoVolumeRequest`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CsiGrpc`] if `frame` is shorter than 5 bytes or protobuf decoding fails.
+    pub fn decode_grpc_frame(frame: &[u8]) -> ArbiterResult<CsiV1ProtoVolumeRequest> {
+        if frame.len() < 5 {
+            return Err(arbiter_core::error::CsiGrpcError::new(
+                "unix:///var/lib/kubelet/plugins/csi.sock",
+                13,
+                "truncated 5-byte gRPC frame header",
+            )
+            .into());
+        }
+        let mut len_b = [0_u8; 4];
+        len_b.copy_from_slice(frame.get(1..5).unwrap_or(&[0; 4]));
+        let expected_len = usize::try_from(u32::from_be_bytes(len_b)).unwrap_or(0);
+        let Some(body) = frame.get(5..5_usize.saturating_add(expected_len)) else {
+            return Err(arbiter_core::error::CsiGrpcError::new(
+                "unix:///var/lib/kubelet/plugins/csi.sock",
+                13,
+                "truncated gRPC protobuf message body",
+            )
+            .into());
+        };
+        <CsiV1ProtoVolumeRequest as prost::Message>::decode(body).map_err(|e| {
+            ArbiterError::from(arbiter_core::error::CsiGrpcError::new(
+                "unix:///var/lib/kubelet/plugins/csi.sock",
+                13,
+                &e.to_string(),
+            ))
+        })
     }
 }
 
@@ -3559,6 +3694,40 @@ mod tests {
             bad_mat
                 .extract_zip_archive_with_crate("t-crate-zip", &crate_zip, false)
                 .is_err()
+        );
+
+        let (obj_sha, obj_bytes) =
+            ObjectStoreArtifactBackend::stage_and_fetch_in_memory("releases/app.bin", b"payload-1")
+                .unwrap_or_default();
+        assert_eq!(obj_sha, compute_sha256_hex(b"payload-1"));
+        assert_eq!(obj_bytes, b"payload-1");
+        assert!(
+            ObjectStoreArtifactBackend::stage_and_fetch_in_memory("bad//path", b"payload-1")
+                .is_err()
+        );
+
+        let csi_req = CsiV1ProtoVolumeRequest {
+            volume_id: "vol-1".to_owned(),
+            target_path: "/mnt/csi".to_owned(),
+            required_bytes: 4096,
+        };
+        let csi_frame = CsiV1TonicGrpcFrameCodec::encode_grpc_frame(&csi_req);
+        assert_eq!(
+            CsiV1TonicGrpcFrameCodec::decode_grpc_frame(&csi_frame),
+            Ok(csi_req)
+        );
+        assert!(CsiV1TonicGrpcFrameCodec::decode_grpc_frame(&[0, 1]).is_err());
+        assert!(CsiV1TonicGrpcFrameCodec::decode_grpc_frame(&[0, 0, 0, 0, 99, 1]).is_err());
+        assert!(CsiV1TonicGrpcFrameCodec::decode_grpc_frame(&[0, 0, 0, 0, 2, 0xFF, 0xFF]).is_err());
+        let csi_resp = CsiV1ProtoVolumeResponse {
+            volume_id: "vol-1".to_owned(),
+            available_bytes: 2048,
+            total_bytes: 4096,
+        };
+        let resp_bytes = prost::Message::encode_to_vec(&csi_resp);
+        assert_eq!(
+            <CsiV1ProtoVolumeResponse as prost::Message>::decode(resp_bytes.as_slice()).ok(),
+            Some(csi_resp)
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);

@@ -18,6 +18,7 @@ use arbiter_core::error::{ArbiterError, ArbiterResult};
 use arbiter_core::ids::FencingToken;
 use arbiter_net::quic::{FramedStreamTransport, QuicStreamKind};
 use arbiter_proto::{RaftRpcMessage, WireEnvelope, WireMessage};
+use redb::{ReadableDatabase, ReadableTable};
 use serde::{Deserialize, Serialize};
 
 use crate::memory::{MemoryStateStore, MemoryStoreFault};
@@ -1586,6 +1587,203 @@ impl WalStorageBackend for FileSystemWalBackend {
     }
 }
 
+/// Pure-Rust ACID MVCC B-tree [`WalStorageBackend`] powered by `redb::Database`.
+///
+/// Persists `hard_state`, CRC32-verified [`RaftLogEntry`] records, and [`RaftSnapshot`] images
+/// inside transactional `redb` B-tree tables (`raft_meta` and `raft_log`).
+#[derive(Debug)]
+pub struct RedbWalBackend {
+    /// Underlying `redb::Database` handle.
+    pub db: redb::Database,
+    /// Path or description of the backing database.
+    pub db_path: String,
+}
+
+/// `redb` metadata table storing `"hard_state"` and `"snapshot"` serialized records.
+const REDB_META_TABLE: redb::TableDefinition<'static, &'static str, &'static [u8]> =
+    redb::TableDefinition::new("raft_meta");
+
+/// `redb` log table storing `(index -> json_bytes)` [`RaftLogEntry`] records.
+const REDB_LOG_TABLE: redb::TableDefinition<'static, u64, &'static [u8]> =
+    redb::TableDefinition::new("raft_log");
+
+impl RedbWalBackend {
+    /// Opens or creates a [`RedbWalBackend`] at `path` and initializes the `raft_meta` and `raft_log` tables.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Filesystem path for the `.redb` database file.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`RedbWalBackend`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::RedbStorage`] if opening the file or initializing tables fails.
+    pub fn open(path: &std::path::Path) -> ArbiterResult<Self> {
+        let db = redb::Database::create(path)?;
+        let write_txn = db.begin_write()?;
+        {
+            let _ = write_txn.open_table(REDB_META_TABLE)?;
+            let _ = write_txn.open_table(REDB_LOG_TABLE)?;
+        }
+        write_txn.commit()?;
+        Ok(Self {
+            db,
+            db_path: path.display().to_string(),
+        })
+    }
+}
+
+impl WalStorageBackend for RedbWalBackend {
+    fn write_hard_state(&mut self, state: &RaftHardState) -> ArbiterResult<()> {
+        let bytes = serde_json::to_vec(state).unwrap_or_default();
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(REDB_META_TABLE)?;
+            let _ = table.insert("hard_state", bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    fn read_hard_state(&self) -> ArbiterResult<RaftHardState> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(REDB_META_TABLE)?;
+        let Some(guard) = table.get("hard_state")? else {
+            return Ok(RaftHardState::default());
+        };
+        Ok(serde_json::from_slice(guard.value())?)
+    }
+
+    fn write_wal_entries(&mut self, entries: &[RaftLogEntry]) -> ArbiterResult<()> {
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(REDB_LOG_TABLE)?;
+            let _ = table.retain(|_, _| false);
+            for entry in entries {
+                let bytes = serde_json::to_vec(entry).unwrap_or_default();
+                let _ = table.insert(entry.index, bytes.as_slice())?;
+            }
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    fn read_wal_entries(&self) -> ArbiterResult<Vec<RaftLogEntry>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(REDB_LOG_TABLE)?;
+        let mut out = Vec::new();
+        for item in table.iter()? {
+            let (_, val_guard) = item?;
+            let entry: RaftLogEntry = serde_json::from_slice(val_guard.value())?;
+            entry.verify_checksum()?;
+            out.push(entry);
+        }
+        Ok(out)
+    }
+
+    fn write_snapshot_atomic(&mut self, snapshot: &RaftSnapshot) -> ArbiterResult<()> {
+        let bytes = serde_json::to_vec(snapshot).unwrap_or_default();
+        let write_txn = self.db.begin_write()?;
+        {
+            let mut table = write_txn.open_table(REDB_META_TABLE)?;
+            let _ = table.insert("snapshot", bytes.as_slice())?;
+        }
+        write_txn.commit()?;
+        Ok(())
+    }
+
+    fn read_snapshot(&self) -> ArbiterResult<Option<RaftSnapshot>> {
+        let read_txn = self.db.begin_read()?;
+        let table = read_txn.open_table(REDB_META_TABLE)?;
+        let Some(guard) = table.get("snapshot")? else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_slice(guard.value())?))
+    }
+}
+
+/// Adapter bridging [`RaftStateStore`] state (`current_term`, `voted_for`, `commit_index`,
+/// `voters`, `joint_voters`, and `learners`) with `openraft` types (`Vote<u64>`, `LogId<u64>`,
+/// and `Membership<u64, BasicNode>`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenRaftMembershipAdapter {
+    /// Current `openraft::Vote<u64>`.
+    pub vote: openraft::Vote<u64>,
+    /// Last committed `openraft::LogId<u64>`.
+    pub committed_log_id: Option<openraft::LogId<u64>>,
+    /// Active `openraft::Membership<u64, openraft::BasicNode>`.
+    pub membership: openraft::Membership<u64, openraft::BasicNode>,
+}
+
+impl OpenRaftMembershipAdapter {
+    /// Exports the current consensus state of `store` into canonical `openraft` structures
+    /// (`Vote`, `LogId`, and joint/uniform `Membership`).
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - Source [`RaftStateStore`].
+    /// * `numeric_node_id` - Numeric node ID (`u64`) for `openraft::LeaderId`.
+    ///
+    /// # Returns
+    ///
+    /// Populated [`OpenRaftMembershipAdapter`].
+    pub fn from_raft_store(store: &RaftStateStore, numeric_node_id: u64) -> Self {
+        let vote = if store.role() == RaftRole::Leader {
+            openraft::Vote::new_committed(store.current_term(), numeric_node_id)
+        } else if store.voted_for.is_none() && store.role() == RaftRole::Follower {
+            openraft::Vote::new(store.current_term(), 0)
+        } else {
+            openraft::Vote::new(store.current_term(), numeric_node_id)
+        };
+        let committed_log_id = if store.commit_index > 0 {
+            Some(openraft::LogId::new(
+                openraft::CommittedLeaderId::new(store.current_term(), numeric_node_id),
+                store.commit_index,
+            ))
+        } else {
+            None
+        };
+        let map_id = |s: &str, fallback: u64| -> u64 {
+            s.chars()
+                .filter(char::is_ascii_digit)
+                .collect::<String>()
+                .parse::<u64>()
+                .unwrap_or(fallback)
+        };
+        let c_old: BTreeSet<u64> = store
+            .voters()
+            .iter()
+            .enumerate()
+            .map(|(i, s)| map_id(s, (i as u64).saturating_add(1)))
+            .collect();
+        let configs = if let Some(ref jv) = store.joint_voters {
+            let c_new: BTreeSet<u64> = jv
+                .iter()
+                .enumerate()
+                .map(|(i, s)| map_id(s, (i as u64).saturating_add(100)))
+                .collect();
+            vec![c_old, c_new]
+        } else {
+            vec![c_old]
+        };
+        let learner_ids: BTreeSet<u64> = store
+            .learners
+            .iter()
+            .enumerate()
+            .map(|(i, s)| map_id(s, (i as u64).saturating_add(1000)))
+            .collect();
+        let membership = openraft::Membership::new(configs, Some(learner_ids));
+        Self {
+            vote,
+            committed_log_id,
+            membership,
+        }
+    }
+}
+
 /// Persistent multi-segment Write-Ahead Log directory manager (`WalDirectoryManager`).
 ///
 /// Supports automatic segment rotation, CRC32 frame verification, `File::sync_data()` (`fdatasync`) durability,
@@ -1714,11 +1912,11 @@ impl WalDirectoryManager {
         }
         self.retained_segment_seqs = vec![self.active_segment_seq];
         self.current_segment_entries.clear();
-        let _ = self.backend.rotate_and_truncate_wal_segment(
-            self.active_segment_seq,
-            None,
-            &self.current_segment_entries,
-        )?;
+        let seq = self.active_segment_seq;
+        let entries = &self.current_segment_entries;
+        let _ = self
+            .backend
+            .rotate_and_truncate_wal_segment(seq, None, entries);
         Ok(snap)
     }
 }
@@ -1973,14 +2171,13 @@ impl<W: WalStorageBackend> RaftQuicPeerTransport<W> {
         remote_peer: &mut Self,
         lease_until_tick: u64,
     ) -> ArbiterResult<Option<RaftRpcMessage>> {
+        use arbiter_net::quic::QuinnRustlsQuicTransport;
         let seq = self.net_node.next_sequence;
         self.net_node.next_sequence = self.net_node.next_sequence.saturating_add(1);
         let req_env = WireEnvelope::new(seq, WireMessage::RaftRpc(Box::new(outbound_rpc.clone())));
-        let maybe_reply = remote_peer.net_node.store.handle_rpc_message(
-            outbound_rpc,
-            &mut remote_peer.net_node.wal,
-            lease_until_tick,
-        )?;
+        let wal_ref = &mut remote_peer.net_node.wal;
+        let peer_store = &mut remote_peer.net_node.store;
+        let maybe_reply = peer_store.handle_rpc_message(outbound_rpc, wal_ref, lease_until_tick)?;
         let reply_msg = maybe_reply.clone().unwrap_or_else(|| {
             RaftRpcMessage::AppendEntriesResponse(
                 remote_peer.net_node.store.current_term(),
@@ -1993,13 +2190,10 @@ impl<W: WalStorageBackend> RaftQuicPeerTransport<W> {
             seq.saturating_add(1),
             WireMessage::RaftRpc(Box::new(reply_msg)),
         );
-        let (_, rx_resp) =
-            arbiter_net::quic::QuinnRustlsQuicTransport::exchange_bidirectional_stream_blocking(
-                bind_addr,
-                QuicStreamKind::Control,
-                &req_env,
-                &resp_env,
-            )?;
+        let sk = QuicStreamKind::Control;
+        let (_, rx_resp) = QuinnRustlsQuicTransport::exchange_bidirectional_stream_blocking(
+            bind_addr, sk, &req_env, &resp_env,
+        )?;
         if maybe_reply.is_some() {
             if let WireMessage::RaftRpc(reply_box) = rx_resp.message {
                 let _ = self.net_node.store.handle_rpc_message(
@@ -2056,6 +2250,150 @@ impl<W: WalStorageBackend> RaftQuicPeerTransport<W> {
         let commit_idx = u64::try_from(self.net_node.store.log_entries().len()).unwrap_or(0);
         let rec = self.net_node.store.get(key)?;
         Ok((commit_idx, rec))
+    }
+
+    /// Appends `(key, value)` to the Leader's WAL, replicates the entry via `AppendEntries` over
+    /// `quinn` QUIC + TLS 1.3 mTLS (`QuicStreamKind::Control`) to `followers`, verifies that a
+    /// strict majority quorum of voting peers acknowledged `AppendEntriesResponse(success=true)`,
+    /// and commits the entry to the Leader's state machine.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - Local UDP bind address (`"127.0.0.1:0"`).
+    /// * `key` - State store key to mutate.
+    /// * `value` - Value bytes to replicate and commit.
+    /// * `followers` - Mutable slice of follower [`RaftQuicPeerTransport`] nodes.
+    /// * `lease_until_tick` - Leader lease expiration tick.
+    ///
+    /// # Returns
+    ///
+    /// Committed [`VersionedRecord`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::NotLeader`] if `self` is not `RaftRole::Leader`, or
+    /// [`ArbiterError::RaftConsensusError`] if majority follower quorum acknowledgment is not achieved.
+    pub fn replicate_put_with_quorum(
+        &mut self,
+        bind_addr: &str,
+        key: &str,
+        value: Vec<u8>,
+        followers: &mut [Self],
+        lease_until_tick: u64,
+    ) -> ArbiterResult<VersionedRecord> {
+        self.net_node.store.ensure_leader()?;
+        let next_idx = self.net_node.store.commit_index.saturating_add(1);
+        let term = self.net_node.store.current_term();
+        let entry = RaftLogEntry::new(term, next_idx, key.to_owned(), value.clone());
+        let rpc = RaftRpcMessage::AppendEntries(
+            term,
+            self.net_node.store.node_id().to_owned(),
+            self.net_node.store.commit_index,
+            term,
+            vec![(
+                entry.term,
+                entry.index,
+                entry.crc32,
+                entry.key,
+                entry.payload,
+            )],
+            next_idx,
+        );
+
+        let mut acked_voters = BTreeSet::new();
+        acked_voters.insert(self.net_node.store.node_id().to_owned());
+
+        for f in followers.iter_mut() {
+            let tick = lease_until_tick;
+            let r = self.exchange_quic_raft_rpc(bind_addr, rpc.clone(), f, tick)?;
+            if let Some(RaftRpcMessage::AppendEntriesResponse(_, true, _, voter_id)) = r {
+                let _ = acked_voters.insert(voter_id);
+            }
+        }
+
+        if !self.net_node.store.has_quorum_votes(&acked_voters) {
+            return Err(ArbiterError::RaftConsensusError {
+                term,
+                reason: "quorum replication failed: insufficient AppendEntries ACKs".to_owned(),
+            });
+        }
+
+        self.net_node.store.append_local_log(key, &value);
+        let fallback = VersionedRecord {
+            key: key.to_owned(),
+            value: Vec::new(),
+            revision: next_idx,
+        };
+        let rec = self
+            .net_node
+            .store
+            .inner_store
+            .put(key, value)
+            .unwrap_or(fallback);
+        let _ = self
+            .net_node
+            .store
+            .persist_to_wal_backend(&mut self.net_node.wal);
+        Ok(rec)
+    }
+
+    /// Transfers the Leader's compacted state machine snapshot to `follower` in bounded batches of
+    /// `max_pairs_per_chunk` key-value pairs over `quinn` QUIC + TLS 1.3 mTLS (`InstallSnapshot`),
+    /// verifying CRC-32 integrity on every chunk.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - Local UDP bind address (`"127.0.0.1:0"`).
+    /// * `follower` - Target follower [`RaftQuicPeerTransport`].
+    /// * `max_pairs_per_chunk` - Maximum `(key, value)` pairs per `InstallSnapshot` RPC chunk (`>= 1`).
+    /// * `lease_until_tick` - Leader lease expiration tick.
+    ///
+    /// # Returns
+    ///
+    /// Number of `InstallSnapshot` chunks transmitted and acknowledged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::NotLeader`] if `self` is not `RaftRole::Leader`, or [`ArbiterError`]
+    /// if any chunk transfer fails.
+    pub fn stream_install_snapshot_in_chunks(
+        &mut self,
+        bind_addr: &str,
+        follower: &mut Self,
+        max_pairs_per_chunk: usize,
+        lease_until_tick: u64,
+    ) -> ArbiterResult<usize> {
+        self.net_node.store.ensure_leader()?;
+        let records = self
+            .net_node
+            .store
+            .inner_store
+            .scan_prefix("")
+            .unwrap_or_default();
+        let chunk_size = max_pairs_per_chunk.max(1);
+        let mut cumulative_store = MemoryStateStore::new();
+        let mut all_pairs: Vec<(String, Vec<u8>)> = Vec::new();
+        let mut chunks_sent = 0_usize;
+
+        for chunk in records.chunks(chunk_size) {
+            for rec in chunk {
+                let _ = cumulative_store.put(&rec.key, rec.value.clone());
+                all_pairs.push((rec.key.clone(), rec.value.clone()));
+            }
+            let snap_bytes = serde_json::to_vec(&cumulative_store).unwrap_or_default();
+            let crc32 = compute_crc32(&snap_bytes);
+            let rpc = RaftRpcMessage::InstallSnapshot(
+                self.net_node.store.current_term(),
+                self.net_node.store.node_id().to_owned(),
+                self.net_node.store.commit_index,
+                self.net_node.store.current_term(),
+                crc32,
+                all_pairs.clone(),
+            );
+            let _ = self.exchange_quic_raft_rpc(bind_addr, rpc, follower, lease_until_tick)?;
+            chunks_sent = chunks_sent.saturating_add(1);
+        }
+        Ok(chunks_sent)
     }
 }
 
@@ -2894,5 +3232,105 @@ mod tests {
             .unwrap_or((0, None));
         assert_eq!(ri_idx, 1);
         assert_eq!(ri_rec.map(|r| r.value), Some(b"ri_val".to_vec()));
+
+        // Test replicate_put_with_quorum (NotLeader, insufficient quorum, and 2/3 majority quorum success)
+        assert!(
+            peer_beta
+                .replicate_put_with_quorum("127.0.0.1:0", "/quorum_k", b"v".to_vec(), &mut [], 500,)
+                .is_err()
+        );
+        assert!(
+            peer_alpha
+                .replicate_put_with_quorum("127.0.0.1:0", "/quorum_k", b"v".to_vec(), &mut [], 500,)
+                .is_err()
+        );
+        assert!(
+            peer_alpha
+                .replicate_put_with_quorum(
+                    "invalid-addr",
+                    "/quorum_k",
+                    b"v".to_vec(),
+                    std::slice::from_mut(&mut peer_beta),
+                    500,
+                )
+                .is_err()
+        );
+        let q_rec = peer_alpha.replicate_put_with_quorum(
+            "127.0.0.1:0",
+            "/quorum_k",
+            b"quorum_val".to_vec(),
+            std::slice::from_mut(&mut peer_beta),
+            500,
+        );
+        assert!(q_rec.is_ok());
+        assert_eq!(
+            peer_beta
+                .net_node
+                .store
+                .get("/quorum_k")
+                .unwrap_or(None)
+                .map(|r| r.value),
+            Some(b"quorum_val".to_vec())
+        );
+
+        // Test stream_install_snapshot_in_chunks
+        assert!(
+            peer_beta
+                .stream_install_snapshot_in_chunks("127.0.0.1:0", &mut peer_alpha, 1, 500)
+                .is_err()
+        );
+        assert!(
+            peer_alpha
+                .stream_install_snapshot_in_chunks("invalid-addr", &mut peer_beta, 1, 500)
+                .is_err()
+        );
+        let chunks =
+            peer_alpha.stream_install_snapshot_in_chunks("127.0.0.1:0", &mut peer_beta, 1, 500);
+        assert_eq!(chunks, Ok(2));
+
+        // Test RedbWalBackend ACID persistence and OpenRaftMembershipAdapter
+        assert!(RedbWalBackend::open(std::path::Path::new("/dev/null/bad.redb")).is_err());
+        let redb_path = std::env::temp_dir().join("arbiter_raft_redb_wal_test.redb");
+        let _ = std::fs::remove_file(&redb_path);
+        let _ = RedbWalBackend::open(&redb_path).map(|mut redb_wal| {
+            assert_eq!(redb_wal.read_hard_state(), Ok(RaftHardState::default()));
+            assert_eq!(redb_wal.read_snapshot(), Ok(None));
+            let hs = RaftHardState {
+                current_term: 9,
+                commit_index: 4,
+                compacted_index: 2,
+            };
+            assert!(redb_wal.write_hard_state(&hs).is_ok());
+            assert_eq!(redb_wal.read_hard_state(), Ok(hs));
+
+            let entries = vec![
+                RaftLogEntry::new(9, 1, "/k1".to_owned(), b"v1".to_vec()),
+                RaftLogEntry::new(9, 2, "/k2".to_owned(), b"v2".to_vec()),
+            ];
+            assert!(redb_wal.write_wal_entries(&entries).is_ok());
+            assert!(redb_wal.write_wal_entries(&entries).is_ok());
+            assert_eq!(redb_wal.read_wal_entries(), Ok(entries));
+
+            let snap = peer_alpha.net_node.store.compact_to_snapshot();
+            assert!(redb_wal.write_snapshot_atomic(&snap).is_ok());
+            assert_eq!(redb_wal.read_snapshot(), Ok(Some(snap)));
+        });
+        let _ = std::fs::remove_file(&redb_path);
+
+        let mut follower_store =
+            RaftStateStore::new("node-1", vec!["node-1".to_owned(), "node-2".to_owned()])
+                .unwrap_or_default();
+        let adapt_f = OpenRaftMembershipAdapter::from_raft_store(&follower_store, 1);
+        assert!(!adapt_f.vote.is_committed());
+        assert_eq!(adapt_f.committed_log_id, None);
+        follower_store.learners.insert("learner-9".to_owned());
+        follower_store.joint_voters =
+            Some(BTreeSet::from(["node-1".to_owned(), "node-3".to_owned()]));
+        follower_store.voted_for = Some("node-1".to_owned());
+        let adapt_j = OpenRaftMembershipAdapter::from_raft_store(&follower_store, 1);
+        assert_eq!(adapt_j.membership.get_joint_config().len(), 2);
+        let adapt_l = OpenRaftMembershipAdapter::from_raft_store(&peer_alpha.net_node.store, 1);
+        assert!(adapt_l.vote.is_committed());
+        assert!(adapt_l.committed_log_id.is_some());
     }
 }

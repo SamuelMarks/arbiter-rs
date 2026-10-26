@@ -854,6 +854,23 @@ impl EtcdClientError {
             message: message.to_owned(),
         }
     }
+
+    /// Creates an [`EtcdClientError`] from a `tonic::Status` response.
+    ///
+    /// # Arguments
+    ///
+    /// * `endpoint` - etcd endpoint URI.
+    /// * `status` - Returned `tonic::Status`.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`EtcdClientError`].
+    pub fn from_tonic_status(endpoint: &str, status: &tonic::Status) -> Self {
+        Self::new(
+            endpoint,
+            &format!("{}: {}", status.code(), status.message()),
+        )
+    }
 }
 
 /// Wrapper error for external `PostgreSQL` wire-protocol SQL client failures.
@@ -2403,6 +2420,109 @@ impl From<prost::EncodeError> for ArbiterError {
     }
 }
 
+/// Wrapper error for `prost::DecodeError` Protocol Buffers message decoding failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("prost protobuf decode error in '{message_type}': {reason}")]
+pub struct ProstDecodeError {
+    /// Protobuf message schema type name being decoded.
+    pub message_type: String,
+    /// Human-readable decode failure description.
+    pub reason: String,
+}
+
+impl ProstDecodeError {
+    /// Creates a new [`ProstDecodeError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `message_type` - Protobuf message schema name.
+    /// * `reason` - Diagnostic decode failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`ProstDecodeError`].
+    pub fn new(message_type: &str, reason: &str) -> Self {
+        Self {
+            message_type: message_type.to_owned(),
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+impl From<prost::DecodeError> for ProstDecodeError {
+    /// Converts a `prost::DecodeError` into a [`ProstDecodeError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `prost::DecodeError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`ProstDecodeError`].
+    fn from(err: prost::DecodeError) -> Self {
+        Self::new("prost::Message", &err.to_string())
+    }
+}
+
+/// Wrapper error for `prost::EncodeError` Protocol Buffers message encoding failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display(
+    "prost protobuf encode error in '{message_type}' (required {required_bytes}B, remaining {remaining_bytes}B): {reason}"
+)]
+pub struct ProstEncodeError {
+    /// Protobuf message schema type name being encoded.
+    pub message_type: String,
+    /// Required buffer capacity in bytes.
+    pub required_bytes: usize,
+    /// Remaining buffer capacity in bytes.
+    pub remaining_bytes: usize,
+    /// Human-readable encode failure description.
+    pub reason: String,
+}
+
+impl ProstEncodeError {
+    /// Creates a new [`ProstEncodeError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `message_type` - Protobuf message schema name.
+    /// * `required_bytes` - Required buffer capacity in bytes.
+    /// * `remaining_bytes` - Remaining buffer capacity in bytes.
+    /// * `reason` - Diagnostic encode failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`ProstEncodeError`].
+    pub fn new(
+        message_type: &str,
+        required_bytes: usize,
+        remaining_bytes: usize,
+        reason: &str,
+    ) -> Self {
+        Self {
+            message_type: message_type.to_owned(),
+            required_bytes,
+            remaining_bytes,
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+impl From<prost::EncodeError> for ProstEncodeError {
+    /// Converts a `prost::EncodeError` into a [`ProstEncodeError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `prost::EncodeError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`ProstEncodeError`].
+    fn from(err: prost::EncodeError) -> Self {
+        Self::new("prost::Message", 0, 0, &err.to_string())
+    }
+}
+
 /// Wrapper error for NVIDIA Management Library (`NVML` / `libnvidia-ml.so`) FFI probe failures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
 #[display("NVML FFI probe error on '{device_id}' (nvmlReturn_t={nvml_code}): {message}")]
@@ -3187,6 +3307,1421 @@ impl ConsulClientError {
             status_code,
             message: message.to_owned(),
         }
+    }
+}
+
+/// Wrapper error for outbound HTTPS/OCI/S3/Redfish/OIDC HTTP client (`HttpClientError`) failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("HTTP client error for '{method} {url}' (status {status_code}): {message}")]
+pub struct HttpClientError {
+    /// HTTP request method (`GET`, `POST`, `PUT`, `DELETE`).
+    pub method: String,
+    /// Target request URL.
+    pub url: String,
+    /// HTTP status code (`0` when connection/TLS failed prior to response).
+    pub status_code: u16,
+    /// Human-readable diagnostic error message.
+    pub message: String,
+}
+
+impl HttpClientError {
+    /// Creates a new [`HttpClientError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `method` - HTTP method string.
+    /// * `url` - Target URL string.
+    /// * `status_code` - HTTP status code (`0` on transport failure).
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`HttpClientError`].
+    pub fn new(method: &str, url: &str, status_code: u16, message: &str) -> Self {
+        Self {
+            method: method.to_owned(),
+            url: url.to_owned(),
+            status_code,
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for Linux Security Module (`seccomp` BPF filter compilation & `Landlock` ABI ruleset) failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("Linux security module error in '{module}' (profile '{profile}'): {reason}")]
+pub struct LinuxSecurityModuleError {
+    /// Security subsystem name (`seccomp-bpf`, `landlock`, `apparmor`, `selinux`).
+    pub module: String,
+    /// Security profile or ruleset identifier.
+    pub profile: String,
+    /// Human-readable failure reason.
+    pub reason: String,
+}
+
+impl LinuxSecurityModuleError {
+    /// Creates a new [`LinuxSecurityModuleError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `module` - Security module identifier (`seccomp-bpf` or `landlock`).
+    /// * `profile` - Profile or ruleset name.
+    /// * `reason` - Diagnostic failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`LinuxSecurityModuleError`].
+    pub fn new(module: &str, profile: &str, reason: &str) -> Self {
+        Self {
+            module: module.to_owned(),
+            profile: profile.to_owned(),
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for `openraft` Raft consensus state machine, storage, or leader-forwarding failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("Raft engine error on node {node_id} (term {term}): {reason}")]
+pub struct RaftEngineError {
+    /// Raft node numeric identifier.
+    pub node_id: u64,
+    /// Raft consensus election term when the failure occurred.
+    pub term: u64,
+    /// Human-readable diagnostic failure reason.
+    pub reason: String,
+}
+
+impl RaftEngineError {
+    /// Creates a new [`RaftEngineError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `node_id` - Numeric Raft node identifier.
+    /// * `term` - Raft election term.
+    /// * `reason` - Diagnostic failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`RaftEngineError`].
+    pub fn new(node_id: u64, term: u64, reason: &str) -> Self {
+        Self {
+            node_id,
+            term,
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+impl From<openraft::error::Fatal<u64>> for RaftEngineError {
+    /// Converts an `openraft::error::Fatal<u64>` error into a [`RaftEngineError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `openraft::error::Fatal<u64>`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`RaftEngineError`].
+    fn from(err: openraft::error::Fatal<u64>) -> Self {
+        Self::new(0, 0, &err.to_string())
+    }
+}
+
+impl From<openraft::error::Fatal<u64>> for ArbiterError {
+    /// Converts an `openraft::error::Fatal<u64>` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `openraft::error::Fatal<u64>`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::RaftEngine`].
+    fn from(err: openraft::error::Fatal<u64>) -> Self {
+        Self::RaftEngine(RaftEngineError::from(err))
+    }
+}
+
+impl From<openraft::error::ForwardToLeader<u64, openraft::BasicNode>> for RaftEngineError {
+    /// Converts an `openraft::error::ForwardToLeader` error into a [`RaftEngineError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `ForwardToLeader` error.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`RaftEngineError`].
+    fn from(err: openraft::error::ForwardToLeader<u64, openraft::BasicNode>) -> Self {
+        Self::new(err.leader_id.unwrap_or(0), 0, &err.to_string())
+    }
+}
+
+impl From<openraft::error::ForwardToLeader<u64, openraft::BasicNode>> for ArbiterError {
+    /// Converts an `openraft::error::ForwardToLeader` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `ForwardToLeader` error.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::RaftEngine`].
+    fn from(err: openraft::error::ForwardToLeader<u64, openraft::BasicNode>) -> Self {
+        Self::RaftEngine(RaftEngineError::from(err))
+    }
+}
+
+/// Wrapper error for `redb` pure-Rust ACID MVCC B-tree embedded storage failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("redb ACID storage error during '{operation}' on '{db_path}': {message}")]
+pub struct RedbStorageError {
+    /// Database file or in-memory store identifier.
+    pub db_path: String,
+    /// Storage operation (`open`, `begin_write`, `open_table`, `insert`, `commit`).
+    pub operation: String,
+    /// Human-readable `redb` diagnostic error message.
+    pub message: String,
+}
+
+impl RedbStorageError {
+    /// Creates a new [`RedbStorageError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `db_path` - Database file or store identifier.
+    /// * `operation` - Storage operation name.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`RedbStorageError`].
+    pub fn new(db_path: &str, operation: &str, message: &str) -> Self {
+        Self {
+            db_path: db_path.to_owned(),
+            operation: operation.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl From<redb::Error> for RedbStorageError {
+    /// Converts a `redb::Error` into a [`RedbStorageError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `redb::Error`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`RedbStorageError`].
+    fn from(err: redb::Error) -> Self {
+        Self::new("redb", "error", &err.to_string())
+    }
+}
+
+impl From<redb::Error> for ArbiterError {
+    /// Converts a `redb::Error` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `redb::Error`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::RedbStorage`].
+    fn from(err: redb::Error) -> Self {
+        Self::RedbStorage(RedbStorageError::from(err))
+    }
+}
+
+impl From<redb::DatabaseError> for RedbStorageError {
+    /// Converts a `redb::DatabaseError` into a [`RedbStorageError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `redb::DatabaseError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`RedbStorageError`].
+    fn from(err: redb::DatabaseError) -> Self {
+        Self::new("redb", "database", &err.to_string())
+    }
+}
+
+impl From<redb::DatabaseError> for ArbiterError {
+    /// Converts a `redb::DatabaseError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `redb::DatabaseError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::RedbStorage`].
+    fn from(err: redb::DatabaseError) -> Self {
+        Self::RedbStorage(RedbStorageError::from(err))
+    }
+}
+
+impl From<redb::TransactionError> for RedbStorageError {
+    /// Converts a `redb::TransactionError` into a [`RedbStorageError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `redb::TransactionError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`RedbStorageError`].
+    fn from(err: redb::TransactionError) -> Self {
+        Self::new("redb", "transaction", &err.to_string())
+    }
+}
+
+impl From<redb::TransactionError> for ArbiterError {
+    /// Converts a `redb::TransactionError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `redb::TransactionError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::RedbStorage`].
+    fn from(err: redb::TransactionError) -> Self {
+        Self::RedbStorage(RedbStorageError::from(err))
+    }
+}
+
+impl From<redb::StorageError> for RedbStorageError {
+    /// Converts a `redb::StorageError` into a [`RedbStorageError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `redb::StorageError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`RedbStorageError`].
+    fn from(err: redb::StorageError) -> Self {
+        Self::new("redb", "storage", &err.to_string())
+    }
+}
+
+impl From<redb::StorageError> for ArbiterError {
+    /// Converts a `redb::StorageError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `redb::StorageError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::RedbStorage`].
+    fn from(err: redb::StorageError) -> Self {
+        Self::RedbStorage(RedbStorageError::from(err))
+    }
+}
+
+impl From<redb::TableError> for RedbStorageError {
+    /// Converts a `redb::TableError` into a [`RedbStorageError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `redb::TableError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`RedbStorageError`].
+    fn from(err: redb::TableError) -> Self {
+        Self::new("redb", "table", &err.to_string())
+    }
+}
+
+impl From<redb::TableError> for ArbiterError {
+    /// Converts a `redb::TableError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `redb::TableError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::RedbStorage`].
+    fn from(err: redb::TableError) -> Self {
+        Self::RedbStorage(RedbStorageError::from(err))
+    }
+}
+
+impl From<redb::CommitError> for RedbStorageError {
+    /// Converts a `redb::CommitError` into a [`RedbStorageError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `redb::CommitError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`RedbStorageError`].
+    fn from(err: redb::CommitError) -> Self {
+        Self::new("redb", "commit", &err.to_string())
+    }
+}
+
+impl From<redb::CommitError> for ArbiterError {
+    /// Converts a `redb::CommitError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `redb::CommitError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::RedbStorage`].
+    fn from(err: redb::CommitError) -> Self {
+        Self::RedbStorage(RedbStorageError::from(err))
+    }
+}
+
+/// Wrapper error for `tokio-postgres` asynchronous PostgreSQL driver failures (`PostgresDriverError`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("PostgreSQL driver error (SQLSTATE {sql_state}): {message}")]
+pub struct PostgresDriverError {
+    /// 5-character SQLSTATE code (or `"08006"` on connection failure).
+    pub sql_state: String,
+    /// Human-readable PostgreSQL driver failure message.
+    pub message: String,
+}
+
+impl PostgresDriverError {
+    /// Creates a new [`PostgresDriverError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `sql_state` - 5-character SQLSTATE code.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`PostgresDriverError`].
+    pub fn new(sql_state: &str, message: &str) -> Self {
+        Self {
+            sql_state: sql_state.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl From<tokio_postgres::Error> for PostgresDriverError {
+    /// Converts a `tokio_postgres::Error` into a [`PostgresDriverError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `tokio_postgres::Error`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`PostgresDriverError`].
+    fn from(err: tokio_postgres::Error) -> Self {
+        Self::new("08006", &err.to_string())
+    }
+}
+
+/// Wrapper error for `tokio-tungstenite` RFC 6455 WebSocket transport failures (`WebSocketTransportError`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("WebSocket transport error on '{endpoint}': {message}")]
+pub struct WebSocketTransportError {
+    /// Target WebSocket endpoint or stream path.
+    pub endpoint: String,
+    /// Human-readable WebSocket transport error message.
+    pub message: String,
+}
+
+impl WebSocketTransportError {
+    /// Creates a new [`WebSocketTransportError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `endpoint` - WebSocket endpoint or stream identifier.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`WebSocketTransportError`].
+    pub fn new(endpoint: &str, message: &str) -> Self {
+        Self {
+            endpoint: endpoint.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl From<tokio_tungstenite::tungstenite::Error> for WebSocketTransportError {
+    /// Converts a `tokio_tungstenite::tungstenite::Error` into a [`WebSocketTransportError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `tungstenite::Error`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`WebSocketTransportError`].
+    fn from(err: tokio_tungstenite::tungstenite::Error) -> Self {
+        Self::new("ws", &err.to_string())
+    }
+}
+
+/// Wrapper error for `hickory-proto` DNS wire codec and name resolution failures (`HickoryDnsError`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("Hickory DNS protocol error for '{query}': {message}")]
+pub struct HickoryDnsError {
+    /// DNS query name or wire operation context.
+    pub query: String,
+    /// Human-readable `hickory-proto` error message.
+    pub message: String,
+}
+
+impl HickoryDnsError {
+    /// Creates a new [`HickoryDnsError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `query` - DNS query name or context.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`HickoryDnsError`].
+    pub fn new(query: &str, message: &str) -> Self {
+        Self {
+            query: query.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl From<hickory_proto::ProtoError> for HickoryDnsError {
+    /// Converts a `hickory_proto::ProtoError` into a [`HickoryDnsError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `hickory_proto::ProtoError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`HickoryDnsError`].
+    fn from(err: hickory_proto::ProtoError) -> Self {
+        Self::new("hickory-dns", &err.to_string())
+    }
+}
+
+impl From<hickory_proto::ProtoError> for ArbiterError {
+    /// Converts a `hickory_proto::ProtoError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `hickory_proto::ProtoError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::HickoryDns`].
+    fn from(err: hickory_proto::ProtoError) -> Self {
+        Self::HickoryDns(HickoryDnsError::from(err))
+    }
+}
+
+/// Wrapper error for `jsonwebtoken` RFC 7519 OIDC/JWT token decoding and signature verification failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("JWT validation error (issuer '{issuer}'): {reason}")]
+pub struct JwtValidationError {
+    /// Token issuer (`iss`) or validation context.
+    pub issuer: String,
+    /// Human-readable JWT validation failure reason.
+    pub reason: String,
+}
+
+impl JwtValidationError {
+    /// Creates a new [`JwtValidationError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `issuer` - Token issuer or validation context.
+    /// * `reason` - Diagnostic failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`JwtValidationError`].
+    pub fn new(issuer: &str, reason: &str) -> Self {
+        Self {
+            issuer: issuer.to_owned(),
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+impl From<jsonwebtoken::errors::Error> for JwtValidationError {
+    /// Converts a `jsonwebtoken::errors::Error` into a [`JwtValidationError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `jsonwebtoken::errors::Error`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`JwtValidationError`].
+    fn from(err: jsonwebtoken::errors::Error) -> Self {
+        Self::new("jsonwebtoken", &err.to_string())
+    }
+}
+
+impl From<jsonwebtoken::errors::Error> for ArbiterError {
+    /// Converts a `jsonwebtoken::errors::Error` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `jsonwebtoken::errors::Error`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::JwtValidation`].
+    fn from(err: jsonwebtoken::errors::Error) -> Self {
+        Self::JwtValidation(JwtValidationError::from(err))
+    }
+}
+
+impl From<spiffe::SpiffeIdError> for X509CertificateError {
+    /// Converts a `spiffe::SpiffeIdError` into an [`X509CertificateError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `spiffe::SpiffeIdError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`X509CertificateError`].
+    fn from(err: spiffe::SpiffeIdError) -> Self {
+        Self::new("spiffe://", &err.to_string())
+    }
+}
+
+impl From<spiffe::SpiffeIdError> for ArbiterError {
+    /// Converts a `spiffe::SpiffeIdError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `spiffe::SpiffeIdError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::X509Certificate`].
+    fn from(err: spiffe::SpiffeIdError) -> Self {
+        Self::X509Certificate(X509CertificateError::from(err))
+    }
+}
+
+/// Wrapper error for `cedar-policy` RBAC/ABAC policy parsing and authorization evaluation failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("Policy evaluation error in '{policy_id}': {reason}")]
+pub struct PolicyEvaluationError {
+    /// Policy identifier or evaluation context.
+    pub policy_id: String,
+    /// Human-readable policy failure reason.
+    pub reason: String,
+}
+
+impl PolicyEvaluationError {
+    /// Creates a new [`PolicyEvaluationError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `policy_id` - Policy identifier or evaluation context.
+    /// * `reason` - Diagnostic failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`PolicyEvaluationError`].
+    pub fn new(policy_id: &str, reason: &str) -> Self {
+        Self {
+            policy_id: policy_id.to_owned(),
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+impl From<cedar_policy::ParseErrors> for PolicyEvaluationError {
+    /// Converts `cedar_policy::ParseErrors` into a [`PolicyEvaluationError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `cedar_policy::ParseErrors`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`PolicyEvaluationError`].
+    fn from(err: cedar_policy::ParseErrors) -> Self {
+        Self::new("cedar::parse", &err.to_string())
+    }
+}
+
+impl From<cedar_policy::ParseErrors> for ArbiterError {
+    /// Converts `cedar_policy::ParseErrors` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `cedar_policy::ParseErrors`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::PolicyEvaluation`].
+    fn from(err: cedar_policy::ParseErrors) -> Self {
+        Self::PolicyEvaluation(PolicyEvaluationError::from(err))
+    }
+}
+
+impl From<cedar_policy::PolicySetError> for PolicyEvaluationError {
+    /// Converts a `cedar_policy::PolicySetError` into a [`PolicyEvaluationError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `cedar_policy::PolicySetError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`PolicyEvaluationError`].
+    fn from(err: cedar_policy::PolicySetError) -> Self {
+        Self::new("cedar::policy_set", &err.to_string())
+    }
+}
+
+impl From<cedar_policy::PolicySetError> for ArbiterError {
+    /// Converts a `cedar_policy::PolicySetError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `cedar_policy::PolicySetError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::PolicyEvaluation`].
+    fn from(err: cedar_policy::PolicySetError) -> Self {
+        Self::PolicyEvaluation(PolicyEvaluationError::from(err))
+    }
+}
+
+/// Wrapper error for `clap` command-line argument parsing and validation failures (`ClapCliError`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("CLI argument error ({kind}): {message}")]
+pub struct ClapCliError {
+    /// `clap::error::ErrorKind` name (e.g., `"UnknownArgument"`, `"DisplayHelp"`).
+    pub kind: String,
+    /// Formatted `clap` diagnostic message.
+    pub message: String,
+}
+
+impl ClapCliError {
+    /// Creates a new [`ClapCliError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `kind` - `clap` error classification name.
+    /// * `message` - Formatted diagnostic message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`ClapCliError`].
+    pub fn new(kind: &str, message: &str) -> Self {
+        Self {
+            kind: kind.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl From<clap::Error> for ClapCliError {
+    /// Converts a `clap::Error` into a [`ClapCliError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `clap::Error`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`ClapCliError`].
+    fn from(err: clap::Error) -> Self {
+        Self::new(&format!("{:?}", err.kind()), &err.to_string())
+    }
+}
+
+impl From<clap::Error> for ArbiterError {
+    /// Converts a `clap::Error` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `clap::Error`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::ClapCli`].
+    fn from(err: clap::Error) -> Self {
+        Self::ClapCli(ClapCliError::from(err))
+    }
+}
+
+/// Wrapper error for OpenTelemetry (`opentelemetry` / `OTLP`) span, metric, or trace context failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("OpenTelemetry error in '{signal_kind}': {message}")]
+pub struct OtlpTelemetryError {
+    /// Telemetry signal type (`metrics`, `traces`, `logs`, `traceparent`).
+    pub signal_kind: String,
+    /// Human-readable OpenTelemetry failure message.
+    pub message: String,
+}
+
+impl OtlpTelemetryError {
+    /// Creates a new [`OtlpTelemetryError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `signal_kind` - Telemetry signal category.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`OtlpTelemetryError`].
+    pub fn new(signal_kind: &str, message: &str) -> Self {
+        Self {
+            signal_kind: signal_kind.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for `prometheus-client` `OpenMetrics` registry or text encoding failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("Prometheus registry error for metric '{metric_name}': {message}")]
+pub struct PrometheusRegistryError {
+    /// Metric family name or registry operation.
+    pub metric_name: String,
+    /// Human-readable failure description.
+    pub message: String,
+}
+
+impl PrometheusRegistryError {
+    /// Creates a new [`PrometheusRegistryError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `metric_name` - Metric family name or context.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`PrometheusRegistryError`].
+    pub fn new(metric_name: &str, message: &str) -> Self {
+        Self {
+            metric_name: metric_name.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl From<core::fmt::Error> for PrometheusRegistryError {
+    /// Converts a `core::fmt::Error` `OpenMetrics` encoding error into a [`PrometheusRegistryError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `core::fmt::Error`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`PrometheusRegistryError`].
+    fn from(err: core::fmt::Error) -> Self {
+        Self::new("openmetrics_encode", &err.to_string())
+    }
+}
+
+impl From<core::fmt::Error> for ArbiterError {
+    /// Converts a `core::fmt::Error` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `core::fmt::Error`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::PrometheusRegistry`].
+    fn from(err: core::fmt::Error) -> Self {
+        Self::PrometheusRegistry(PrometheusRegistryError::from(err))
+    }
+}
+
+/// Wrapper error for `oci-spec` OCI Runtime Specification (`config.json`) or Image Specification failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("OCI specification error at '{bundle_path}': {message}")]
+pub struct OciSpecError {
+    /// Path or identifier of the OCI bundle or image manifest.
+    pub bundle_path: String,
+    /// Human-readable `oci-spec` failure description.
+    pub message: String,
+}
+
+impl OciSpecError {
+    /// Creates a new [`OciSpecError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `bundle_path` - Path or identifier of the OCI bundle.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`OciSpecError`].
+    pub fn new(bundle_path: &str, message: &str) -> Self {
+        Self {
+            bundle_path: bundle_path.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl From<oci_spec::OciSpecError> for OciSpecError {
+    /// Converts an `oci_spec::OciSpecError` into an [`OciSpecError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `oci_spec::OciSpecError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`OciSpecError`].
+    fn from(err: oci_spec::OciSpecError) -> Self {
+        Self::new("oci-spec", &err.to_string())
+    }
+}
+
+impl From<oci_spec::OciSpecError> for ArbiterError {
+    /// Converts an `oci_spec::OciSpecError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `oci_spec::OciSpecError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::OciSpec`].
+    fn from(err: oci_spec::OciSpecError) -> Self {
+        Self::OciSpec(OciSpecError::from(err))
+    }
+}
+
+/// Wrapper error for Linux `cgroups v2` controller and `seccomp-bpf` filter isolation failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("Linux isolation error in '{subsystem}' (target '{target}'): {reason}")]
+pub struct LinuxIsolationError {
+    /// Linux isolation subsystem (`cgroups-v2`, `seccomp-bpf`, `namespaces`).
+    pub subsystem: String,
+    /// Target cgroup hierarchy path or syscall filter name.
+    pub target: String,
+    /// Human-readable failure reason.
+    pub reason: String,
+}
+
+impl LinuxIsolationError {
+    /// Creates a new [`LinuxIsolationError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `subsystem` - Linux isolation subsystem name.
+    /// * `target` - Target cgroup or filter path.
+    /// * `reason` - Diagnostic failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`LinuxIsolationError`].
+    pub fn new(subsystem: &str, target: &str, reason: &str) -> Self {
+        Self {
+            subsystem: subsystem.to_owned(),
+            target: target.to_owned(),
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for `windows-sys` Job Objects, Processor Groups, and Host Compute Service (`HCS`) calls.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("windows-sys error in '{api_name}' (Win32 code {win32_error}): {message}")]
+pub struct WindowsSysError {
+    /// Invoked `windows-sys` function name.
+    pub api_name: String,
+    /// Numeric Win32 `GetLastError` or `HRESULT` status code.
+    pub win32_error: u32,
+    /// Human-readable failure description.
+    pub message: String,
+}
+
+impl WindowsSysError {
+    /// Creates a new [`WindowsSysError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `api_name` - Win32 API function name.
+    /// * `win32_error` - Numeric Win32 error code.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`WindowsSysError`].
+    pub fn new(api_name: &str, win32_error: u32, message: &str) -> Self {
+        Self {
+            api_name: api_name.to_owned(),
+            win32_error,
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for `nvml-wrapper` safe Rust NVIDIA Management Library bindings (`NvmlWrapperError`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("nvml-wrapper error on '{device_id}': {message}")]
+pub struct NvmlWrapperError {
+    /// Target GPU identifier or `"nvml"`.
+    pub device_id: String,
+    /// Human-readable `nvml_wrapper::error::NvmlError` description.
+    pub message: String,
+}
+
+impl NvmlWrapperError {
+    /// Creates a new [`NvmlWrapperError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `device_id` - GPU device identifier.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`NvmlWrapperError`].
+    pub fn new(device_id: &str, message: &str) -> Self {
+        Self {
+            device_id: device_id.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl From<nvml_wrapper::error::NvmlError> for NvmlWrapperError {
+    /// Converts an `nvml_wrapper::error::NvmlError` into an [`NvmlWrapperError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `NvmlError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`NvmlWrapperError`].
+    fn from(err: nvml_wrapper::error::NvmlError) -> Self {
+        Self::new("nvml", &err.to_string())
+    }
+}
+
+impl From<nvml_wrapper::error::NvmlError> for ArbiterError {
+    /// Converts an `nvml_wrapper::error::NvmlError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `NvmlError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::NvmlWrapper`].
+    fn from(err: nvml_wrapper::error::NvmlError) -> Self {
+        Self::NvmlWrapper(NvmlWrapperError::from(err))
+    }
+}
+
+/// Wrapper error for `object_store` unified artifact storage (`file://`, `s3://`, `gcs://`, `http://`) failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("Object store error ({store_scheme}) at '{path}': {message}")]
+pub struct ObjectStoreError {
+    /// Object store backend scheme (`local`, `memory`, `s3`, `gcs`, `http`).
+    pub store_scheme: String,
+    /// Object path or URI.
+    pub path: String,
+    /// Human-readable `object_store` failure message.
+    pub message: String,
+}
+
+impl ObjectStoreError {
+    /// Creates a new [`ObjectStoreError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `store_scheme` - Storage backend scheme.
+    /// * `path` - Target object path.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`ObjectStoreError`].
+    pub fn new(store_scheme: &str, path: &str, message: &str) -> Self {
+        Self {
+            store_scheme: store_scheme.to_owned(),
+            path: path.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+impl From<object_store::Error> for ObjectStoreError {
+    /// Converts an `object_store::Error` into an [`ObjectStoreError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `object_store::Error`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`ObjectStoreError`].
+    fn from(err: object_store::Error) -> Self {
+        Self::new("object_store", "", &err.to_string())
+    }
+}
+
+impl From<object_store::Error> for ArbiterError {
+    /// Converts an `object_store::Error` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `object_store::Error`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::ObjectStore`].
+    fn from(err: object_store::Error) -> Self {
+        Self::ObjectStore(ObjectStoreError::from(err))
+    }
+}
+
+impl From<object_store::path::Error> for ObjectStoreError {
+    /// Converts an `object_store::path::Error` into an [`ObjectStoreError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `object_store::path::Error`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`ObjectStoreError`].
+    fn from(err: object_store::path::Error) -> Self {
+        Self::new("object_store::path", "", &err.to_string())
+    }
+}
+
+impl From<object_store::path::Error> for ArbiterError {
+    /// Converts an `object_store::path::Error` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `object_store::path::Error`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::ObjectStore`].
+    fn from(err: object_store::path::Error) -> Self {
+        Self::ObjectStore(ObjectStoreError::from(err))
+    }
+}
+
+impl From<axum::Error> for HttpTransportError {
+    /// Converts an `axum::Error` into an [`HttpTransportError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `axum::Error`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`HttpTransportError`].
+    fn from(err: axum::Error) -> Self {
+        Self::new(500, &err.to_string())
+    }
+}
+
+impl From<axum::Error> for ArbiterError {
+    /// Converts an `axum::Error` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `axum::Error`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::HttpTransport`].
+    fn from(err: axum::Error) -> Self {
+        Self::HttpTransport(HttpTransportError::from(err))
+    }
+}
+
+impl From<uuid::Error> for CryptoSignatureError {
+    /// Converts a `uuid::Error` into a [`CryptoSignatureError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `uuid::Error`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`CryptoSignatureError`].
+    fn from(err: uuid::Error) -> Self {
+        Self::new("UUID", &err.to_string())
+    }
+}
+
+impl From<uuid::Error> for ArbiterError {
+    /// Converts a `uuid::Error` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `uuid::Error`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::CryptoSignature`].
+    fn from(err: uuid::Error) -> Self {
+        Self::CryptoSignature(CryptoSignatureError::from(err))
+    }
+}
+
+/// Wrapper error for `nix` POSIX/Linux system call failures (`NixSyscallError`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("nix syscall error (errno {errno}): {description}")]
+pub struct NixSyscallError {
+    /// Numeric POSIX `errno` value.
+    pub errno: i32,
+    /// Human-readable `nix::errno::Errno` description.
+    pub description: String,
+}
+
+impl NixSyscallError {
+    /// Creates a new [`NixSyscallError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `errno` - Numeric POSIX `errno` value.
+    /// * `description` - Human-readable error description.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`NixSyscallError`].
+    pub fn new(errno: i32, description: &str) -> Self {
+        Self {
+            errno,
+            description: description.to_owned(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl From<nix::errno::Errno> for NixSyscallError {
+    /// Converts a `nix::errno::Errno` into a [`NixSyscallError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `nix::errno::Errno`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`NixSyscallError`].
+    fn from(err: nix::errno::Errno) -> Self {
+        Self::new(err as i32, err.desc())
+    }
+}
+
+/// Wrapper error for Linux `seccomp-bpf` filter compilation and installation failures (`SeccompCompileError`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("seccomp-bpf filter compile error: {reason}")]
+pub struct SeccompCompileError {
+    /// Human-readable `seccomp-bpf` compilation or installation failure reason.
+    pub reason: String,
+}
+
+impl SeccompCompileError {
+    /// Creates a new [`SeccompCompileError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `reason` - Diagnostic failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`SeccompCompileError`].
+    pub fn new(reason: &str) -> Self {
+        Self {
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for Linux eBPF (`aya` / `bpf()` syscall) socket and cgroup fencing program loader failures.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("eBPF loader error for program '{program}': {reason}")]
+pub struct EbpfLoaderError {
+    /// Target eBPF program or attachment hook name.
+    pub program: String,
+    /// Human-readable eBPF loader failure reason.
+    pub reason: String,
+}
+
+impl EbpfLoaderError {
+    /// Creates a new [`EbpfLoaderError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `program` - eBPF program or hook name.
+    /// * `reason` - Diagnostic failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`EbpfLoaderError`].
+    pub fn new(program: &str, reason: &str) -> Self {
+        Self {
+            program: program.to_owned(),
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for Windows Job Object, NUMA Group Affinity, and Named Pipe syscall failures (`WindowsSyscallError`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("Windows syscall error in '{operation}' (code 0x{code:08x}): {reason}")]
+pub struct WindowsSyscallError {
+    /// Numeric Win32 or `NTSTATUS` code.
+    pub code: u32,
+    /// Invoked Windows syscall or operation name.
+    pub operation: String,
+    /// Human-readable failure reason.
+    pub reason: String,
+}
+
+impl WindowsSyscallError {
+    /// Creates a new [`WindowsSyscallError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `code` - Numeric Win32 status code.
+    /// * `operation` - Invoked Windows operation name.
+    /// * `reason` - Diagnostic failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`WindowsSyscallError`].
+    pub fn new(code: u32, operation: &str, reason: &str) -> Self {
+        Self {
+            code,
+            operation: operation.to_owned(),
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for `etcd` v3 gRPC KV, Lease, Watch, and CAS transaction failures (`EtcdGrpcError`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("etcd v3 gRPC error during '{operation}': {message}")]
+pub struct EtcdGrpcError {
+    /// Invoked `etcd` v3 gRPC operation (`Txn`, `Range`, `LeaseGrant`, `LeaseKeepAlive`, `Watch`).
+    pub operation: String,
+    /// Human-readable gRPC failure message.
+    pub message: String,
+}
+
+impl EtcdGrpcError {
+    /// Creates a new [`EtcdGrpcError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `operation` - `etcd` v3 gRPC operation name.
+    /// * `message` - Diagnostic failure message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`EtcdGrpcError`].
+    pub fn new(operation: &str, message: &str) -> Self {
+        Self {
+            operation: operation.to_owned(),
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for `PostgreSQL` connection pool acquisition and lifecycle failures (`PostgresPoolError`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("PostgreSQL connection pool error: {message}")]
+pub struct PostgresPoolError {
+    /// Human-readable connection pool failure description.
+    pub message: String,
+}
+
+impl PostgresPoolError {
+    /// Creates a new [`PostgresPoolError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `message` - Diagnostic connection pool error message.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`PostgresPoolError`].
+    pub fn new(message: &str) -> Self {
+        Self {
+            message: message.to_owned(),
+        }
+    }
+}
+
+/// Wrapper error for dynamic shared library symbol loading (`libloading::Error`) failures (`DynamicLibloadingError`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
+#[display("Dynamic libloading error for '{library}': {reason}")]
+pub struct DynamicLibloadingError {
+    /// Shared library name or path (`librocm_smi64.so`, `libze_loader.so.1`, `libnvidia-ml.so.1`).
+    pub library: String,
+    /// Human-readable loader failure reason.
+    pub reason: String,
+}
+
+impl DynamicLibloadingError {
+    /// Creates a new [`DynamicLibloadingError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `library` - Shared library name or path.
+    /// * `reason` - Diagnostic failure reason.
+    ///
+    /// # Returns
+    ///
+    /// Structured [`DynamicLibloadingError`].
+    pub fn new(library: &str, reason: &str) -> Self {
+        Self {
+            library: library.to_owned(),
+            reason: reason.to_owned(),
+        }
+    }
+}
+
+impl From<libloading::Error> for DynamicLibloadingError {
+    /// Converts a `libloading::Error` into a [`DynamicLibloadingError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `libloading::Error`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`DynamicLibloadingError`].
+    fn from(err: libloading::Error) -> Self {
+        Self::new("libloading", &err.to_string())
     }
 }
 
@@ -4223,6 +5758,136 @@ pub enum ArbiterError {
     #[display("Consul HTTP client failure: {_0}")]
     #[from]
     ConsulClient(ConsulClientError),
+
+    /// Wrapped [`ProstDecodeError`].
+    #[display("prost protobuf decode failure: {_0}")]
+    #[from]
+    ProstDecode(ProstDecodeError),
+
+    /// Wrapped [`ProstEncodeError`].
+    #[display("prost protobuf encode failure: {_0}")]
+    #[from]
+    ProstEncode(ProstEncodeError),
+
+    /// Wrapped [`HttpClientError`].
+    #[display("HTTP client failure: {_0}")]
+    #[from]
+    HttpClient(HttpClientError),
+
+    /// Wrapped [`LinuxSecurityModuleError`].
+    #[display("Linux security module failure: {_0}")]
+    #[from]
+    LinuxSecurityModule(LinuxSecurityModuleError),
+
+    /// Wrapped [`RaftEngineError`].
+    #[display("Raft engine failure: {_0}")]
+    #[from]
+    RaftEngine(RaftEngineError),
+
+    /// Wrapped [`RedbStorageError`].
+    #[display("redb ACID storage failure: {_0}")]
+    #[from]
+    RedbStorage(RedbStorageError),
+
+    /// Wrapped [`PostgresDriverError`].
+    #[display("PostgreSQL driver failure: {_0}")]
+    #[from]
+    PostgresDriver(PostgresDriverError),
+
+    /// Wrapped [`WebSocketTransportError`].
+    #[display("WebSocket transport failure: {_0}")]
+    #[from]
+    WebSocketTransport(WebSocketTransportError),
+
+    /// Wrapped [`HickoryDnsError`].
+    #[display("Hickory DNS protocol failure: {_0}")]
+    #[from]
+    HickoryDns(HickoryDnsError),
+
+    /// Wrapped [`JwtValidationError`].
+    #[display("JWT validation failure: {_0}")]
+    #[from]
+    JwtValidation(JwtValidationError),
+
+    /// Wrapped [`PolicyEvaluationError`].
+    #[display("Policy evaluation failure: {_0}")]
+    #[from]
+    PolicyEvaluation(PolicyEvaluationError),
+
+    /// Wrapped [`ClapCliError`].
+    #[display("CLI argument failure: {_0}")]
+    #[from]
+    ClapCli(ClapCliError),
+
+    /// Wrapped [`OtlpTelemetryError`].
+    #[display("OpenTelemetry failure: {_0}")]
+    #[from]
+    OtlpTelemetry(OtlpTelemetryError),
+
+    /// Wrapped [`PrometheusRegistryError`].
+    #[display("Prometheus registry failure: {_0}")]
+    #[from]
+    PrometheusRegistry(PrometheusRegistryError),
+
+    /// Wrapped [`OciSpecError`].
+    #[display("OCI specification failure: {_0}")]
+    #[from]
+    OciSpec(OciSpecError),
+
+    /// Wrapped [`LinuxIsolationError`].
+    #[display("Linux isolation failure: {_0}")]
+    #[from]
+    LinuxIsolation(LinuxIsolationError),
+
+    /// Wrapped [`WindowsSysError`].
+    #[display("windows-sys failure: {_0}")]
+    #[from]
+    WindowsSys(WindowsSysError),
+
+    /// Wrapped [`NvmlWrapperError`].
+    #[display("nvml-wrapper failure: {_0}")]
+    #[from]
+    NvmlWrapper(NvmlWrapperError),
+
+    /// Wrapped [`ObjectStoreError`].
+    #[display("Object store failure: {_0}")]
+    #[from]
+    ObjectStore(ObjectStoreError),
+
+    /// Wrapped [`NixSyscallError`].
+    #[display("nix syscall failure: {_0}")]
+    #[from]
+    NixSyscall(NixSyscallError),
+
+    /// Wrapped [`SeccompCompileError`].
+    #[display("seccomp-bpf compile failure: {_0}")]
+    #[from]
+    SeccompCompile(SeccompCompileError),
+
+    /// Wrapped [`EbpfLoaderError`].
+    #[display("eBPF loader failure: {_0}")]
+    #[from]
+    EbpfLoader(EbpfLoaderError),
+
+    /// Wrapped [`WindowsSyscallError`].
+    #[display("Windows syscall failure: {_0}")]
+    #[from]
+    WindowsSyscall(WindowsSyscallError),
+
+    /// Wrapped [`EtcdGrpcError`].
+    #[display("etcd v3 gRPC failure: {_0}")]
+    #[from]
+    EtcdGrpc(EtcdGrpcError),
+
+    /// Wrapped [`PostgresPoolError`].
+    #[display("PostgreSQL pool failure: {_0}")]
+    #[from]
+    PostgresPool(PostgresPoolError),
+
+    /// Wrapped [`DynamicLibloadingError`].
+    #[display("Dynamic libloading failure: {_0}")]
+    #[from]
+    DynamicLibloading(DynamicLibloadingError),
 }
 
 /// Generates bidirectional `TryFrom<ArbiterError>` conversions for wrapped domain error structs.
@@ -4315,6 +5980,32 @@ impl_try_from_arbiter_error!(
     (X509Parse, X509ParseError),
     (SqliteStorage, SqliteStorageError),
     (ConsulClient, ConsulClientError),
+    (ProstDecode, ProstDecodeError),
+    (ProstEncode, ProstEncodeError),
+    (HttpClient, HttpClientError),
+    (LinuxSecurityModule, LinuxSecurityModuleError),
+    (RaftEngine, RaftEngineError),
+    (RedbStorage, RedbStorageError),
+    (PostgresDriver, PostgresDriverError),
+    (WebSocketTransport, WebSocketTransportError),
+    (HickoryDns, HickoryDnsError),
+    (JwtValidation, JwtValidationError),
+    (PolicyEvaluation, PolicyEvaluationError),
+    (ClapCli, ClapCliError),
+    (OtlpTelemetry, OtlpTelemetryError),
+    (PrometheusRegistry, PrometheusRegistryError),
+    (OciSpec, OciSpecError),
+    (LinuxIsolation, LinuxIsolationError),
+    (WindowsSys, WindowsSysError),
+    (NvmlWrapper, NvmlWrapperError),
+    (ObjectStore, ObjectStoreError),
+    (NixSyscall, NixSyscallError),
+    (SeccompCompile, SeccompCompileError),
+    (EbpfLoader, EbpfLoaderError),
+    (WindowsSyscall, WindowsSyscallError),
+    (EtcdGrpc, EtcdGrpcError),
+    (PostgresPool, PostgresPoolError),
+    (DynamicLibloading, DynamicLibloadingError),
 );
 
 impl ArbiterError {
@@ -4615,6 +6306,34 @@ impl ArbiterError {
             307 | 503 => tonic::Status::unavailable(msg),
             _ => tonic::Status::internal(msg),
         }
+    }
+
+    /// Alias for [`ArbiterError::to_http_status_code`] returning the canonical HTTP status code (`u16`).
+    ///
+    /// # Returns
+    ///
+    /// Numeric HTTP status code (`307`, `400`, `401`, `403`, `404`, `409`, `429`, `500`, `502`, `503`).
+    pub const fn to_http_status(&self) -> u16 {
+        self.to_http_status_code()
+    }
+
+    /// Returns a deterministic numeric error code (`u32`) corresponding to this error's HTTP/gRPC classification.
+    ///
+    /// # Returns
+    ///
+    /// Numeric `u32` error code (`1000 + http_status`).
+    pub const fn error_code(&self) -> u32 {
+        1000_u32.saturating_add(self.to_http_status_code() as u32)
+    }
+
+    /// Returns `true` if the error represents a transient transport, leader-forwarding, or resource-contention
+    /// condition that is safe to retry with backoff.
+    ///
+    /// # Returns
+    ///
+    /// `true` for HTTP `307`, `429`, `502`, or `503` classifications; `false` otherwise.
+    pub const fn is_transient(&self) -> bool {
+        matches!(self.to_http_status_code(), 307 | 429 | 502 | 503)
     }
 }
 
@@ -5587,6 +7306,221 @@ mod tests {
                 .contains("X.509v3 parse failure:")
         );
         assert!(std::error::Error::source(&arbiter_x509_parse).is_some());
+
+        let prost_dec_wrap = ProstDecodeError::new("mesos.v1.Call", "invalid wire tag");
+        assert!(
+            prost_dec_wrap
+                .to_string()
+                .contains("prost protobuf decode error")
+        );
+        assert!(std::error::Error::source(&prost_dec_wrap).is_none());
+        let arbiter_prost_dec = ArbiterError::from(prost_dec_wrap);
+        assert!(
+            arbiter_prost_dec
+                .to_string()
+                .contains("prost protobuf decode failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_prost_dec).is_some());
+
+        let prost_enc_wrap = ProstEncodeError::new("mesos.v1.Event", 64, 0, "buffer full");
+        assert!(
+            prost_enc_wrap
+                .to_string()
+                .contains("prost protobuf encode error")
+        );
+        assert!(std::error::Error::source(&prost_enc_wrap).is_none());
+        let arbiter_prost_enc = ArbiterError::from(prost_enc_wrap);
+        assert!(
+            arbiter_prost_enc
+                .to_string()
+                .contains("prost protobuf encode failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_prost_enc).is_some());
+
+        let http_cli_wrap = HttpClientError::new(
+            "GET",
+            "https://registry.arbiter.internal",
+            502,
+            "bad gateway",
+        );
+        assert!(http_cli_wrap.to_string().contains("HTTP client error"));
+        assert!(std::error::Error::source(&http_cli_wrap).is_none());
+        let arbiter_http_cli = ArbiterError::from(http_cli_wrap);
+        assert!(
+            arbiter_http_cli
+                .to_string()
+                .contains("HTTP client failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_http_cli).is_some());
+
+        let lsm_wrap =
+            LinuxSecurityModuleError::new("seccomp-bpf", "default", "syscall not allowed");
+        assert!(lsm_wrap.to_string().contains("Linux security module error"));
+        assert!(std::error::Error::source(&lsm_wrap).is_none());
+        let arbiter_lsm = ArbiterError::from(lsm_wrap);
+        assert!(
+            arbiter_lsm
+                .to_string()
+                .contains("Linux security module failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_lsm).is_some());
+
+        let raft_eng_wrap = RaftEngineError::new(1, 5, "quorum lost");
+        assert!(raft_eng_wrap.to_string().contains("Raft engine error"));
+        assert!(std::error::Error::source(&raft_eng_wrap).is_none());
+        let arbiter_raft_eng = ArbiterError::from(raft_eng_wrap);
+        assert!(
+            arbiter_raft_eng
+                .to_string()
+                .contains("Raft engine failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_raft_eng).is_some());
+
+        let redb_wrap = RedbStorageError::new("/tmp/raft.redb", "open", "locked");
+        assert!(redb_wrap.to_string().contains("redb ACID storage error"));
+        assert!(std::error::Error::source(&redb_wrap).is_none());
+        let arbiter_redb = ArbiterError::from(redb_wrap);
+        assert!(
+            arbiter_redb
+                .to_string()
+                .contains("redb ACID storage failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_redb).is_some());
+
+        let pg_drv_wrap = PostgresDriverError::new("40001", "serialization_failure");
+        assert!(pg_drv_wrap.to_string().contains("PostgreSQL driver error"));
+        assert!(std::error::Error::source(&pg_drv_wrap).is_none());
+        let arbiter_pg_drv = ArbiterError::from(pg_drv_wrap);
+        assert!(
+            arbiter_pg_drv
+                .to_string()
+                .contains("PostgreSQL driver failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_pg_drv).is_some());
+
+        let ws_tr_wrap = WebSocketTransportError::new("/api/v1/executor", "closed");
+        assert!(ws_tr_wrap.to_string().contains("WebSocket transport error"));
+        assert!(std::error::Error::source(&ws_tr_wrap).is_none());
+        let arbiter_ws_tr = ArbiterError::from(ws_tr_wrap);
+        assert!(
+            arbiter_ws_tr
+                .to_string()
+                .contains("WebSocket transport failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_ws_tr).is_some());
+
+        let hickory_wrap = HickoryDnsError::new("pg.arbiter.internal", "NXDOMAIN");
+        assert!(
+            hickory_wrap
+                .to_string()
+                .contains("Hickory DNS protocol error")
+        );
+        assert!(std::error::Error::source(&hickory_wrap).is_none());
+        let arbiter_hickory = ArbiterError::from(hickory_wrap);
+        assert!(
+            arbiter_hickory
+                .to_string()
+                .contains("Hickory DNS protocol failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_hickory).is_some());
+
+        let jwt_wrap = JwtValidationError::new("arbiter-auth", "expired");
+        assert!(jwt_wrap.to_string().contains("JWT validation error"));
+        assert!(std::error::Error::source(&jwt_wrap).is_none());
+        let arbiter_jwt = ArbiterError::from(jwt_wrap);
+        assert!(arbiter_jwt.to_string().contains("JWT validation failure:"));
+        assert!(std::error::Error::source(&arbiter_jwt).is_some());
+
+        let cedar_wrap = PolicyEvaluationError::new("policy-0", "deny");
+        assert!(cedar_wrap.to_string().contains("Policy evaluation error"));
+        assert!(std::error::Error::source(&cedar_wrap).is_none());
+        let arbiter_cedar = ArbiterError::from(cedar_wrap);
+        assert!(
+            arbiter_cedar
+                .to_string()
+                .contains("Policy evaluation failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_cedar).is_some());
+
+        let clap_wrap = ClapCliError::new("UnknownArgument", "--bad-flag");
+        assert!(clap_wrap.to_string().contains("CLI argument error"));
+        assert!(std::error::Error::source(&clap_wrap).is_none());
+        let arbiter_clap = ArbiterError::from(clap_wrap);
+        assert!(arbiter_clap.to_string().contains("CLI argument failure:"));
+        assert!(std::error::Error::source(&arbiter_clap).is_some());
+
+        let otel_wrap = OtlpTelemetryError::new("traces", "invalid span id");
+        assert!(otel_wrap.to_string().contains("OpenTelemetry error"));
+        assert!(std::error::Error::source(&otel_wrap).is_none());
+        let arbiter_otel = ArbiterError::from(otel_wrap);
+        assert!(arbiter_otel.to_string().contains("OpenTelemetry failure:"));
+        assert!(std::error::Error::source(&arbiter_otel).is_some());
+
+        let prom_wrap = PrometheusRegistryError::new("arbiter_tasks", "duplicate");
+        assert!(prom_wrap.to_string().contains("Prometheus registry error"));
+        assert!(std::error::Error::source(&prom_wrap).is_none());
+        let arbiter_prom = ArbiterError::from(prom_wrap);
+        assert!(
+            arbiter_prom
+                .to_string()
+                .contains("Prometheus registry failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_prom).is_some());
+
+        let oci_spec_wrap = OciSpecError::new("/tmp/config.json", "invalid version");
+        assert!(
+            oci_spec_wrap
+                .to_string()
+                .contains("OCI specification error")
+        );
+        assert!(std::error::Error::source(&oci_spec_wrap).is_none());
+        let arbiter_oci_spec = ArbiterError::from(oci_spec_wrap);
+        assert!(
+            arbiter_oci_spec
+                .to_string()
+                .contains("OCI specification failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_oci_spec).is_some());
+
+        let linux_iso_wrap = LinuxIsolationError::new("cgroups-v2", "cpu.max", "EACCES");
+        assert!(linux_iso_wrap.to_string().contains("Linux isolation error"));
+        assert!(std::error::Error::source(&linux_iso_wrap).is_none());
+        let arbiter_linux_iso = ArbiterError::from(linux_iso_wrap);
+        assert!(
+            arbiter_linux_iso
+                .to_string()
+                .contains("Linux isolation failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_linux_iso).is_some());
+
+        let winsys_wrap = WindowsSysError::new("CreateJobObjectW", 5, "Access Denied");
+        assert!(winsys_wrap.to_string().contains("windows-sys error"));
+        assert!(std::error::Error::source(&winsys_wrap).is_none());
+        let arbiter_winsys = ArbiterError::from(winsys_wrap);
+        assert!(arbiter_winsys.to_string().contains("windows-sys failure:"));
+        assert!(std::error::Error::source(&arbiter_winsys).is_some());
+
+        let nvml_wrap_err = NvmlWrapperError::new("gpu-0", "not found");
+        assert!(nvml_wrap_err.to_string().contains("nvml-wrapper error"));
+        assert!(std::error::Error::source(&nvml_wrap_err).is_none());
+        let arbiter_nvml_wrap = ArbiterError::from(nvml_wrap_err);
+        assert!(
+            arbiter_nvml_wrap
+                .to_string()
+                .contains("nvml-wrapper failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_nvml_wrap).is_some());
+
+        let obj_store_wrap = ObjectStoreError::new("local", "/tmp/a", "not found");
+        assert!(obj_store_wrap.to_string().contains("Object store error"));
+        assert!(std::error::Error::source(&obj_store_wrap).is_none());
+        let arbiter_obj_store = ArbiterError::from(obj_store_wrap);
+        assert!(
+            arbiter_obj_store
+                .to_string()
+                .contains("Object store failure:")
+        );
+        assert!(std::error::Error::source(&arbiter_obj_store).is_some());
     }
 
     #[test]
@@ -6151,6 +8085,258 @@ mod tests {
             ConsulClientError,
             ConsulClientError::new("http://127.0.0.1:8500", 500, "err")
         );
+        check_try_from!(
+            ProstDecodeError,
+            ProstDecodeError::new("mesos.v1.Call", "bad wire tag")
+        );
+        check_try_from!(
+            ProstEncodeError,
+            ProstEncodeError::new("mesos.v1.Event", 64, 0, "buffer full")
+        );
+        check_try_from!(
+            HttpClientError,
+            HttpClientError::new("GET", "https://example.invalid", 502, "bad gateway")
+        );
+        check_try_from!(
+            LinuxSecurityModuleError,
+            LinuxSecurityModuleError::new("seccomp-bpf", "default", "invalid syscall")
+        );
+        check_try_from!(RaftEngineError, RaftEngineError::new(1, 2, "fatal"));
+        check_try_from!(RedbStorageError, RedbStorageError::new("db", "open", "err"));
+        check_try_from!(
+            PostgresDriverError,
+            PostgresDriverError::new("40001", "err")
+        );
+        check_try_from!(
+            WebSocketTransportError,
+            WebSocketTransportError::new("/ws", "err")
+        );
+        check_try_from!(HickoryDnsError, HickoryDnsError::new("q", "err"));
+        check_try_from!(JwtValidationError, JwtValidationError::new("iss", "err"));
+        check_try_from!(
+            PolicyEvaluationError,
+            PolicyEvaluationError::new("p", "err")
+        );
+        check_try_from!(ClapCliError, ClapCliError::new("k", "err"));
+        check_try_from!(OtlpTelemetryError, OtlpTelemetryError::new("s", "err"));
+        check_try_from!(
+            PrometheusRegistryError,
+            PrometheusRegistryError::new("m", "err")
+        );
+        check_try_from!(OciSpecError, OciSpecError::new("b", "err"));
+        check_try_from!(
+            LinuxIsolationError,
+            LinuxIsolationError::new("c", "t", "err")
+        );
+        check_try_from!(WindowsSysError, WindowsSysError::new("a", 1, "err"));
+        check_try_from!(NvmlWrapperError, NvmlWrapperError::new("d", "err"));
+        check_try_from!(ObjectStoreError, ObjectStoreError::new("s", "p", "err"));
+
+        let prost_dec_err =
+            <u64 as prost::Message>::decode(&[0x80_u8; 12][..]).map_err(ProstDecodeError::from);
+        assert!(prost_dec_err.is_err());
+        let mut zero_buf = [0_u8; 0];
+        let mut zero_slice: &mut [u8] = &mut zero_buf;
+        let prost_enc_err = <u64 as prost::Message>::encode(&128_u64, &mut zero_slice)
+            .map_err(ProstEncodeError::from);
+        assert!(prost_enc_err.is_err());
+
+        let etcd_from_status = EtcdClientError::from_tonic_status(
+            "etcd-grpc",
+            &tonic::Status::unavailable("etcd down"),
+        );
+        assert_eq!(etcd_from_status.endpoint, "etcd-grpc");
+    }
+
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn test_new_third_party_error_conversions_and_helpers() {
+        let fatal1 = RaftEngineError::from(openraft::error::Fatal::<u64>::Stopped);
+        assert_eq!(fatal1.node_id, 0);
+        let fatal2 = ArbiterError::from(openraft::error::Fatal::<u64>::Panicked);
+        assert!(fatal2.to_string().contains("Raft engine failure:"));
+
+        let fwd_with_id = openraft::error::ForwardToLeader::<u64, openraft::BasicNode> {
+            leader_id: Some(7),
+            leader_node: Some(openraft::BasicNode::new("127.0.0.1:9000")),
+        };
+        assert_eq!(RaftEngineError::from(fwd_with_id).node_id, 7);
+        let fwd_empty = openraft::error::ForwardToLeader::<u64, openraft::BasicNode>::empty();
+        assert_eq!(RaftEngineError::from(fwd_empty.clone()).node_id, 0);
+        assert!(
+            ArbiterError::from(fwd_empty)
+                .to_string()
+                .contains("Raft engine failure:")
+        );
+
+        let redb_stor = redb::StorageError::ValueTooLarge(999);
+        assert_eq!(RedbStorageError::from(redb_stor).operation, "storage");
+        let redb_stor2 = redb::StorageError::ValueTooLarge(999);
+        assert!(
+            ArbiterError::from(redb_stor2)
+                .to_string()
+                .contains("redb ACID storage failure:")
+        );
+
+        let redb_tbl = redb::TableError::TableDoesNotExist("t1".to_owned());
+        assert_eq!(RedbStorageError::from(redb_tbl).operation, "table");
+        let redb_tbl2 = redb::TableError::TableDoesNotExist("t1".to_owned());
+        assert!(
+            ArbiterError::from(redb_tbl2)
+                .to_string()
+                .contains("redb ACID storage failure:")
+        );
+
+        let redb_db = redb::DatabaseError::DatabaseAlreadyOpen;
+        assert_eq!(RedbStorageError::from(redb_db).operation, "database");
+        let redb_db2 = redb::DatabaseError::DatabaseAlreadyOpen;
+        assert!(
+            ArbiterError::from(redb_db2)
+                .to_string()
+                .contains("redb ACID storage failure:")
+        );
+
+        let redb_txn = redb::TransactionError::Storage(redb::StorageError::PreviousIo);
+        assert_eq!(RedbStorageError::from(redb_txn).operation, "transaction");
+        let redb_txn2 = redb::TransactionError::Storage(redb::StorageError::PreviousIo);
+        assert!(
+            ArbiterError::from(redb_txn2)
+                .to_string()
+                .contains("redb ACID storage failure:")
+        );
+
+        let redb_commit = redb::CommitError::Storage(redb::StorageError::PreviousIo);
+        assert_eq!(RedbStorageError::from(redb_commit).operation, "commit");
+        let redb_commit2 = redb::CommitError::Storage(redb::StorageError::PreviousIo);
+        assert!(
+            ArbiterError::from(redb_commit2)
+                .to_string()
+                .contains("redb ACID storage failure:")
+        );
+
+        let redb_gen = redb::Error::DatabaseAlreadyOpen;
+        assert_eq!(RedbStorageError::from(redb_gen).operation, "error");
+        let redb_gen2 = redb::Error::DatabaseAlreadyOpen;
+        assert!(
+            ArbiterError::from(redb_gen2)
+                .to_string()
+                .contains("redb ACID storage failure:")
+        );
+
+        let pg_parse1 = "invalid_key=1"
+            .parse::<tokio_postgres::Config>()
+            .map_err(PostgresDriverError::from);
+        assert!(pg_parse1.is_err());
+
+        let ws_tr1 =
+            WebSocketTransportError::from(tokio_tungstenite::tungstenite::Error::ConnectionClosed);
+        assert_eq!(ws_tr1.endpoint, "ws");
+
+        let dns_p1 = HickoryDnsError::from(hickory_proto::ProtoError::from("bad label"));
+        assert_eq!(dns_p1.query, "hickory-dns");
+        let dns_p2 = ArbiterError::from(hickory_proto::ProtoError::from("bad label"));
+        assert!(dns_p2.to_string().contains("Hickory DNS protocol failure:"));
+
+        let jwt_err1 = JwtValidationError::from(jsonwebtoken::errors::Error::from(
+            jsonwebtoken::errors::ErrorKind::InvalidToken,
+        ));
+        assert_eq!(jwt_err1.issuer, "jsonwebtoken");
+        let jwt_err2 = ArbiterError::from(jsonwebtoken::errors::Error::from(
+            jsonwebtoken::errors::ErrorKind::InvalidToken,
+        ));
+        assert!(jwt_err2.to_string().contains("JWT validation failure:"));
+
+        let spiffe_res1 =
+            spiffe::SpiffeId::new("not-a-spiffe-uri").map_err(X509CertificateError::from);
+        assert!(spiffe_res1.is_err());
+        let spiffe_res2 = spiffe::SpiffeId::new("not-a-spiffe-uri").map_err(ArbiterError::from);
+        assert!(spiffe_res2.is_err());
+
+        let cedar_p1 = "invalid cedar syntax !!!"
+            .parse::<cedar_policy::PolicySet>()
+            .map_err(PolicyEvaluationError::from);
+        assert!(cedar_p1.is_err());
+        let cedar_p2 = "invalid cedar syntax !!!"
+            .parse::<cedar_policy::PolicySet>()
+            .map_err(ArbiterError::from);
+        assert!(cedar_p2.is_err());
+
+        let mut pset = cedar_policy::PolicySet::new();
+        let pol_res = cedar_policy::Policy::parse(
+            Some(cedar_policy::PolicyId::new("p0")),
+            "permit(principal, action, resource);",
+        );
+        assert!(pol_res.is_ok());
+        let _ = pol_res.map(|pol| {
+            assert!(pset.add(pol.clone()).is_ok());
+            let dup1 = pset.add(pol.clone()).map_err(PolicyEvaluationError::from);
+            assert!(dup1.is_err());
+            let dup2 = pset.add(pol).map_err(ArbiterError::from);
+            assert!(dup2.is_err());
+        });
+
+        let clap_cmd = clap::Command::new("arbiter-test");
+        let clap_err1 = clap_cmd
+            .clone()
+            .try_get_matches_from(["arbiter-test", "--unknown-flag"])
+            .map_err(ClapCliError::from);
+        assert!(clap_err1.is_err());
+        let clap_err2 = clap_cmd
+            .try_get_matches_from(["arbiter-test", "--unknown-flag"])
+            .map_err(ArbiterError::from);
+        assert!(clap_err2.is_err());
+
+        let prom_err1 = PrometheusRegistryError::from(core::fmt::Error);
+        assert_eq!(prom_err1.metric_name, "openmetrics_encode");
+        let prom_err2 = ArbiterError::from(core::fmt::Error);
+        assert!(
+            prom_err2
+                .to_string()
+                .contains("Prometheus registry failure:")
+        );
+
+        let oci_err1 = oci_spec::runtime::Spec::load("/nonexistent/arbiter/config.json")
+            .map_err(OciSpecError::from);
+        assert!(oci_err1.is_err());
+        let oci_err2 = oci_spec::runtime::Spec::load("/nonexistent/arbiter/config.json")
+            .map_err(ArbiterError::from);
+        assert!(oci_err2.is_err());
+
+        let nvml_err1 = NvmlWrapperError::from(nvml_wrapper::error::NvmlError::NotSupported);
+        assert_eq!(nvml_err1.device_id, "nvml");
+        let nvml_err2 = ArbiterError::from(nvml_wrapper::error::NvmlError::NotSupported);
+        assert!(nvml_err2.to_string().contains("nvml-wrapper failure:"));
+
+        let obj_err1 = ObjectStoreError::from(object_store::Error::NotImplemented {
+            operation: "put".to_owned(),
+            implementer: "memory".to_owned(),
+        });
+        assert_eq!(obj_err1.store_scheme, "object_store");
+        let obj_err2 = ArbiterError::from(object_store::Error::NotImplemented {
+            operation: "put".to_owned(),
+            implementer: "memory".to_owned(),
+        });
+        assert!(obj_err2.to_string().contains("Object store failure:"));
+
+        let obj_path1 =
+            object_store::path::Path::parse("bad//path").map_err(ObjectStoreError::from);
+        assert!(obj_path1.is_err());
+        let obj_path2 = object_store::path::Path::parse("bad//path").map_err(ArbiterError::from);
+        assert!(obj_path2.is_err());
+
+        let axum_err1 = HttpTransportError::from(axum::Error::new(std::io::Error::other("axum")));
+        assert_eq!(axum_err1.status_code, 500);
+        let axum_err2 = ArbiterError::from(axum::Error::new(std::io::Error::other("axum")));
+        assert!(axum_err2.to_string().contains("HTTP transport failure:"));
+
+        let uuid_err1 = "not-a-uuid"
+            .parse::<uuid::Uuid>()
+            .map_err(CryptoSignatureError::from);
+        assert!(uuid_err1.is_err());
+        let uuid_err2 = "not-a-uuid"
+            .parse::<uuid::Uuid>()
+            .map_err(ArbiterError::from);
+        assert!(uuid_err2.is_err());
     }
 
     #[test]
@@ -6281,7 +8467,92 @@ mod tests {
 
         for (err, expected_http, expected_grpc) in cases {
             assert_eq!(err.to_http_status_code(), expected_http);
+            assert_eq!(err.to_http_status(), expected_http);
+            assert_eq!(err.error_code(), 1000 + u32::from(expected_http));
+            assert_eq!(
+                err.is_transient(),
+                matches!(expected_http, 307 | 429 | 502 | 503)
+            );
             assert_eq!(err.to_tonic_status().code(), expected_grpc);
         }
+    }
+
+    #[test]
+    fn test_phase1_error_wrappers_and_try_from() {
+        let other = ArbiterError::EmptyIdentifier {
+            kind: "TaskId".to_owned(),
+        };
+
+        let nix_w = NixSyscallError::new(1, "EPERM");
+        assert!(nix_w.to_string().contains("EPERM"));
+        assert!(std::error::Error::source(&nix_w).is_none());
+        #[cfg(unix)]
+        {
+            let from_errno = NixSyscallError::from(nix::errno::Errno::EACCES);
+            assert_eq!(from_errno.errno, nix::errno::Errno::EACCES as i32);
+            let arb_from_errno = ArbiterError::from(nix::errno::Errno::EACCES);
+            assert!(arb_from_errno.to_string().contains("POSIX syscall"));
+        }
+        let nix_arb = ArbiterError::from(nix_w.clone());
+        assert!(nix_arb.to_string().contains("nix syscall failure:"));
+        assert!(std::error::Error::source(&nix_arb).is_some());
+        assert_eq!(NixSyscallError::try_from(nix_arb), Ok(nix_w));
+        assert!(NixSyscallError::try_from(other.clone()).is_err());
+
+        let sec_w = SeccompCompileError::new("invalid BPF instruction");
+        assert!(sec_w.to_string().contains("invalid BPF instruction"));
+        assert!(std::error::Error::source(&sec_w).is_none());
+        let sec_arb = ArbiterError::from(sec_w.clone());
+        assert!(sec_arb.to_string().contains("seccomp-bpf compile failure:"));
+        assert!(std::error::Error::source(&sec_arb).is_some());
+        assert_eq!(SeccompCompileError::try_from(sec_arb), Ok(sec_w));
+        assert!(SeccompCompileError::try_from(other.clone()).is_err());
+
+        let ebpf_w = EbpfLoaderError::new("cgroup_skb_egress", "verifier rejected");
+        assert!(ebpf_w.to_string().contains("cgroup_skb_egress"));
+        assert!(std::error::Error::source(&ebpf_w).is_none());
+        let ebpf_arb = ArbiterError::from(ebpf_w.clone());
+        assert!(ebpf_arb.to_string().contains("eBPF loader failure:"));
+        assert!(std::error::Error::source(&ebpf_arb).is_some());
+        assert_eq!(EbpfLoaderError::try_from(ebpf_arb), Ok(ebpf_w));
+        assert!(EbpfLoaderError::try_from(other.clone()).is_err());
+
+        let win_w = WindowsSyscallError::new(5, "AssignProcessToJobObject", "access denied");
+        assert!(win_w.to_string().contains("AssignProcessToJobObject"));
+        assert!(std::error::Error::source(&win_w).is_none());
+        let win_arb = ArbiterError::from(win_w.clone());
+        assert!(win_arb.to_string().contains("Windows syscall failure:"));
+        assert!(std::error::Error::source(&win_arb).is_some());
+        assert_eq!(WindowsSyscallError::try_from(win_arb), Ok(win_w));
+        assert!(WindowsSyscallError::try_from(other.clone()).is_err());
+
+        let etcd_w = EtcdGrpcError::new("Txn", "raft leader changed");
+        assert!(etcd_w.to_string().contains("Txn"));
+        assert!(std::error::Error::source(&etcd_w).is_none());
+        let etcd_arb = ArbiterError::from(etcd_w.clone());
+        assert!(etcd_arb.to_string().contains("etcd v3 gRPC failure:"));
+        assert!(std::error::Error::source(&etcd_arb).is_some());
+        assert_eq!(EtcdGrpcError::try_from(etcd_arb), Ok(etcd_w));
+        assert!(EtcdGrpcError::try_from(other.clone()).is_err());
+
+        let pg_w = PostgresPoolError::new("pool timed out waiting for connection");
+        assert!(pg_w.to_string().contains("pool timed out"));
+        assert!(std::error::Error::source(&pg_w).is_none());
+        let pg_arb = ArbiterError::from(pg_w.clone());
+        assert!(pg_arb.to_string().contains("PostgreSQL pool failure:"));
+        assert!(std::error::Error::source(&pg_arb).is_some());
+        assert_eq!(PostgresPoolError::try_from(pg_arb), Ok(pg_w));
+        assert!(PostgresPoolError::try_from(other.clone()).is_err());
+
+        let dl_w = DynamicLibloadingError::from(libloading::Error::IncompatibleSize);
+        assert!(dl_w.to_string().contains("libloading"));
+        assert!(std::error::Error::source(&dl_w).is_none());
+        let dl_direct = ArbiterError::from(libloading::Error::IncompatibleSize);
+        assert!(dl_direct.to_string().contains("Dynamic library failure:"));
+        let dl_arb = ArbiterError::from(dl_w.clone());
+        assert!(dl_arb.to_string().contains("Dynamic libloading failure:"));
+        assert!(std::error::Error::source(&dl_arb).is_some());
+        assert_eq!(DynamicLibloadingError::try_from(dl_arb), Ok(dl_w));
+        assert!(DynamicLibloadingError::try_from(other).is_err());
     }
 }
