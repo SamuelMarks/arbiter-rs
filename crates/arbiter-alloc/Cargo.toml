@@ -13,6 +13,7 @@ categories.workspace = true
 
 [dependencies]
 arbiter-core = { workspace = true }
+ed25519-dalek = { workspace = true }
 serde = { workspace = true }
 
 [dev-dependencies]

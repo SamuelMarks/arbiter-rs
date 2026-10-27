@@ -60,6 +60,118 @@ pub struct PreemptionPlan {
     pub post_eviction_available: ResourceBundle,
 }
 
+/// Multi-stage graceful preemption lifecycle stage (`PreemptPending` -> `Checkpointing` -> `SigtermGrace` -> `Reclaimed`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum PreemptionStage {
+    /// Preemption warning emitted to executor/framework (`PreemptPending`).
+    PreemptPending,
+    /// Task is actively executing `CRIU` / `MicroVM` / application checkpointing (`Checkpointing`).
+    Checkpointing,
+    /// Task has been sent `SIGTERM` and is draining within its grace period (`SigtermGrace`).
+    SigtermGrace,
+    /// Task has exited or grace period elapsed; resources are reclaimed (`Reclaimed`).
+    Reclaimed,
+}
+
+/// Stateful checkpoint-before-kill preemption lifecycle machine for an evicted victim task.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PreemptionLifecycleStateMachine {
+    /// Victim [`TaskId`].
+    pub task_id: TaskId,
+    /// Assigned [`EvictionAction`].
+    pub action: EvictionAction,
+    /// Current [`PreemptionStage`].
+    pub stage: PreemptionStage,
+    /// Monotonic tick when the current stage deadline expires.
+    pub stage_deadline_tick: u64,
+    /// Grace duration in ticks for `SigtermGrace`.
+    pub sigterm_grace_ticks: u64,
+}
+
+impl PreemptionLifecycleStateMachine {
+    /// Creates a new [`PreemptionLifecycleStateMachine`] at `started_at_tick`.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - Victim [`TaskId`].
+    /// * `action` - Assigned [`EvictionAction`].
+    /// * `started_at_tick` - Monotonic tick when preemption started.
+    /// * `checkpoint_timeout_ticks` - Maximum ticks allowed for `Checkpointing`.
+    /// * `sigterm_grace_ticks` - Maximum ticks allowed for `SigtermGrace`.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`PreemptionLifecycleStateMachine`].
+    pub const fn new(
+        task_id: TaskId,
+        action: EvictionAction,
+        started_at_tick: u64,
+        checkpoint_timeout_ticks: u64,
+        sigterm_grace_ticks: u64,
+    ) -> Self {
+        let (stage, deadline) = match action {
+            EvictionAction::CheckpointAndSuspend => (
+                PreemptionStage::PreemptPending,
+                started_at_tick.saturating_add(checkpoint_timeout_ticks),
+            ),
+            EvictionAction::GracefulSigterm => (
+                PreemptionStage::SigtermGrace,
+                started_at_tick.saturating_add(sigterm_grace_ticks),
+            ),
+            EvictionAction::ImmediateKill => (PreemptionStage::Reclaimed, started_at_tick),
+        };
+        Self {
+            task_id,
+            action,
+            stage,
+            stage_deadline_tick: deadline,
+            sigterm_grace_ticks,
+        }
+    }
+
+    /// Advances the preemption state machine based on `current_tick`, `checkpoint_completed`, and `task_terminated`.
+    ///
+    /// # Arguments
+    ///
+    /// * `current_tick` - Current monotonic scheduler tick.
+    /// * `checkpoint_completed` - Whether the executor confirmed checkpoint completion.
+    /// * `task_terminated` - Whether the executor confirmed task process exit.
+    ///
+    /// # Returns
+    ///
+    /// Updated [`PreemptionStage`].
+    pub fn advance(
+        &mut self,
+        current_tick: u64,
+        checkpoint_completed: bool,
+        task_terminated: bool,
+    ) -> PreemptionStage {
+        if task_terminated {
+            self.stage = PreemptionStage::Reclaimed;
+            return self.stage;
+        }
+        match self.stage {
+            PreemptionStage::PreemptPending => {
+                self.stage = PreemptionStage::Checkpointing;
+            }
+            PreemptionStage::Checkpointing => {
+                if checkpoint_completed || current_tick >= self.stage_deadline_tick {
+                    self.stage = PreemptionStage::SigtermGrace;
+                    self.stage_deadline_tick =
+                        current_tick.saturating_add(self.sigterm_grace_ticks);
+                }
+            }
+            PreemptionStage::SigtermGrace => {
+                if current_tick >= self.stage_deadline_tick {
+                    self.stage = PreemptionStage::Reclaimed;
+                }
+            }
+            PreemptionStage::Reclaimed => {}
+        }
+        self.stage
+    }
+}
+
 /// Computes the idle guaranteed quota of a lender role that can be borrowed as `Revocable` capacity.
 ///
 /// # Arguments
@@ -673,6 +785,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_caas_primary_preemption_penalty() {
         let agent_id = AgentId::new("agent-1").unwrap_or_default();
         let incoming = make_incoming(16_000, PriorityClass::ProductionHigh);
@@ -770,5 +883,53 @@ mod tests {
             )
             .is_err()
         );
+
+        let tid = TaskId::new("victim-1").unwrap_or_default();
+        let mut sm_ckpt = PreemptionLifecycleStateMachine::new(
+            tid.clone(),
+            EvictionAction::CheckpointAndSuspend,
+            100,
+            50,
+            20,
+        );
+        assert_eq!(sm_ckpt.stage, PreemptionStage::PreemptPending);
+        assert_eq!(
+            sm_ckpt.advance(101, false, false),
+            PreemptionStage::Checkpointing
+        );
+        assert_eq!(
+            sm_ckpt.advance(110, false, false),
+            PreemptionStage::Checkpointing
+        );
+        assert_eq!(
+            sm_ckpt.advance(120, true, false),
+            PreemptionStage::SigtermGrace
+        );
+        assert_eq!(
+            sm_ckpt.advance(130, false, false),
+            PreemptionStage::SigtermGrace
+        );
+        assert_eq!(
+            sm_ckpt.advance(145, false, false),
+            PreemptionStage::Reclaimed
+        );
+        assert_eq!(
+            sm_ckpt.advance(150, false, false),
+            PreemptionStage::Reclaimed
+        );
+
+        let mut sm_sig = PreemptionLifecycleStateMachine::new(
+            tid.clone(),
+            EvictionAction::GracefulSigterm,
+            10,
+            50,
+            20,
+        );
+        assert_eq!(sm_sig.stage, PreemptionStage::SigtermGrace);
+        assert_eq!(sm_sig.advance(15, false, true), PreemptionStage::Reclaimed);
+
+        let sm_kill =
+            PreemptionLifecycleStateMachine::new(tid, EvictionAction::ImmediateKill, 10, 50, 20);
+        assert_eq!(sm_kill.stage, PreemptionStage::Reclaimed);
     }
 }

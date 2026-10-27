@@ -3096,6 +3096,66 @@ impl From<tokio::time::error::Elapsed> for ArbiterError {
     }
 }
 
+impl<T> From<tokio::sync::mpsc::error::SendError<T>> for AsyncRuntimeError {
+    /// Converts a `tokio::sync::mpsc::error::SendError<T>` into an [`AsyncRuntimeError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `SendError<T>`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`AsyncRuntimeError`].
+    fn from(err: tokio::sync::mpsc::error::SendError<T>) -> Self {
+        Self::new("tokio::mpsc::send", &err.to_string())
+    }
+}
+
+impl<T> From<tokio::sync::mpsc::error::SendError<T>> for ArbiterError {
+    /// Converts a `tokio::sync::mpsc::error::SendError<T>` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `SendError<T>`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::AsyncRuntime`].
+    fn from(err: tokio::sync::mpsc::error::SendError<T>) -> Self {
+        Self::AsyncRuntime(AsyncRuntimeError::from(err))
+    }
+}
+
+impl From<tokio::sync::oneshot::error::RecvError> for AsyncRuntimeError {
+    /// Converts a `tokio::sync::oneshot::error::RecvError` into an [`AsyncRuntimeError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `RecvError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`AsyncRuntimeError`].
+    fn from(err: tokio::sync::oneshot::error::RecvError) -> Self {
+        Self::new("tokio::oneshot::recv", &err.to_string())
+    }
+}
+
+impl From<tokio::sync::oneshot::error::RecvError> for ArbiterError {
+    /// Converts a `tokio::sync::oneshot::error::RecvError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `RecvError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::AsyncRuntime`].
+    fn from(err: tokio::sync::oneshot::error::RecvError) -> Self {
+        Self::AsyncRuntime(AsyncRuntimeError::from(err))
+    }
+}
+
 /// Wrapper error for generic gRPC transport and status failures (`GrpcTransportError`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
 #[display("gRPC transport error on '{endpoint}' (status {status_code}): {message}")]
@@ -3469,6 +3529,96 @@ impl From<openraft::error::ForwardToLeader<u64, openraft::BasicNode>> for Arbite
     ///
     /// [`ArbiterError::RaftEngine`].
     fn from(err: openraft::error::ForwardToLeader<u64, openraft::BasicNode>) -> Self {
+        Self::RaftEngine(RaftEngineError::from(err))
+    }
+}
+
+impl From<openraft::error::InitializeError<u64, openraft::BasicNode>> for RaftEngineError {
+    /// Converts an `openraft::error::InitializeError` into a [`RaftEngineError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `InitializeError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`RaftEngineError`].
+    fn from(err: openraft::error::InitializeError<u64, openraft::BasicNode>) -> Self {
+        Self::new(0, 0, &err.to_string())
+    }
+}
+
+impl From<openraft::error::InitializeError<u64, openraft::BasicNode>> for ArbiterError {
+    /// Converts an `openraft::error::InitializeError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `InitializeError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::RaftEngine`].
+    fn from(err: openraft::error::InitializeError<u64, openraft::BasicNode>) -> Self {
+        Self::RaftEngine(RaftEngineError::from(err))
+    }
+}
+
+impl From<openraft::error::ClientWriteError<u64, openraft::BasicNode>> for RaftEngineError {
+    /// Converts an `openraft::error::ClientWriteError` into a [`RaftEngineError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `ClientWriteError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`RaftEngineError`].
+    fn from(err: openraft::error::ClientWriteError<u64, openraft::BasicNode>) -> Self {
+        Self::new(0, 0, &err.to_string())
+    }
+}
+
+impl From<openraft::error::ClientWriteError<u64, openraft::BasicNode>> for ArbiterError {
+    /// Converts an `openraft::error::ClientWriteError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `ClientWriteError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::RaftEngine`].
+    fn from(err: openraft::error::ClientWriteError<u64, openraft::BasicNode>) -> Self {
+        Self::RaftEngine(RaftEngineError::from(err))
+    }
+}
+
+impl From<openraft::error::CheckIsLeaderError<u64, openraft::BasicNode>> for RaftEngineError {
+    /// Converts an `openraft::error::CheckIsLeaderError` into a [`RaftEngineError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `CheckIsLeaderError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`RaftEngineError`].
+    fn from(err: openraft::error::CheckIsLeaderError<u64, openraft::BasicNode>) -> Self {
+        Self::new(0, 0, &err.to_string())
+    }
+}
+
+impl From<openraft::error::CheckIsLeaderError<u64, openraft::BasicNode>> for ArbiterError {
+    /// Converts an `openraft::error::CheckIsLeaderError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `CheckIsLeaderError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::RaftEngine`].
+    fn from(err: openraft::error::CheckIsLeaderError<u64, openraft::BasicNode>) -> Self {
         Self::RaftEngine(RaftEngineError::from(err))
     }
 }
@@ -3922,6 +4072,66 @@ impl From<spiffe::SpiffeIdError> for ArbiterError {
     }
 }
 
+impl From<spiffe::svid::x509::X509SvidError> for X509CertificateError {
+    /// Converts a `spiffe::svid::x509::X509SvidError` into an [`X509CertificateError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `X509SvidError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`X509CertificateError`].
+    fn from(err: spiffe::svid::x509::X509SvidError) -> Self {
+        Self::new("spiffe::x509_svid", &err.to_string())
+    }
+}
+
+impl From<spiffe::svid::x509::X509SvidError> for ArbiterError {
+    /// Converts a `spiffe::svid::x509::X509SvidError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `X509SvidError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::X509Certificate`].
+    fn from(err: spiffe::svid::x509::X509SvidError) -> Self {
+        Self::X509Certificate(X509CertificateError::from(err))
+    }
+}
+
+impl From<spiffe::bundle::x509::X509BundleError> for X509CertificateError {
+    /// Converts a `spiffe::bundle::x509::X509BundleError` into an [`X509CertificateError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `X509BundleError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`X509CertificateError`].
+    fn from(err: spiffe::bundle::x509::X509BundleError) -> Self {
+        Self::new("spiffe::x509_bundle", &err.to_string())
+    }
+}
+
+impl From<spiffe::bundle::x509::X509BundleError> for ArbiterError {
+    /// Converts a `spiffe::bundle::x509::X509BundleError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `X509BundleError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::X509Certificate`].
+    fn from(err: spiffe::bundle::x509::X509BundleError) -> Self {
+        Self::X509Certificate(X509CertificateError::from(err))
+    }
+}
+
 /// Wrapper error for `cedar-policy` RBAC/ABAC policy parsing and authorization evaluation failures.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Display, Error)]
 #[display("Policy evaluation error in '{policy_id}': {reason}")]
@@ -4007,6 +4217,36 @@ impl From<cedar_policy::PolicySetError> for ArbiterError {
     ///
     /// [`ArbiterError::PolicyEvaluation`].
     fn from(err: cedar_policy::PolicySetError) -> Self {
+        Self::PolicyEvaluation(PolicyEvaluationError::from(err))
+    }
+}
+
+impl From<cedar_policy::RequestValidationError> for PolicyEvaluationError {
+    /// Converts a `cedar_policy::RequestValidationError` into a [`PolicyEvaluationError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `RequestValidationError`.
+    ///
+    /// # Returns
+    ///
+    /// A structured [`PolicyEvaluationError`].
+    fn from(err: cedar_policy::RequestValidationError) -> Self {
+        Self::new("cedar::request_validation", &err.to_string())
+    }
+}
+
+impl From<cedar_policy::RequestValidationError> for ArbiterError {
+    /// Converts a `cedar_policy::RequestValidationError` directly into an [`ArbiterError`].
+    ///
+    /// # Arguments
+    ///
+    /// * `err` - The underlying `RequestValidationError`.
+    ///
+    /// # Returns
+    ///
+    /// [`ArbiterError::PolicyEvaluation`].
+    fn from(err: cedar_policy::RequestValidationError) -> Self {
         Self::PolicyEvaluation(PolicyEvaluationError::from(err))
     }
 }
@@ -8135,11 +8375,139 @@ mod tests {
         let prost_dec_err =
             <u64 as prost::Message>::decode(&[0x80_u8; 12][..]).map_err(ProstDecodeError::from);
         assert!(prost_dec_err.is_err());
+        let prost_dec_arb =
+            <u64 as prost::Message>::decode(&[0x80_u8; 12][..]).map_err(ArbiterError::from);
+        assert!(prost_dec_arb.is_err());
         let mut zero_buf = [0_u8; 0];
         let mut zero_slice: &mut [u8] = &mut zero_buf;
         let prost_enc_err = <u64 as prost::Message>::encode(&128_u64, &mut zero_slice)
             .map_err(ProstEncodeError::from);
         assert!(prost_enc_err.is_err());
+        let mut zero_buf2 = [0_u8; 0];
+        let mut zero_slice2: &mut [u8] = &mut zero_buf2;
+        let prost_enc_arb =
+            <u64 as prost::Message>::encode(&128_u64, &mut zero_slice2).map_err(ArbiterError::from);
+        assert!(prost_enc_arb.is_err());
+
+        let (mpsc_tx, mpsc_rx) = tokio::sync::mpsc::unbounded_channel::<u32>();
+        drop(mpsc_rx);
+        let send_err1 = mpsc_tx.send(1).map_err(AsyncRuntimeError::from);
+        assert!(send_err1.is_err());
+        let send_err2 = mpsc_tx.send(2).map_err(ArbiterError::from);
+        assert!(send_err2.is_err());
+
+        let (oneshot_sender_a, mut oneshot_receiver_a) = tokio::sync::oneshot::channel::<u32>();
+        drop(oneshot_sender_a);
+        let _ = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map(|rt| {
+                rt.block_on(async {
+                    let recv_err1 = (&mut oneshot_receiver_a)
+                        .await
+                        .map_err(AsyncRuntimeError::from);
+                    assert!(recv_err1.is_err());
+                });
+            });
+        let (oneshot_sender_b, oneshot_receiver_b) = tokio::sync::oneshot::channel::<u32>();
+        drop(oneshot_sender_b);
+        let _ = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .map(|rt| {
+                rt.block_on(async {
+                    let recv_err2 = oneshot_receiver_b.await.map_err(ArbiterError::from);
+                    assert!(recv_err2.is_err());
+                });
+            });
+
+        let init_err = openraft::error::InitializeError::<u64, openraft::BasicNode>::NotAllowed(
+            openraft::error::NotAllowed {
+                last_log_id: None,
+                vote: openraft::Vote::new(1, 1),
+            },
+        );
+        assert_eq!(RaftEngineError::from(init_err.clone()).node_id, 0);
+        assert!(
+            ArbiterError::from(init_err)
+                .to_string()
+                .contains("Raft engine failure:")
+        );
+
+        let cw_err = openraft::error::ClientWriteError::<u64, openraft::BasicNode>::ForwardToLeader(
+            openraft::error::ForwardToLeader::empty(),
+        );
+        assert_eq!(RaftEngineError::from(cw_err.clone()).node_id, 0);
+        assert!(
+            ArbiterError::from(cw_err)
+                .to_string()
+                .contains("Raft engine failure:")
+        );
+
+        let cil_err =
+            openraft::error::CheckIsLeaderError::<u64, openraft::BasicNode>::ForwardToLeader(
+                openraft::error::ForwardToLeader::empty(),
+            );
+        assert_eq!(RaftEngineError::from(cil_err.clone()).node_id, 0);
+        assert!(
+            ArbiterError::from(cil_err)
+                .to_string()
+                .contains("Raft engine failure:")
+        );
+
+        let svid_err1 = spiffe::X509Svid::parse_from_der(b"bad-der", b"bad-key")
+            .map_err(X509CertificateError::from);
+        assert!(svid_err1.is_err());
+        let svid_err2 =
+            spiffe::X509Svid::parse_from_der(b"bad-der", b"bad-key").map_err(ArbiterError::from);
+        assert!(svid_err2.is_err());
+
+        let td_res = spiffe::TrustDomain::new("arbiter.internal");
+        assert!(td_res.is_ok());
+        let _ = td_res.map(|td| {
+            let b_err1 = spiffe::X509Bundle::parse_from_der(td.clone(), b"bad-der")
+                .map_err(X509CertificateError::from);
+            assert!(b_err1.is_err());
+            let b_err2 =
+                spiffe::X509Bundle::parse_from_der(td, b"bad-der").map_err(ArbiterError::from);
+            assert!(b_err2.is_err());
+        });
+
+        let schema_res = cedar_policy::Schema::from_cedarschema_str(
+            "entity User; action view appliesTo { principal: [User], resource: [User] };",
+        );
+        assert!(schema_res.is_ok());
+        let _ = schema_res.map(|(schema, _)| {
+            let _ = "User::\"alice\""
+                .parse::<cedar_policy::EntityUid>()
+                .map(|p_uid| {
+                    let _ = "Action::\"unknown_action\""
+                        .parse::<cedar_policy::EntityUid>()
+                        .map(|a_uid| {
+                            let _ =
+                                "User::\"bob\""
+                                    .parse::<cedar_policy::EntityUid>()
+                                    .map(|r_uid| {
+                                        let req_err1 = cedar_policy::Request::new(
+                                            p_uid.clone(),
+                                            a_uid.clone(),
+                                            r_uid.clone(),
+                                            cedar_policy::Context::empty(),
+                                            Some(&schema),
+                                        )
+                                        .map_err(PolicyEvaluationError::from);
+                                        assert!(req_err1.is_err());
+                                        let req_err2 = cedar_policy::Request::new(
+                                            p_uid,
+                                            a_uid,
+                                            r_uid,
+                                            cedar_policy::Context::empty(),
+                                            Some(&schema),
+                                        )
+                                        .map_err(ArbiterError::from);
+                                        assert!(req_err2.is_err());
+                                    });
+                        });
+                });
+        });
 
         let etcd_from_status = EtcdClientError::from_tonic_status(
             "etcd-grpc",

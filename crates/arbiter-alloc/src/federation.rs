@@ -29,6 +29,186 @@ pub struct FederatedBurstDecision {
     pub consumed_resources: ResourceBundle,
 }
 
+/// Cryptographically signed cross-cluster resource reservation claim ticket (`ClaimTicket`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimTicket {
+    /// Unique ticket identifier.
+    pub ticket_id: String,
+    /// Issuing home cluster ID.
+    pub home_cluster: ClusterId,
+    /// Target remote burst peer cluster ID.
+    pub target_cluster: ClusterId,
+    /// Claimed resource bundle.
+    pub claimed_resources: ResourceBundle,
+    /// Monotonic tick at which this claim ticket expires if not activated.
+    pub expires_at_tick: u64,
+    /// Ed25519 public key (32 bytes) of the issuing cluster authority.
+    pub issuer_public_key: [u8; 32],
+    /// Ed25519 signature (64 bytes) over the canonical claim payload.
+    pub signature: Vec<u8>,
+}
+
+impl ClaimTicket {
+    /// Signs and constructs a new [`ClaimTicket`] using `signing_key_bytes` (32-byte Ed25519 seed).
+    ///
+    /// # Arguments
+    ///
+    /// * `ticket_id` - Unique ticket identifier.
+    /// * `home_cluster` - Issuing home [`ClusterId`].
+    /// * `target_cluster` - Remote burst peer [`ClusterId`].
+    /// * `claimed_resources` - Reserved [`ResourceBundle`].
+    /// * `expires_at_tick` - Expiration tick.
+    /// * `signing_key_bytes` - 32-byte Ed25519 signing key seed.
+    ///
+    /// # Returns
+    ///
+    /// Signed [`ClaimTicket`].
+    pub fn sign_new(
+        ticket_id: &str,
+        home_cluster: ClusterId,
+        target_cluster: ClusterId,
+        claimed_resources: ResourceBundle,
+        expires_at_tick: u64,
+        signing_key_bytes: &[u8; 32],
+    ) -> Self {
+        use ed25519_dalek::{Signer, SigningKey};
+
+        let signing_key = SigningKey::from_bytes(signing_key_bytes);
+        let issuer_public_key = signing_key.verifying_key().to_bytes();
+        let msg = Self::canonical_payload(
+            ticket_id,
+            &home_cluster,
+            &target_cluster,
+            &claimed_resources,
+            expires_at_tick,
+        );
+        let sig = signing_key.sign(msg.as_bytes());
+        Self {
+            ticket_id: ticket_id.to_owned(),
+            home_cluster,
+            target_cluster,
+            claimed_resources,
+            expires_at_tick,
+            issuer_public_key,
+            signature: sig.to_bytes().to_vec(),
+        }
+    }
+
+    /// Formats the canonical byte string signed by [`Self::sign_new`].
+    ///
+    /// # Arguments
+    ///
+    /// * `ticket_id` - Ticket identifier.
+    /// * `home_cluster` - Home [`ClusterId`].
+    /// * `target_cluster` - Target [`ClusterId`].
+    /// * `claimed_resources` - Claimed [`ResourceBundle`].
+    /// * `expires_at_tick` - Expiration tick.
+    ///
+    /// # Returns
+    ///
+    /// Canonical payload string.
+    fn canonical_payload(
+        ticket_id: &str,
+        home_cluster: &ClusterId,
+        target_cluster: &ClusterId,
+        claimed_resources: &ResourceBundle,
+        expires_at_tick: u64,
+    ) -> String {
+        format!(
+            "{ticket_id}:{home_cluster}:{target_cluster}:{}:{}:{expires_at_tick}",
+            claimed_resources.cpu.get(),
+            claimed_resources.memory.get()
+        )
+    }
+
+    /// Verifies the Ed25519 cryptographic signature and TTL validity of this [`ClaimTicket`] at `current_tick`.
+    ///
+    /// # Arguments
+    ///
+    /// * `current_tick` - Current monotonic scheduler tick.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if the signature is authentic and `current_tick < self.expires_at_tick`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CryptoSignature`] if the public key or signature is invalid, or
+    /// [`ArbiterError::LeaseExpired`] if `current_tick >= self.expires_at_tick`.
+    pub fn verify(&self, current_tick: u64) -> ArbiterResult<()> {
+        use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+
+        if current_tick >= self.expires_at_tick {
+            return Err(ArbiterError::LeaseExpired {
+                lease_id: self.ticket_id.clone(),
+                expired_at_tick: self.expires_at_tick,
+            });
+        }
+        let verifying_key = VerifyingKey::from_bytes(&self.issuer_public_key)?;
+        let sig = Signature::from_slice(&self.signature)?;
+        let msg = Self::canonical_payload(
+            &self.ticket_id,
+            &self.home_cluster,
+            &self.target_cluster,
+            &self.claimed_resources,
+            self.expires_at_tick,
+        );
+        verifying_key.verify(msg.as_bytes(), &sig)?;
+        Ok(())
+    }
+}
+
+/// Active remote execution lease tracking burst capacity held on a federated peer cluster.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RemoteExecutionLease {
+    /// Verified [`ClaimTicket`] backing this remote execution lease.
+    pub ticket: ClaimTicket,
+    /// Monotonic tick when the remote lease expires if not renewed.
+    pub lease_expires_at_tick: u64,
+}
+
+/// Reclaims expired or unreachable [`RemoteExecutionLease`]s and credits their `claimed_resources`
+/// back to the corresponding peer in `peers`.
+///
+/// # Arguments
+///
+/// * `leases` - Mutable vector of active [`RemoteExecutionLease`]s.
+/// * `peers` - Mutable slice of [`BurstPeerCandidate`]s.
+/// * `current_tick` - Current monotonic scheduler tick.
+///
+/// # Returns
+///
+/// Number of reclaimed leases.
+pub fn reclaim_expired_or_unreachable_remote_leases(
+    leases: &mut Vec<RemoteExecutionLease>,
+    peers: &mut [BurstPeerCandidate],
+    current_tick: u64,
+) -> usize {
+    let mut reclaimed_count = 0_usize;
+    leases.retain(|lease| {
+        let peer_reachable = peers
+            .iter()
+            .find(|p| p.cluster_id == lease.ticket.target_cluster)
+            .is_some_and(|p| p.reachable);
+        let expired = current_tick >= lease.lease_expires_at_tick;
+        if !peer_reachable || expired {
+            for peer in peers.iter_mut() {
+                if peer.cluster_id == lease.ticket.target_cluster {
+                    peer.idle_capacity = peer
+                        .idle_capacity
+                        .try_add(&lease.ticket.claimed_resources)
+                        .unwrap_or_default();
+                }
+            }
+            reclaimed_count = reclaimed_count.saturating_add(1);
+            false
+        } else {
+            true
+        }
+    });
+    reclaimed_count
+}
+
 /// Selects a healthy federated peer cluster capable of absorbing an unplaced direct [`TaskSpec`].
 ///
 /// # Arguments
@@ -170,6 +350,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_cross_cluster_task_and_gang_bursting() {
         let mut peers = vec![
             BurstPeerCandidate {
@@ -242,5 +423,57 @@ mod tests {
         }
         assert!(burst_task_to_federation(&t1, &mut peers).is_err());
         assert!(burst_gang_to_federation(&gang_ok, &mut peers).is_err());
+
+        // 7. ClaimTicket Ed25519 signature verification & RemoteExecutionLease TTL reclamation
+        let seed = [7_u8; 32];
+        let home = ClusterId::new("us-east-1").unwrap_or_default();
+        let target = ClusterId::new("peer-large").unwrap_or_default();
+        let mut claimed = ResourceBundle::zero();
+        claimed.cpu = Millicores::new(4_000);
+        let ticket = ClaimTicket::sign_new("ticket-01", home, target.clone(), claimed, 500, &seed);
+        assert!(ticket.verify(100).is_ok());
+        assert!(ticket.verify(500).is_err());
+
+        let mut bad_sig_len = ticket.clone();
+        bad_sig_len.signature.truncate(10);
+        assert!(bad_sig_len.verify(100).is_err());
+
+        let mut bad_sig_bytes = ticket.clone();
+        bad_sig_bytes.signature = vec![0_u8; 64];
+        assert!(bad_sig_bytes.verify(100).is_err());
+
+        let mut bad_pubkey = ticket.clone();
+        // 0x02 followed by all 0x00 is a non-canonical / invalid Ed25519 compressed Edwards Y point
+        bad_pubkey.issuer_public_key = [2_u8; 32];
+        assert!(bad_pubkey.verify(100).is_err());
+
+        for p in &mut peers {
+            if p.cluster_id == target {
+                p.reachable = true;
+            }
+        }
+        let mut leases = vec![
+            RemoteExecutionLease {
+                ticket: ticket.clone(),
+                lease_expires_at_tick: 200,
+            },
+            RemoteExecutionLease {
+                ticket,
+                lease_expires_at_tick: 800,
+            },
+        ];
+        assert_eq!(
+            reclaim_expired_or_unreachable_remote_leases(&mut leases, &mut peers, 300),
+            1
+        );
+        assert_eq!(leases.len(), 1);
+        for p in &mut peers {
+            p.reachable = false;
+        }
+        assert_eq!(
+            reclaim_expired_or_unreachable_remote_leases(&mut leases, &mut peers, 350),
+            1
+        );
+        assert!(leases.is_empty());
     }
 }

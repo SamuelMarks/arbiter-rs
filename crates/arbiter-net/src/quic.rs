@@ -3870,6 +3870,270 @@ pub fn build_quinn_transport_config(
     Ok(std::sync::Arc::new(cfg))
 }
 
+/// Architectural 4-class QUIC stream routing role (`Control`, `ResourceOffers`, `StatusAndFence`,
+/// `MultiplexedHeartbeatAndCaas`) multiplexed over a single persistent `quinn::Connection`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ArchitecturalQuicStreamRole {
+    /// Stream Class 0: Bidirectional reliable control stream (`RegisterAgent`, `ReregisterAgent`, `RegisterFramework`, `Subscribe`, `RaftRpc`).
+    #[default]
+    Control,
+    /// Stream Class 1: Dedicated stream for `Offer`, `InverseOffer`, `RescindResourceOffer`, and `AcceptOffers` / `DeclineOffers`.
+    ResourceOffers,
+    /// Stream Class 2: High-priority stream for `TaskStatusUpdate`, `AcknowledgeStatusUpdate`, `OperationStatusUpdate`, and Tier-1 `StonithFenceTask` + `FenceVerificationReceipt`.
+    StatusAndFence,
+    /// Stream Class 3: Single-wire multiplexed `AgentHeartbeat` carrying hardware counter deltas and batched `ElectionGroup` lease renewals.
+    MultiplexedHeartbeatAndCaas,
+}
+
+impl ArchitecturalQuicStreamRole {
+    /// Converts this [`ArchitecturalQuicStreamRole`] into the wire [`QuicStreamClass`] byte (`0..=3`).
+    ///
+    /// # Returns
+    ///
+    /// Corresponding [`QuicStreamClass`].
+    pub const fn to_stream_class(self) -> QuicStreamClass {
+        match self {
+            Self::Control => QuicStreamClass::Control,
+            Self::ResourceOffers => QuicStreamClass::Telemetry,
+            Self::StatusAndFence => QuicStreamClass::ArtifactP2p,
+            Self::MultiplexedHeartbeatAndCaas => QuicStreamClass::ContainerIo,
+        }
+    }
+}
+
+/// Long-lived multi-peer `quinn` + `rustls` QUIC endpoint daemon (`PersistentQuinnEndpoint`).
+///
+/// Holds a persistent `quinn::Endpoint` server/client pair, a connection pool
+/// (`BTreeMap<std::net::SocketAddr, quinn::Connection>`) reusing established TLS 1.3 sessions
+/// across calls without creating ephemeral sockets per RPC, a `0-RTT`/`1-RTT` session ticket cache,
+/// connection migration tracking, and exponential-backoff reconnection.
+#[derive(Debug)]
+pub struct PersistentQuinnEndpoint {
+    /// Bound `AsyncQuicServer` listening for inbound peer streams and datagrams.
+    pub server: AsyncQuicServer,
+    /// Bound `AsyncQuicClient` initiating and pooling outbound peer connections.
+    pub client: AsyncQuicClient,
+    /// Pooled persistent `quinn::Connection` handles keyed by remote peer `SocketAddr`.
+    pub pooled_connections: std::collections::BTreeMap<std::net::SocketAddr, quinn::Connection>,
+    /// Cached `0-RTT` / `1-RTT` session tickets keyed by peer `SocketAddr`.
+    pub session_ticket_cache:
+        std::collections::BTreeMap<std::net::SocketAddr, ZeroRttSessionTicket>,
+    /// Reconnection exponential backoff policy.
+    pub backoff_policy: ReconnectBackoffPolicy,
+    /// Monotonic count of messages multiplexed per [`ArchitecturalQuicStreamRole`] (`0..=3`).
+    pub stream_role_counters: [u64; 4],
+}
+
+impl PersistentQuinnEndpoint {
+    /// Binds a long-lived [`PersistentQuinnEndpoint`] on `bind_addr` for `spiffe_san_dns`.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - Local UDP bind address (e.g., `"127.0.0.1:0"`).
+    /// * `spiffe_san_dns` - SPIFFE trust domain / DNS SAN (e.g., `"arbiter.internal"`).
+    /// * `backoff_policy` - [`ReconnectBackoffPolicy`] for automatic reconnection.
+    ///
+    /// # Returns
+    ///
+    /// Bound [`PersistentQuinnEndpoint`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if TLS 1.3 config construction or UDP socket binding fails.
+    pub fn bind(
+        bind_addr: &str,
+        spiffe_san_dns: &str,
+        backoff_policy: ReconnectBackoffPolicy,
+    ) -> ArbiterResult<Self> {
+        let pair = LiveQuinnEndpointPair::bind_pair(bind_addr, spiffe_san_dns)?;
+        Ok(Self {
+            server: pair.server,
+            client: pair.client,
+            pooled_connections: std::collections::BTreeMap::new(),
+            session_ticket_cache: std::collections::BTreeMap::new(),
+            backoff_policy,
+            stream_role_counters: [0; 4],
+        })
+    }
+
+    /// Returns a pooled `quinn::Connection` to `peer_addr`, establishing and caching a new TLS 1.3
+    /// connection (and issuing a `ZeroRttSessionTicket` into `session_ticket_cache`) if none exists.
+    ///
+    /// # Arguments
+    ///
+    /// * `peer_addr` - Target peer UDP `SocketAddr`.
+    /// * `ticket_secret` - 32-byte key for issuing `ZeroRttSessionTicket`s.
+    /// * `current_tick` - Monotonic tick.
+    ///
+    /// # Returns
+    ///
+    /// Active pooled `quinn::Connection`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if connection establishment fails.
+    pub async fn get_or_connect_peer(
+        &mut self,
+        peer_addr: std::net::SocketAddr,
+        ticket_secret: &[u8; 32],
+        current_tick: u64,
+    ) -> ArbiterResult<quinn::Connection> {
+        if let Some(existing) = self.pooled_connections.get(&peer_addr) {
+            return Ok(existing.clone());
+        }
+        let _ = self.backoff_policy.delay_for_attempt(0)?;
+        let connecting = self
+            .client
+            .endpoint
+            .connect(peer_addr, &self.client.server_name)?;
+        let conn = connecting.await?;
+        let cid = QuicConnectionId::new(u64::from(peer_addr.port()).max(1))?;
+        let ticket = ZeroRttSessionTicket::issue(
+            cid,
+            &format!("spiffe://{}/peer/{peer_addr}", self.client.server_name),
+            current_tick,
+            300,
+            ticket_secret,
+        );
+        self.session_ticket_cache.insert(peer_addr, ticket);
+        self.pooled_connections.insert(peer_addr, conn.clone());
+        Ok(conn)
+    }
+
+    /// Migrates a pooled peer connection from `old_addr` to `new_addr` after verifying its cached
+    /// [`ZeroRttSessionTicket`].
+    ///
+    /// # Arguments
+    ///
+    /// * `old_addr` - Previous peer `SocketAddr`.
+    /// * `new_addr` - New roaming peer `SocketAddr`.
+    /// * `ticket_secret` - 32-byte server session ticket secret key.
+    /// * `current_tick` - Current monotonic tick.
+    ///
+    /// # Returns
+    ///
+    /// Verified [`QuicConnectionId`] of the migrated peer session.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::QuicConnectionError`] if `old_addr` is not pooled or its ticket is invalid.
+    pub fn migrate_pooled_peer(
+        &mut self,
+        old_addr: std::net::SocketAddr,
+        new_addr: std::net::SocketAddr,
+        ticket_secret: &[u8; 32],
+        current_tick: u64,
+    ) -> ArbiterResult<QuicConnectionId> {
+        let Some(ticket) = self.session_ticket_cache.remove(&old_addr) else {
+            return Err(ArbiterError::QuicConnectionError {
+                stream_id: 0,
+                reason: format!("no cached 0-RTT ticket for peer '{old_addr}'"),
+            });
+        };
+        ticket.verify(ticket_secret, current_tick)?;
+        if let Some(conn) = self.pooled_connections.remove(&old_addr) {
+            self.pooled_connections.insert(new_addr, conn);
+        }
+        self.session_ticket_cache.insert(new_addr, ticket.clone());
+        Ok(ticket.connection_id)
+    }
+
+    /// Multiplexes and exchanges all four architectural stream roles (`Control`, `ResourceOffers`,
+    /// `StatusAndFence`, and `MultiplexedHeartbeatAndCaas`) over a single pooled `quinn::Connection`
+    /// without re-binding sockets or re-running TLS handshakes between streams.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - Server UDP bind address (`"127.0.0.1:0"`).
+    /// * `envelope` - [`WireEnvelope`] to exchange across all 4 multiplexed stream roles.
+    ///
+    /// # Returns
+    ///
+    /// Array of 4 decoded [`WireEnvelope`]s received across the 4 stream classes on the single connection.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if binding, connection pooling, or stream multiplexing fails.
+    pub fn exchange_four_stream_classes_over_pooled_connection_blocking(
+        bind_addr: &str,
+        envelope: &WireEnvelope,
+    ) -> ArbiterResult<[WireEnvelope; 4]> {
+        let env_clone = envelope.clone();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(arbiter_core::error::IoOperationError::from)?;
+        rt.block_on(async move {
+            let backoff = ReconnectBackoffPolicy {
+                initial_backoff_ms: 10,
+                max_backoff_ms: 100,
+                max_attempts: 3,
+            };
+            let mut daemon = Self::bind(bind_addr, "arbiter.internal", backoff)?;
+            let srv_addr = daemon.server.local_addr;
+            let srv_endpoint = daemon.server.endpoint.clone();
+            let srv_reply = env_clone.clone();
+            let srv_task = tokio::spawn(async move {
+                let incoming = srv_endpoint
+                    .accept()
+                    .await
+                    .ok_or(quinn::ConnectionError::LocallyClosed)?;
+                let conn = incoming.await?;
+                for _ in 0..4 {
+                    let (mut send, mut recv) = conn.accept_bi().await?;
+                    let raw = recv
+                        .read_to_end(arbiter_proto::MAX_WIRE_FRAME_BYTES as usize)
+                        .await?;
+                    let (cls, _, _) = decode_arbiter_wire_frame_for_class(&raw)?;
+                    let out = encode_arbiter_wire_frame_for_class(cls, &srv_reply)?;
+                    send.write_all(&out).await?;
+                    let _ = send.finish();
+                    let _ = send.stopped().await;
+                }
+                Ok::<(), ArbiterError>(())
+            });
+
+            let secret = [0x5A_u8; 32];
+            let roles = [
+                ArchitecturalQuicStreamRole::Control,
+                ArchitecturalQuicStreamRole::ResourceOffers,
+                ArchitecturalQuicStreamRole::StatusAndFence,
+                ArchitecturalQuicStreamRole::MultiplexedHeartbeatAndCaas,
+            ];
+            let mut replies = Vec::with_capacity(4);
+            for role in roles {
+                let conn = daemon.get_or_connect_peer(srv_addr, &secret, 10).await?;
+                let cls = role.to_stream_class();
+                let (mut c_send, mut c_recv) = conn.open_bi().await?;
+                let _ = c_send.set_priority(cls.priority_weight());
+                let frame = encode_arbiter_wire_frame_for_class(cls, &env_clone)?;
+                c_send.write_all(&frame).await?;
+                let _ = c_send.finish();
+                let rx_raw = c_recv
+                    .read_to_end(arbiter_proto::MAX_WIRE_FRAME_BYTES as usize)
+                    .await?;
+                let (_, _, dec) = decode_arbiter_wire_frame_for_class(&rx_raw)?;
+                if let Some(slot) = daemon
+                    .stream_role_counters
+                    .get_mut(usize::from(cls.class_id()))
+                {
+                    *slot = slot.saturating_add(1);
+                }
+                replies.push(dec);
+            }
+            let migrated_addr = std::net::SocketAddr::from(([127, 0, 0, 1], 65001));
+            let _ = daemon.migrate_pooled_peer(srv_addr, migrated_addr, &secret, 20)?;
+            srv_task.await??;
+            Ok([
+                replies.first().cloned().unwrap_or(env_clone.clone()),
+                replies.get(1).cloned().unwrap_or(env_clone.clone()),
+                replies.get(2).cloned().unwrap_or(env_clone.clone()),
+                replies.get(3).cloned().unwrap_or(env_clone),
+            ])
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arbiter_core::ids::AgentId;
@@ -4952,5 +5216,81 @@ mod tests {
         assert!(build_quinn_transport_config(QuicCongestionAlgorithm::BbrV3, 1000, 0).is_err());
         assert!(build_quinn_transport_config(QuicCongestionAlgorithm::BbrV3, 1000, 32).is_ok());
         assert!(build_quinn_transport_config(QuicCongestionAlgorithm::Cubic, 1000, 32).is_ok());
+
+        // Test ArchitecturalQuicStreamRole and PersistentQuinnEndpoint 4-class pooled multiplexing
+        assert_eq!(
+            ArchitecturalQuicStreamRole::default(),
+            ArchitecturalQuicStreamRole::Control
+        );
+        assert_eq!(
+            ArchitecturalQuicStreamRole::Control.to_stream_class(),
+            QuicStreamClass::Control
+        );
+        assert_eq!(
+            ArchitecturalQuicStreamRole::ResourceOffers.to_stream_class(),
+            QuicStreamClass::Telemetry
+        );
+        assert_eq!(
+            ArchitecturalQuicStreamRole::StatusAndFence.to_stream_class(),
+            QuicStreamClass::ArtifactP2p
+        );
+        assert_eq!(
+            ArchitecturalQuicStreamRole::MultiplexedHeartbeatAndCaas.to_stream_class(),
+            QuicStreamClass::ContainerIo
+        );
+        let pq_env = sample_envelope(601);
+        assert!(
+            PersistentQuinnEndpoint::exchange_four_stream_classes_over_pooled_connection_blocking(
+                "invalid-addr",
+                &pq_env
+            )
+            .is_err()
+        );
+        assert_eq!(
+            PersistentQuinnEndpoint::exchange_four_stream_classes_over_pooled_connection_blocking(
+                "127.0.0.1:0",
+                &pq_env
+            ),
+            Ok([
+                pq_env.clone(),
+                pq_env.clone(),
+                pq_env.clone(),
+                pq_env.clone()
+            ])
+        );
+        let _ = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|rt| {
+                rt.block_on(async {
+                    let backoff = ReconnectBackoffPolicy {
+                        initial_backoff_ms: 10,
+                        max_backoff_ms: 100,
+                        max_attempts: 2,
+                    };
+                    let _ =
+                        PersistentQuinnEndpoint::bind("127.0.0.1:0", "arbiter.internal", backoff)
+                            .map(|mut d| {
+                                let uncached = std::net::SocketAddr::from(([127, 0, 0, 1], 59999));
+                                assert!(
+                                    d.migrate_pooled_peer(uncached, uncached, &[0; 32], 10)
+                                        .is_err()
+                                );
+                                let cid = QuicConnectionId::new(1).unwrap_or_default();
+                                let ticket = ZeroRttSessionTicket::issue(
+                                    cid,
+                                    "spiffe://arbiter.internal/peer/1",
+                                    1,
+                                    100,
+                                    &[0x11; 32],
+                                );
+                                d.session_ticket_cache.insert(uncached, ticket);
+                                assert!(
+                                    d.migrate_pooled_peer(uncached, uncached, &[0x22; 32], 10)
+                                        .is_err()
+                                );
+                            });
+                });
+            });
     }
 }

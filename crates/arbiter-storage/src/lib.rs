@@ -2569,6 +2569,177 @@ impl CsiV1TonicGrpcFrameCodec {
             ))
         })
     }
+
+    /// Encodes a [`CsiV1ProtoVolumeResponse`] into a 5-byte HTTP/2 gRPC length-prefixed binary frame.
+    ///
+    /// # Arguments
+    ///
+    /// * `resp` - [`CsiV1ProtoVolumeResponse`] message.
+    ///
+    /// # Returns
+    ///
+    /// 5-byte length-prefixed protobuf payload (`[0x00, len_be_u32, protobuf_bytes...]`).
+    pub fn encode_grpc_response_frame(resp: &CsiV1ProtoVolumeResponse) -> Vec<u8> {
+        let payload = prost::Message::encode_to_vec(resp);
+        let len_u32 = u32::try_from(payload.len()).unwrap_or(u32::MAX);
+        let mut frame = Vec::with_capacity(5 + payload.len());
+        frame.push(0_u8);
+        frame.extend_from_slice(&len_u32.to_be_bytes());
+        frame.extend_from_slice(&payload);
+        frame
+    }
+
+    /// Decodes a 5-byte HTTP/2 gRPC length-prefixed binary frame into a [`CsiV1ProtoVolumeResponse`].
+    ///
+    /// # Arguments
+    ///
+    /// * `frame` - Raw gRPC response frame bytes.
+    ///
+    /// # Returns
+    ///
+    /// Decoded [`CsiV1ProtoVolumeResponse`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::CsiGrpc`] if `frame` is shorter than 5 bytes or protobuf decoding fails.
+    pub fn decode_grpc_response_frame(frame: &[u8]) -> ArbiterResult<CsiV1ProtoVolumeResponse> {
+        if frame.len() < 5 {
+            return Err(arbiter_core::error::CsiGrpcError::new(
+                "unix:///var/lib/csi/sockets/pluginproxy/csi.sock",
+                13,
+                "truncated 5-byte gRPC response frame header",
+            )
+            .into());
+        }
+        let mut len_b = [0_u8; 4];
+        len_b.copy_from_slice(frame.get(1..5).unwrap_or(&[0; 4]));
+        let expected_len = usize::try_from(u32::from_be_bytes(len_b)).unwrap_or(0);
+        let Some(body) = frame.get(5..5_usize.saturating_add(expected_len)) else {
+            return Err(arbiter_core::error::CsiGrpcError::new(
+                "unix:///var/lib/csi/sockets/pluginproxy/csi.sock",
+                13,
+                "truncated gRPC protobuf response body",
+            )
+            .into());
+        };
+        <CsiV1ProtoVolumeResponse as prost::Message>::decode(body).map_err(|e| {
+            ArbiterError::from(arbiter_core::error::CsiGrpcError::new(
+                "unix:///var/lib/csi/sockets/pluginproxy/csi.sock",
+                13,
+                &e.to_string(),
+            ))
+        })
+    }
+}
+
+/// CSI v1.9 Unix Domain Socket gRPC client (`UnixSocketCsiClient`).
+///
+/// Connects to `/var/lib/csi/sockets/pluginproxy/csi.sock` over a Unix Domain Socket, transmits
+/// a 5-byte HTTP/2 gRPC length-prefixed `prost::Message` [`CsiV1ProtoVolumeRequest`] frame, and
+/// decodes the plugin's [`CsiV1ProtoVolumeResponse`] frame.
+#[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UnixSocketCsiClient {
+    /// Path to the CSI v1.9 plugin Unix Domain Socket.
+    pub socket_path: String,
+}
+
+impl UnixSocketCsiClient {
+    /// Creates a new [`UnixSocketCsiClient`] targeting `socket_path`.
+    ///
+    /// # Arguments
+    ///
+    /// * `socket_path` - Path to the CSI Unix Domain Socket.
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`UnixSocketCsiClient`].
+    pub fn new(socket_path: &str) -> Self {
+        Self {
+            socket_path: socket_path.to_owned(),
+        }
+    }
+
+    /// Sends a 5-byte gRPC protobuf [`CsiV1ProtoVolumeRequest`] over the Unix Domain Socket at
+    /// `self.socket_path` and decodes the [`CsiV1ProtoVolumeResponse`].
+    ///
+    /// # Arguments
+    ///
+    /// * `req` - [`CsiV1ProtoVolumeRequest`] to transmit.
+    ///
+    /// # Returns
+    ///
+    /// Decoded [`CsiV1ProtoVolumeResponse`] returned by the CSI plugin.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketIoError`] if connecting to `socket_path` fails or
+    /// [`ArbiterError::CsiGrpc`] if response decoding fails.
+    #[cfg(unix)]
+    pub fn call_volume_rpc(
+        &self,
+        req: &CsiV1ProtoVolumeRequest,
+    ) -> ArbiterResult<CsiV1ProtoVolumeResponse> {
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixStream;
+
+        let mut stream =
+            UnixStream::connect(&self.socket_path).map_err(|err| ArbiterError::SocketIoError {
+                endpoint: self.socket_path.clone(),
+                reason: err.to_string(),
+            })?;
+        let tx_frame = CsiV1TonicGrpcFrameCodec::encode_grpc_frame(req);
+        let _ = stream.write_all(&tx_frame);
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        let mut rx_frame = Vec::new();
+        let _ = stream.read_to_end(&mut rx_frame);
+        CsiV1TonicGrpcFrameCodec::decode_grpc_response_frame(&rx_frame)
+    }
+
+    ///Applies an OCI image layer entry list with `.wh.<filename>` whiteout tombstone deletion semantics
+    /// on top of `<rootfs_dir>`, deleting any lower-layer file matching `<dir>/<filename>` when a
+    /// `.wh.<filename>` whiteout entry is encountered.
+    ///
+    /// # Arguments
+    ///
+    /// * `rootfs_dir` - Target merged rootfs or ZFS clone directory.
+    /// * `layer_entries` - Slice of `(relative_entry_path, entry_bytes)` in the OCI layer.
+    ///
+    /// # Returns
+    ///
+    /// Count of whiteout deletions applied.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::StoreWriteError`] if any entry fails path-traversal validation or disk write.
+    pub fn apply_oci_layer_with_whiteouts(
+        rootfs_dir: &std::path::Path,
+        layer_entries: &[(&str, &[u8])],
+    ) -> ArbiterResult<usize> {
+        let mat = SandboxMaterializer::new(&rootfs_dir.display().to_string());
+        let mut whiteout_deletions = 0_usize;
+        for &(rel_path, content) in layer_entries {
+            let full = mat.validate_and_resolve_archive_entry("rootfs", rel_path)?;
+            let path_obj = std::path::Path::new(&full);
+            let file_name = path_obj
+                .file_name()
+                .map(|f| f.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            if let Some(wh_target) = file_name.strip_prefix(".wh.") {
+                if let Some(parent) = path_obj.parent() {
+                    let victim = parent.join(wh_target);
+                    let _ = std::fs::remove_file(victim);
+                    whiteout_deletions = whiteout_deletions.saturating_add(1);
+                }
+            } else {
+                let _ = path_obj.parent().map(std::fs::create_dir_all);
+                std::fs::write(path_obj, content).map_err(|e| ArbiterError::StoreWriteError {
+                    key: full,
+                    reason: e.to_string(),
+                })?;
+            }
+        }
+        Ok(whiteout_deletions)
+    }
 }
 
 /// Returns the crate identifier for verification.
@@ -3714,7 +3885,7 @@ mod tests {
         let csi_frame = CsiV1TonicGrpcFrameCodec::encode_grpc_frame(&csi_req);
         assert_eq!(
             CsiV1TonicGrpcFrameCodec::decode_grpc_frame(&csi_frame),
-            Ok(csi_req)
+            Ok(csi_req.clone())
         );
         assert!(CsiV1TonicGrpcFrameCodec::decode_grpc_frame(&[0, 1]).is_err());
         assert!(CsiV1TonicGrpcFrameCodec::decode_grpc_frame(&[0, 0, 0, 0, 99, 1]).is_err());
@@ -3727,7 +3898,64 @@ mod tests {
         let resp_bytes = prost::Message::encode_to_vec(&csi_resp);
         assert_eq!(
             <CsiV1ProtoVolumeResponse as prost::Message>::decode(resp_bytes.as_slice()).ok(),
-            Some(csi_resp)
+            Some(csi_resp.clone())
+        );
+
+        let resp_frame = CsiV1TonicGrpcFrameCodec::encode_grpc_response_frame(&csi_resp);
+        assert_eq!(
+            CsiV1TonicGrpcFrameCodec::decode_grpc_response_frame(&resp_frame),
+            Ok(csi_resp.clone())
+        );
+        assert!(CsiV1TonicGrpcFrameCodec::decode_grpc_response_frame(&[0, 1]).is_err());
+        assert!(
+            CsiV1TonicGrpcFrameCodec::decode_grpc_response_frame(&[0, 0, 0, 0, 99, 1]).is_err()
+        );
+        assert!(
+            CsiV1TonicGrpcFrameCodec::decode_grpc_response_frame(&[0, 0, 0, 0, 1, 0xFF]).is_err()
+        );
+
+        let uds_csi_path = tmp_dir.join("csi_proto.sock");
+        let _ = std::fs::remove_file(&uds_csi_path);
+        let uds_cli = UnixSocketCsiClient::new(&uds_csi_path.display().to_string());
+        assert!(uds_cli.call_volume_rpc(&csi_req).is_err());
+        let _ = std::os::unix::net::UnixListener::bind(&uds_csi_path).map(|listener| {
+            let expected_resp = csi_resp.clone();
+            let srv_h = std::thread::spawn(move || {
+                use std::io::{Read, Write};
+                let _ = listener.accept().map(|(mut srv, _)| {
+                    let mut rx = Vec::new();
+                    let _ = srv.read_to_end(&mut rx);
+                    let tx = CsiV1TonicGrpcFrameCodec::encode_grpc_response_frame(&expected_resp);
+                    let _ = srv.write_all(&tx);
+                    let _ = srv.shutdown(std::net::Shutdown::Write);
+                });
+            });
+            assert_eq!(uds_cli.call_volume_rpc(&csi_req), Ok(csi_resp));
+            let _ = srv_h.join();
+        });
+
+        let wh_dir = tmp_dir.join("oci_wh_test");
+        assert_eq!(
+            UnixSocketCsiClient::apply_oci_layer_with_whiteouts(
+                &wh_dir,
+                &[
+                    ("etc/old.conf", b"old"),
+                    ("etc/.wh.old.conf", b""),
+                    ("etc/new.conf", b"new")
+                ]
+            ),
+            Ok(1)
+        );
+        assert!(
+            UnixSocketCsiClient::apply_oci_layer_with_whiteouts(&wh_dir, &[("../bad", b"x")])
+                .is_err()
+        );
+        assert!(
+            UnixSocketCsiClient::apply_oci_layer_with_whiteouts(
+                std::path::Path::new("/dev/null/bad_wh"),
+                &[("a.txt", b"x")]
+            )
+            .is_err()
         );
 
         let _ = std::fs::remove_dir_all(&tmp_dir);

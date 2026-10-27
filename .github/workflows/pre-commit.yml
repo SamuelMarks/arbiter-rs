@@ -1,9 +1,8 @@
-name: Pre-commit & CI Quality Gates
+name: CI
 
 on:
   push:
     branches:
-      - main
       - master
     tags:
       - "v*"

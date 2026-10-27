@@ -723,6 +723,9 @@ pub enum SchedulerCall {
     Message(FrameworkId, AgentId, ExecutorId, Vec<u8>),
     /// Hints to the Master allocator or cluster autoscaler about desired resource shapes: `(framework_id, requests)`.
     Request(FrameworkId, Vec<ResourceRequest>),
+    /// Dynamically updates a subscribed Framework's role list, suppressed roles, and offer filters without tearing down (`UPDATE_FRAMEWORK`):
+    /// `(sub, suppressed_roles, offer_filter)`.
+    UpdateFramework(SubscribeFramework, Vec<RoleName>, OfferFilter),
 }
 
 /// Complete Mesos v1 `scheduler::Event` notifications streamed from Master to a subscribed Framework.
@@ -2068,6 +2071,11 @@ pub fn extract_mesos_v1_protobuf_headers(
             SchedulerCall::Request(f, _) => {
                 fw = f.as_str().to_owned();
                 "REQUEST"
+            }
+            SchedulerCall::UpdateFramework(sub, _, _) => {
+                fw = sub.framework_id.as_str().to_owned();
+                rl = sub.role.as_str().to_owned();
+                "UPDATE_FRAMEWORK"
             }
         },
         WireMessage::SchedulerEvent(ev) => match ev.as_ref() {
@@ -3486,6 +3494,15 @@ mod tests {
                 vec![1, 2],
             ))),
             WireMessage::SchedulerCall(Box::new(SchedulerCall::Request(fw.clone(), Vec::new()))),
+            WireMessage::SchedulerCall(Box::new(SchedulerCall::UpdateFramework(
+                SubscribeFramework {
+                    framework_id: fw.clone(),
+                    role: rl.clone(),
+                    failover_timeout_ms: 5000,
+                },
+                vec![rl.clone()],
+                OfferFilter::default(),
+            ))),
             WireMessage::SchedulerEvent(Box::new(SchedulerEvent::Offers(vec![offer]))),
             WireMessage::SchedulerEvent(Box::new(SchedulerEvent::InverseOffers(vec![inv_offer]))),
             WireMessage::SchedulerEvent(Box::new(SchedulerEvent::Rescind(

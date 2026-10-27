@@ -470,6 +470,80 @@ pub const fn compute_shared_volume_fair_share(
     arbiter_core::units::Bytes::new(volume_capacity.get() / divisor)
 }
 
+/// Ranks active roles and frameworks using the **Apache Mesos 2-Stage Hierarchical Allocation Order**:
+///
+/// - **Stage 1 (Quota Guarantee Satisfaction)**: Roles whose current usage (`allocated + offered`)
+///   is strictly below their `guaranteed_min` quota (`is_below_guaranteed_quota`) are ranked first,
+///   ordered by their weighted dominant share ascending.
+/// - **Stage 2 (Weighted Dominant Resource Fairness Burst)**: Roles whose `guaranteed_min` is
+///   already satisfied (or zero) are ranked second, ordered by their HDRF share ascending up to
+///   their `hard_max` burst limit.
+///
+/// # Arguments
+///
+/// * `hierarchy` - Registered [`RoleHierarchy`] defining weights, parents, and quotas.
+/// * `states` - Slice of current [`RoleAllocationState`]s.
+/// * `outstanding_offers` - Per-role [`ResourceBundle`] of active leased offers.
+/// * `total_capacity` - Total cluster [`ResourceBundle`].
+///
+/// # Returns
+///
+/// Tuple `(Vec<DominantShareEntry>, ResourceBundle)` containing the 2-stage ordered candidates
+/// and the aggregate unsatisfied quota headroom [`ResourceBundle`] reserved for Stage 1 roles.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError`] if role lookup, quota ceiling validation, or share arithmetic fails.
+pub fn rank_two_stage_mesos_candidates(
+    hierarchy: &RoleHierarchy,
+    states: &[RoleAllocationState],
+    outstanding_offers: &BTreeMap<RoleName, ResourceBundle>,
+    total_capacity: &ResourceBundle,
+) -> ArbiterResult<(Vec<DominantShareEntry>, ResourceBundle)> {
+    let headroom = compute_unsatisfied_quota_headroom(hierarchy, states, outstanding_offers)?;
+    let hdrf_ordered =
+        rank_hdrf_candidates_with_offers(hierarchy, states, outstanding_offers, total_capacity)?;
+
+    let mut role_usage: BTreeMap<RoleName, ResourceBundle> = BTreeMap::new();
+    for state in states {
+        let offered = outstanding_offers
+            .get(&state.role)
+            .cloned()
+            .unwrap_or_else(ResourceBundle::zero);
+        let curr = role_usage
+            .get(&state.role)
+            .cloned()
+            .unwrap_or_else(ResourceBundle::zero);
+        let with_alloc = curr.try_add(&state.allocated).unwrap_or_default();
+        role_usage.insert(
+            state.role.clone(),
+            with_alloc.try_add(&offered).unwrap_or_default(),
+        );
+    }
+
+    let mut stage1_guarantee_unsatisfied = Vec::new();
+    let mut stage2_wdrf_burst = Vec::new();
+
+    for entry in hdrf_ordered {
+        let guaranteed_min = hierarchy
+            .get_role(&entry.role)
+            .map(|r| r.quota.guaranteed_min.clone())
+            .unwrap_or_default();
+        let used = role_usage
+            .get(&entry.role)
+            .cloned()
+            .unwrap_or_else(ResourceBundle::zero);
+        if is_below_guaranteed_quota(&used, &guaranteed_min) {
+            stage1_guarantee_unsatisfied.push(entry);
+        } else {
+            stage2_wdrf_burst.push(entry);
+        }
+    }
+
+    stage1_guarantee_unsatisfied.extend(stage2_wdrf_burst);
+    Ok((stage1_guarantee_unsatisfied, headroom))
+}
+
 /// Helper to construct a standard [`WeightBasisPoints`] when building test or default role configs.
 ///
 /// # Returns
@@ -785,6 +859,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::too_many_lines)]
     fn test_quota_headroom_offers_and_shared_volume_share() {
         let mut max_cap = ResourceBundle::zero();
         max_cap.cpu = Millicores::MAX;
@@ -885,6 +960,57 @@ mod tests {
                 Bytes::new(expected)
             );
         }
+
+        // Verify 2-Stage Mesos ranking: even if r_leaf has a higher current dominant share (4_000 + 2_000 = 6_000m)
+        // than an unguaranteed role (0m), r_leaf is below its guaranteed_min (10_000m) and is ranked in Stage 1 first!
+        let r_best_effort = RoleName::new("best-effort").unwrap_or_default();
+        let _ = h_headroom.add_role(Role {
+            name: r_best_effort.clone(),
+            parent: None,
+            quota: Quota {
+                id: QuotaId::new("q-be").unwrap_or_default(),
+                guaranteed_min: ResourceBundle::zero(),
+                hard_max: max_cap.clone(),
+                allow_burst_borrowing: true,
+                weight: WeightBasisPoints::STANDARD,
+            },
+        });
+        let mut two_stage_states = st_headroom;
+        two_stage_states.push(RoleAllocationState {
+            role: r_best_effort.clone(),
+            framework_id: None,
+            allocated: ResourceBundle::zero(),
+            allocation_count: 0,
+        });
+        let (two_stage_ranked, two_stage_headroom) = rank_two_stage_mesos_candidates(
+            &h_headroom,
+            &two_stage_states,
+            &offered_map,
+            &sample_capacity(),
+        )
+        .unwrap_or_default();
+        assert_eq!(two_stage_ranked.len(), 2);
+        assert_eq!(
+            two_stage_ranked.first().map(|e| &e.role),
+            Some(&RoleName::new("dept.ml").unwrap_or_default())
+        );
+        assert_eq!(
+            two_stage_ranked.get(1).map(|e| &e.role),
+            Some(&r_best_effort)
+        );
+        assert_eq!(two_stage_headroom.cpu, Millicores::new(20_000));
+        assert!(
+            rank_two_stage_mesos_candidates(&h_headroom, &bad_st, &offered_map, &max_cap).is_err()
+        );
+        assert!(
+            rank_two_stage_mesos_candidates(
+                &h_headroom,
+                &two_stage_states,
+                &offered_map,
+                &ResourceBundle::zero()
+            )
+            .is_err()
+        );
     }
 
     proptest! {

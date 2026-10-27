@@ -51,6 +51,86 @@ impl MesosStreamId {
     pub fn as_str(&self) -> &str {
         &self.0
     }
+
+    /// Generates a deterministic RFC 4122 UUID v4 [`MesosStreamId`] (`xxxxxxxx-xxxx-4xxx-8xxx-xxxxxxxxxxxx`)
+    /// from `(framework_id, monotonic_seq)`.
+    ///
+    /// # Arguments
+    ///
+    /// * `framework_id` - Subscribing [`FrameworkId`].
+    /// * `monotonic_seq` - Monotonic subscription sequence counter.
+    ///
+    /// # Returns
+    ///
+    /// Validated RFC 4122 UUID v4 [`MesosStreamId`].
+    pub fn issue_uuid_v4(framework_id: &FrameworkId, monotonic_seq: u64) -> Self {
+        use sha2::{Digest as _, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(framework_id.as_str().as_bytes());
+        hasher.update(monotonic_seq.to_le_bytes());
+        let digest = hasher.finalize();
+        let mut b = [0_u8; 16];
+        for (dst, &src) in b.iter_mut().zip(digest.iter().take(16)) {
+            *dst = src;
+        }
+        // Set RFC 4122 version 4 (0100xxxx) at byte 6 and variant 1 (10xxxxxx) at byte 8
+        b[6] = (b[6] & 0x0F) | 0x40;
+        b[8] = (b[8] & 0x3F) | 0x80;
+        let uuid_str = format!(
+            "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+            b[0],
+            b[1],
+            b[2],
+            b[3],
+            b[4],
+            b[5],
+            b[6],
+            b[7],
+            b[8],
+            b[9],
+            b[10],
+            b[11],
+            b[12],
+            b[13],
+            b[14],
+            b[15]
+        );
+        Self(uuid_str)
+    }
+
+    /// Validates that this [`MesosStreamId`] conforms to the canonical 36-character RFC 4122
+    /// UUID v4 layout (`8-4-4-4-12` hex digits with version nibble `'4'`).
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` if valid RFC 4122 UUID v4 format.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::HttpHandlerError`] (`400 Bad Request`) if malformed.
+    pub fn validate_uuid_v4_format(&self) -> ArbiterResult<()> {
+        let s = self.0.as_bytes();
+        let valid_len = s.len() == 36;
+        let valid_dashes = s.get(8) == Some(&b'-')
+            && s.get(13) == Some(&b'-')
+            && s.get(18) == Some(&b'-')
+            && s.get(23) == Some(&b'-');
+        let valid_ver = s.get(14) == Some(&b'4');
+        let all_hex_or_dash = s
+            .iter()
+            .enumerate()
+            .all(|(idx, &ch)| matches!(idx, 8 | 13 | 18 | 23) || ch.is_ascii_hexdigit());
+        if !(valid_len && valid_dashes && valid_ver && all_hex_or_dash) {
+            return Err(ArbiterError::HttpHandlerError {
+                status_code: 400,
+                message: format!(
+                    "Mesos-Stream-Id '{}' is not a valid 36-char RFC 4122 UUID v4",
+                    self.0
+                ),
+            });
+        }
+        Ok(())
+    }
 }
 
 /// RFC 6455 WebSocket frame opcode (`Text`, `Binary`, `Ping`, `Pong`, `Close`).
@@ -541,6 +621,51 @@ impl HttpGateway {
             });
         }
         Ok(())
+    }
+
+    /// Validates `Mesos-Stream-Id` RFC 4122 UUID v4 format and active binding for stateful
+    /// Scheduler `Call` messages (`ACCEPT`, `DECLINE`, `REVIVE`, `SUPPRESS`, `KILL`, `SHUTDOWN`,
+    /// `ACKNOWLEDGE`, `ACKNOWLEDGE_OPERATION_STATUS`, `RECONCILE`, `RECONCILE_OPERATIONS`,
+    /// `MESSAGE`, `REQUEST`), while issuing and binding a new UUID v4 `Mesos-Stream-Id` on `SUBSCRIBE`.
+    ///
+    /// # Arguments
+    ///
+    /// * `framework_id` - Calling [`FrameworkId`].
+    /// * `is_subscribe_call` - `true` if the `Call` is `SUBSCRIBE`, `false` for stateful follow-up calls.
+    /// * `presented_stream_id` - Optional `Mesos-Stream-Id` header value from the HTTP request.
+    /// * `monotonic_seq` - Monotonic sequence number used when issuing a new UUID v4 stream ID.
+    ///
+    /// # Returns
+    ///
+    /// Active or newly issued [`MesosStreamId`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::HttpHandlerError`] if a stateful call is missing `Mesos-Stream-Id`,
+    /// presents a non-UUID-v4 header, or presents a stale stream ID.
+    pub fn enforce_scheduler_call_stream_id(
+        &mut self,
+        framework_id: &FrameworkId,
+        is_subscribe_call: bool,
+        presented_stream_id: Option<&MesosStreamId>,
+        monotonic_seq: u64,
+    ) -> ArbiterResult<MesosStreamId> {
+        if is_subscribe_call {
+            let issued = MesosStreamId::issue_uuid_v4(framework_id, monotonic_seq);
+            self.bind_mesos_stream_id(framework_id.clone(), issued.clone());
+            return Ok(issued);
+        }
+        let Some(presented) = presented_stream_id else {
+            return Err(ArbiterError::HttpHandlerError {
+                status_code: 400,
+                message: format!(
+                    "missing required Mesos-Stream-Id header on stateful Call for framework '{framework_id}'"
+                ),
+            });
+        };
+        presented.validate_uuid_v4_format()?;
+        self.validate_mesos_stream_id(framework_id, presented)?;
+        Ok(presented.clone())
     }
 
     /// Executes a live TCP HTTP/1.1 request/response exchange between a bound [`HttpControlPlaneServer`]
@@ -3749,6 +3874,56 @@ data: "
                 &h2_env,
             ),
             Ok((h2_env.clone(), h2_env))
+        );
+
+        // RFC 4122 UUID v4 Mesos-Stream-Id generation, format validation, and stateful Call enforcement
+        let fw_uuid = FrameworkId::new("fw-uuid-v4").unwrap_or_default();
+        let issued_sid = MesosStreamId::issue_uuid_v4(&fw_uuid, 1);
+        assert_eq!(issued_sid.validate_uuid_v4_format(), Ok(()));
+        let bad_len_sid = MesosStreamId::new("short").unwrap_or_default();
+        assert!(bad_len_sid.validate_uuid_v4_format().is_err());
+        let bad_dash1 =
+            MesosStreamId::new("01234567X0123-4123-8123-0123456789ab").unwrap_or_default();
+        assert!(bad_dash1.validate_uuid_v4_format().is_err());
+        let bad_dash2 =
+            MesosStreamId::new("01234567-0123X4123-8123-0123456789ab").unwrap_or_default();
+        assert!(bad_dash2.validate_uuid_v4_format().is_err());
+        let bad_dash3 =
+            MesosStreamId::new("01234567-0123-4123X8123-0123456789ab").unwrap_or_default();
+        assert!(bad_dash3.validate_uuid_v4_format().is_err());
+        let bad_dash4 =
+            MesosStreamId::new("01234567-0123-4123-8123X0123456789ab").unwrap_or_default();
+        assert!(bad_dash4.validate_uuid_v4_format().is_err());
+        let bad_ver =
+            MesosStreamId::new("01234567-0123-5123-8123-0123456789ab").unwrap_or_default();
+        assert!(bad_ver.validate_uuid_v4_format().is_err());
+        let bad_hex =
+            MesosStreamId::new("01234567-0123-4123-8123-0123456789az").unwrap_or_default();
+        assert!(bad_hex.validate_uuid_v4_format().is_err());
+
+        let mut gw_sid = HttpGateway::new(SvidAuthority::new("arbiter.internal", [0x11; 32], 100));
+        assert!(
+            gw_sid
+                .enforce_scheduler_call_stream_id(&fw_uuid, false, None, 1)
+                .is_err()
+        );
+        assert!(
+            gw_sid
+                .enforce_scheduler_call_stream_id(&fw_uuid, false, Some(&bad_len_sid), 1)
+                .is_err()
+        );
+        assert!(
+            gw_sid
+                .enforce_scheduler_call_stream_id(&fw_uuid, false, Some(&issued_sid), 1)
+                .is_err()
+        );
+        let sub_sid = gw_sid
+            .enforce_scheduler_call_stream_id(&fw_uuid, true, None, 1)
+            .unwrap_or_default();
+        assert_eq!(sub_sid, issued_sid);
+        assert_eq!(
+            gw_sid.enforce_scheduler_call_stream_id(&fw_uuid, false, Some(&sub_sid), 2),
+            Ok(sub_sid)
         );
     }
 }

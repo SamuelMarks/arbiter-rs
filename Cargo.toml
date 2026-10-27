@@ -99,7 +99,7 @@ sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 nvml-wrapper = { version = "0.13", default-features = false }
 object_store = { version = "0.14", default-features = false }
 cedar-policy = { version = "4.14", default-features = false }
-spiffe = { version = "0.18", default-features = false }
+spiffe = { version = "0.18", default-features = false, features = ["x509"] }
 opentelemetry = { version = "0.33", default-features = false, features = ["trace"] }
 openraft = { version = "0.9", default-features = false }
 aes-gcm = { version = "0.11", default-features = false, features = ["aes"] }

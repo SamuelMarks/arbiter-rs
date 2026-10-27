@@ -1352,6 +1352,23 @@ impl<S: StateStore> MasterNode<S> {
                 }
                 Ok(vec![SchedulerEvent::Heartbeat])
             }
+            SchedulerCall::UpdateFramework(sub, suppressed_roles, filter) => {
+                let Some(fw) = self.frameworks.get_mut(&sub.framework_id) else {
+                    return Err(ArbiterError::FrameworkNotFound {
+                        framework_id: sub.framework_id.to_string(),
+                    });
+                };
+                fw.role = sub.role.clone();
+                fw.filter = filter;
+                if let Some(conn) = self.framework_connections.get_mut(&sub.framework_id) {
+                    conn.failover_timeout_ticks = sub.failover_timeout_ms;
+                    conn.suppressed_roles = suppressed_roles.into_iter().collect();
+                    conn.suppressed = conn.suppressed_roles.contains(&sub.role);
+                }
+                self.operator_event_log
+                    .push(OperatorEvent::FrameworkUpdated(sub.framework_id));
+                Ok(vec![SchedulerEvent::Heartbeat])
+            }
         }
     }
 
@@ -4406,6 +4423,38 @@ mod tests {
         assert!(
             master
                 .handle_scheduler_call(SchedulerCall::Request(fw_id.clone(), Vec::new()), 26)
+                .is_ok()
+        );
+        assert!(
+            master
+                .handle_scheduler_call(
+                    SchedulerCall::UpdateFramework(
+                        SubscribeFramework {
+                            framework_id: bad_fw.clone(),
+                            role: role.clone(),
+                            failover_timeout_ms: 500,
+                        },
+                        Vec::new(),
+                        OfferFilter::default(),
+                    ),
+                    26,
+                )
+                .is_err()
+        );
+        assert!(
+            master
+                .handle_scheduler_call(
+                    SchedulerCall::UpdateFramework(
+                        SubscribeFramework {
+                            framework_id: fw_id.clone(),
+                            role,
+                            failover_timeout_ms: 50,
+                        },
+                        Vec::new(),
+                        OfferFilter::default(),
+                    ),
+                    26,
+                )
                 .is_ok()
         );
         assert!(

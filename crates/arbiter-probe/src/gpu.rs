@@ -978,6 +978,62 @@ pub fn discover_intel_xe_tiles_dir(
     })
 }
 
+/// Scans a Linux AMD DRM device directory (`/sys/class/drm/card0/device`) for `MI300X` partition modes.
+///
+/// Reads `current_compute_partition` (`SPX`, `DPX`, `TPX`, `QPX`, `CPX`) and
+/// `current_memory_partition` (`NPS1`, `NPS2`, `NPS4`) from sysfs.
+///
+/// # Arguments
+///
+/// * `drm_device_dir` - Path to `/sys/class/drm/card*/device` or a synthetic test directory.
+///
+/// # Returns
+///
+/// Tuple `(AmdComputePartitionMode, AmdMemoryPartitionMode)`.
+///
+/// # Errors
+///
+/// Returns [`ArbiterError::RocmError`] if either sysfs file cannot be read or contains an unknown mode string.
+pub fn discover_amd_mi300x_partition_modes_dir(
+    drm_device_dir: &std::path::Path,
+) -> ArbiterResult<(AmdComputePartitionMode, AmdMemoryPartitionMode)> {
+    let comp_raw = std::fs::read_to_string(drm_device_dir.join("current_compute_partition"))
+        .map_err(|e| ArbiterError::RocmError {
+            device: drm_device_dir.display().to_string(),
+            reason: e.to_string(),
+        })?;
+    let mem_raw = std::fs::read_to_string(drm_device_dir.join("current_memory_partition"))
+        .map_err(|e| ArbiterError::RocmError {
+            device: drm_device_dir.display().to_string(),
+            reason: e.to_string(),
+        })?;
+    let comp_mode = match comp_raw.trim().to_ascii_uppercase().as_str() {
+        "SPX" => AmdComputePartitionMode::Spx,
+        "DPX" => AmdComputePartitionMode::Dpx,
+        "TPX" => AmdComputePartitionMode::Tpx,
+        "QPX" => AmdComputePartitionMode::Qpx,
+        "CPX" => AmdComputePartitionMode::Cpx,
+        other => {
+            return Err(ArbiterError::RocmError {
+                device: drm_device_dir.display().to_string(),
+                reason: format!("unknown AMD compute partition mode '{other}'"),
+            });
+        }
+    };
+    let mem_mode = match mem_raw.trim().to_ascii_uppercase().as_str() {
+        "NPS1" => AmdMemoryPartitionMode::Nps1,
+        "NPS2" => AmdMemoryPartitionMode::Nps2,
+        "NPS4" => AmdMemoryPartitionMode::Nps4,
+        other => {
+            return Err(ArbiterError::RocmError {
+                device: drm_device_dir.display().to_string(),
+                reason: format!("unknown AMD memory partition mode '{other}'"),
+            });
+        }
+    };
+    Ok((comp_mode, mem_mode))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1327,5 +1383,59 @@ mod tests {
         assert!(NvidiaNvmlProbe::from_vendor_ffi_backend(&ffi_err).is_err());
         assert!(AmdRocmProbe::from_vendor_ffi_backend(&ffi_err).is_err());
         assert!(IntelLevelZeroProbe::from_vendor_ffi_backend(&ffi_err).is_err());
+
+        // Test discover_amd_mi300x_partition_modes_dir across all compute/memory modes and error branches
+        let amd_part_dir =
+            std::env::temp_dir().join(format!("arbiter_amd_part_{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&amd_part_dir);
+        assert!(discover_amd_mi300x_partition_modes_dir(&amd_part_dir).is_err());
+        let _ = std::fs::create_dir_all(&amd_part_dir);
+        let _ = std::fs::write(amd_part_dir.join("current_compute_partition"), "SPX\n");
+        assert!(discover_amd_mi300x_partition_modes_dir(&amd_part_dir).is_err());
+        for (c_str, c_exp, m_str, m_exp) in [
+            (
+                "SPX",
+                AmdComputePartitionMode::Spx,
+                "NPS1",
+                AmdMemoryPartitionMode::Nps1,
+            ),
+            (
+                "DPX",
+                AmdComputePartitionMode::Dpx,
+                "NPS2",
+                AmdMemoryPartitionMode::Nps2,
+            ),
+            (
+                "TPX",
+                AmdComputePartitionMode::Tpx,
+                "NPS4",
+                AmdMemoryPartitionMode::Nps4,
+            ),
+            (
+                "QPX",
+                AmdComputePartitionMode::Qpx,
+                "NPS1",
+                AmdMemoryPartitionMode::Nps1,
+            ),
+            (
+                "CPX",
+                AmdComputePartitionMode::Cpx,
+                "NPS4",
+                AmdMemoryPartitionMode::Nps4,
+            ),
+        ] {
+            let _ = std::fs::write(amd_part_dir.join("current_compute_partition"), c_str);
+            let _ = std::fs::write(amd_part_dir.join("current_memory_partition"), m_str);
+            assert_eq!(
+                discover_amd_mi300x_partition_modes_dir(&amd_part_dir),
+                Ok((c_exp, m_exp))
+            );
+        }
+        let _ = std::fs::write(amd_part_dir.join("current_compute_partition"), "BAD_COMP");
+        assert!(discover_amd_mi300x_partition_modes_dir(&amd_part_dir).is_err());
+        let _ = std::fs::write(amd_part_dir.join("current_compute_partition"), "SPX");
+        let _ = std::fs::write(amd_part_dir.join("current_memory_partition"), "BAD_MEM");
+        assert!(discover_amd_mi300x_partition_modes_dir(&amd_part_dir).is_err());
+        let _ = std::fs::remove_dir_all(&amd_part_dir);
     }
 }

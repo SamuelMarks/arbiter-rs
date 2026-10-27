@@ -110,6 +110,87 @@ pub struct RegisteredFramework {
     pub suppressed_agents: BTreeMap<AgentId, u64>,
 }
 
+impl RegisteredFramework {
+    /// Applies a Mesos `OfferFilter` (`refuse_ticks`) for `agent_id` starting at `current_tick`.
+    ///
+    /// # Arguments
+    ///
+    /// * `agent_id` - [`AgentId`] whose offer was declined or partially accepted.
+    /// * `current_tick` - Current monotonic scheduler tick.
+    /// * `refuse_ticks` - Number of ticks to suppress offers from `agent_id`.
+    pub fn apply_refuse_filter(&mut self, agent_id: AgentId, current_tick: u64, refuse_ticks: u64) {
+        if refuse_ticks > 0 {
+            self.suppressed_agents
+                .insert(agent_id, current_tick.saturating_add(refuse_ticks));
+        }
+    }
+
+    /// Suppresses all offer generation for this framework until `revive_offers` is called
+    /// (`SchedulerCall::Suppress`).
+    pub fn suppress_offers(&mut self) {
+        self.filter.refuse_milliseconds = u64::MAX;
+    }
+
+    /// Clears all active agent `OfferFilter`s and role suppression (`SchedulerCall::Revive`).
+    pub fn revive_offers(&mut self) {
+        self.suppressed_agents.clear();
+        if self.filter.refuse_milliseconds == u64::MAX {
+            self.filter.refuse_milliseconds = 0;
+        }
+    }
+
+    /// Returns `true` if the framework has suppressed offer generation via [`Self::suppress_offers`].
+    ///
+    /// # Returns
+    ///
+    /// `true` if `self.filter.refuse_milliseconds == u64::MAX`.
+    pub const fn is_role_suppressed(&self) -> bool {
+        self.filter.refuse_milliseconds == u64::MAX
+    }
+}
+
+/// Computes the harvestable **Revocable Resource** slack on an Agent from `QoS` cgroup telemetry:
+/// `slack = max(0, allocated_reserved - actual_cgroup_usage_ewma)`.
+///
+/// # Arguments
+///
+/// * `allocated_reserved` - Non-revocable [`ResourceBundle`] currently allocated to tasks on the Agent.
+/// * `actual_usage_ewma` - Exponentially-weighted moving average [`ResourceBundle`] actually consumed by task cgroups.
+///
+/// # Returns
+///
+/// Harvestable revocable [`ResourceBundle`] slack.
+pub fn compute_agent_revocable_slack(
+    allocated_reserved: &ResourceBundle,
+    actual_usage_ewma: &ResourceBundle,
+) -> ResourceBundle {
+    ResourceBundle {
+        cpu: allocated_reserved.cpu.saturating_sub(actual_usage_ewma.cpu),
+        memory: allocated_reserved
+            .memory
+            .saturating_sub(actual_usage_ewma.memory),
+        hugepages: allocated_reserved
+            .hugepages
+            .saturating_sub(actual_usage_ewma.hugepages),
+        gpu_compute: allocated_reserved
+            .gpu_compute
+            .saturating_sub(actual_usage_ewma.gpu_compute),
+        gpu_vram: allocated_reserved
+            .gpu_vram
+            .saturating_sub(actual_usage_ewma.gpu_vram),
+        tpu_chips: allocated_reserved
+            .tpu_chips
+            .saturating_sub(actual_usage_ewma.tpu_chips),
+        disk: allocated_reserved
+            .disk
+            .saturating_sub(actual_usage_ewma.disk),
+        network_bandwidth: allocated_reserved
+            .network_bandwidth
+            .saturating_sub(actual_usage_ewma.network_bandwidth),
+        ports: arbiter_core::units::PortSet::empty(),
+    }
+}
+
 /// Output of a single scheduling cycle of the [`HybridAllocationEngine`].
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AllocationCycleOutcome {
@@ -333,6 +414,9 @@ impl HybridAllocationEngine {
             let Some(fw) = frameworks.iter().find(|f| &f.framework_id == fw_id) else {
                 continue;
             };
+            if fw.is_role_suppressed() {
+                continue;
+            }
             let is_revocable_borrow = hierarchy.roles().iter().any(|r| {
                 (r.name == fw.role)
                     & has_idle_lender_quota
@@ -781,5 +865,59 @@ mod tests {
         let empty_stack =
             resolve_offer_reservation_stack(&aid2, &r_base, &static_res, &dyn_res, &refined);
         assert!(empty_stack.is_empty());
+
+        let mut fw_sup = RegisteredFramework {
+            framework_id: FrameworkId::new("fw-sup").unwrap_or_default(),
+            role: r_base,
+            filter: OfferFilter::default(),
+            suppressed_agents: BTreeMap::new(),
+        };
+        fw_sup.apply_refuse_filter(aid1.clone(), 10, 0);
+        assert!(fw_sup.suppressed_agents.is_empty());
+        fw_sup.apply_refuse_filter(aid1, 10, 50);
+        assert_eq!(fw_sup.suppressed_agents.len(), 1);
+        assert!(!fw_sup.is_role_suppressed());
+        fw_sup.suppress_offers();
+        assert!(fw_sup.is_role_suppressed());
+
+        let (hierarchy, total_cap, _, r_fw) = sample_hierarchy_and_cap();
+        fw_sup.role = r_fw.clone();
+        let st_sup = vec![RoleAllocationState {
+            role: r_fw,
+            framework_id: Some(fw_sup.framework_id.clone()),
+            allocated: ResourceBundle::zero(),
+            allocation_count: 0,
+        }];
+        let mut ag_sup = vec![make_agent("agent-sup-1", 16_000, 16_000_000)];
+        let mut eng_sup = HybridAllocationEngine::new(100);
+        let out_sup = eng_sup
+            .run_allocation_cycle(
+                &hierarchy,
+                &st_sup,
+                &total_cap,
+                &mut ag_sup,
+                &[],
+                &[],
+                &[fw_sup.clone()],
+                100,
+            )
+            .unwrap_or_default();
+        assert!(out_sup.generated_offers.is_empty());
+
+        fw_sup.revive_offers();
+        assert!(!fw_sup.is_role_suppressed());
+        assert!(fw_sup.suppressed_agents.is_empty());
+        fw_sup.revive_offers();
+        assert!(!fw_sup.is_role_suppressed());
+
+        let mut reserved = ResourceBundle::zero();
+        reserved.cpu = Millicores::new(16_000);
+        reserved.memory = Bytes::new(32_000);
+        let mut ewma = ResourceBundle::zero();
+        ewma.cpu = Millicores::new(6_000);
+        ewma.memory = Bytes::new(12_000);
+        let revocable_slack = compute_agent_revocable_slack(&reserved, &ewma);
+        assert_eq!(revocable_slack.cpu, Millicores::new(10_000));
+        assert_eq!(revocable_slack.memory, Bytes::new(20_000));
     }
 }

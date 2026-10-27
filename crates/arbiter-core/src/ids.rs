@@ -398,6 +398,410 @@ define_string_id!(
     "StreamId"
 );
 
+define_string_id!(
+    /// Unique UUID identifier for Mesos v1 `Offer::Operation` status tracking and reconciliation (`OperationUuid`).
+    OperationUuid,
+    "OperationUuid"
+);
+
+define_string_id!(
+    /// Unique identifier for a Mesos v1 `OfferFilter` (`RefuseSeconds`) entry (`OfferFilterId`).
+    OfferFilterId,
+    "OfferFilterId"
+);
+
+/// Validated ZFS pool and dataset path (e.g., `tank/arbiter/vol-01`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct ZfsDatasetName(String);
+
+impl ZfsDatasetName {
+    /// Validates and constructs a [`ZfsDatasetName`].
+    ///
+    /// Must be non-empty, not start or end with `/`, not contain `..` or `//`, and only contain
+    /// ASCII alphanumeric characters, `-`, `_`, `.`, `:`, or `/`.
+    ///
+    /// # Arguments
+    ///
+    /// * `dataset` - Candidate ZFS dataset path string slice.
+    ///
+    /// # Returns
+    ///
+    /// Validated [`ZfsDatasetName`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::EmptyIdentifier`] if `dataset` is empty, or
+    /// [`ArbiterError::InvalidIdentifierCharacters`] if malformed.
+    pub fn new(dataset: &str) -> ArbiterResult<Self> {
+        if dataset.is_empty() {
+            return Err(ArbiterError::EmptyIdentifier {
+                kind: "ZfsDatasetName".to_owned(),
+            });
+        }
+        if dataset.starts_with('/')
+            || dataset.ends_with('/')
+            || dataset.contains("//")
+            || dataset.contains("..")
+        {
+            return Err(ArbiterError::InvalidIdentifierCharacters {
+                kind: "ZfsDatasetName".to_owned(),
+                value: dataset.to_owned(),
+                reason: "ZFS dataset name must not start/end with '/', contain '//', or '..'"
+                    .to_owned(),
+            });
+        }
+        let chars_ok = dataset.bytes().all(|b| {
+            b.is_ascii_alphanumeric()
+                || b == b'-'
+                || b == b'_'
+                || b == b'.'
+                || b == b':'
+                || b == b'/'
+        });
+        if !chars_ok {
+            return Err(ArbiterError::InvalidIdentifierCharacters {
+                kind: "ZfsDatasetName".to_owned(),
+                value: dataset.to_owned(),
+                reason: "ZFS dataset name contains disallowed characters".to_owned(),
+            });
+        }
+        Ok(Self(dataset.to_owned()))
+    }
+
+    /// Returns the ZFS dataset name string slice.
+    ///
+    /// # Returns
+    ///
+    /// Dataset name `&str`.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ZfsDatasetName {
+    /// Formats the ZFS dataset name.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl FromStr for ZfsDatasetName {
+    type Err = ArbiterError;
+
+    /// Parses a string slice into a [`ZfsDatasetName`].
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - Candidate dataset path string slice.
+    ///
+    /// # Returns
+    ///
+    /// Validated [`ZfsDatasetName`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if validation fails.
+    fn from_str(s: &str) -> ArbiterResult<Self> {
+        Self::new(s)
+    }
+}
+
+/// Validated OCI container image reference (`[registry/]repository[:tag][@sha256:digest]`).
+#[derive(
+    Debug,
+    Default,
+    Clone,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct OciImageReference {
+    /// Full canonical OCI image reference string.
+    raw: String,
+    /// Repository path (including optional registry prefix).
+    repository: String,
+    /// Optional image tag (e.g., `"latest"` or `"v1.2.3"`).
+    tag: Option<String>,
+    /// Optional immutable SHA-256 content digest.
+    digest: Option<Sha256Digest>,
+}
+
+impl OciImageReference {
+    /// Parses and validates an [`OciImageReference`] string (`[registry/]repo[:tag][@sha256:hex]`).
+    ///
+    /// # Arguments
+    ///
+    /// * `reference` - Candidate OCI image reference string slice.
+    ///
+    /// # Returns
+    ///
+    /// Validated [`OciImageReference`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::EmptyIdentifier`] if `reference` is empty, or
+    /// [`ArbiterError::InvalidIdentifierCharacters`] if the repository, tag, or digest is malformed.
+    pub fn new(reference: &str) -> ArbiterResult<Self> {
+        if reference.is_empty() {
+            return Err(ArbiterError::EmptyIdentifier {
+                kind: "OciImageReference".to_owned(),
+            });
+        }
+        if reference
+            .bytes()
+            .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+        {
+            return Err(ArbiterError::InvalidIdentifierCharacters {
+                kind: "OciImageReference".to_owned(),
+                value: reference.to_owned(),
+                reason: "OCI image reference must not contain whitespace or control characters"
+                    .to_owned(),
+            });
+        }
+        let (before_digest, digest) = if let Some((repo_tag, dig_part)) = reference.split_once('@')
+        {
+            let Some(hex_str) = dig_part.strip_prefix("sha256:") else {
+                return Err(ArbiterError::InvalidIdentifierCharacters {
+                    kind: "OciImageReference".to_owned(),
+                    value: reference.to_owned(),
+                    reason: "OCI image digest must start with 'sha256:'".to_owned(),
+                });
+            };
+            (repo_tag, Some(Sha256Digest::new(hex_str)?))
+        } else {
+            (reference, None)
+        };
+        let last_slash = before_digest.rfind('/');
+        let last_colon = before_digest.rfind(':');
+        let (repository, tag) = match (last_slash, last_colon) {
+            (Some(slash_idx), Some(colon_idx)) if colon_idx > slash_idx => (
+                &before_digest[..colon_idx],
+                Some(&before_digest[colon_idx + 1..]),
+            ),
+            (None, Some(colon_idx)) => (
+                &before_digest[..colon_idx],
+                Some(&before_digest[colon_idx + 1..]),
+            ),
+            _ => (before_digest, None),
+        };
+        if repository.is_empty() || repository.starts_with('/') || repository.ends_with('/') {
+            return Err(ArbiterError::InvalidIdentifierCharacters {
+                kind: "OciImageReference".to_owned(),
+                value: reference.to_owned(),
+                reason: "OCI repository path must be non-empty and not start/end with '/'"
+                    .to_owned(),
+            });
+        }
+        if let Some(t) = tag
+            && t.is_empty()
+        {
+            return Err(ArbiterError::InvalidIdentifierCharacters {
+                kind: "OciImageReference".to_owned(),
+                value: reference.to_owned(),
+                reason: "OCI image tag after ':' cannot be empty".to_owned(),
+            });
+        }
+        Ok(Self {
+            raw: reference.to_owned(),
+            repository: repository.to_owned(),
+            tag: tag.map(ToOwned::to_owned),
+            digest,
+        })
+    }
+
+    /// Returns the full OCI image reference string slice.
+    ///
+    /// # Returns
+    ///
+    /// Full image reference `&str`.
+    pub fn as_str(&self) -> &str {
+        &self.raw
+    }
+
+    /// Returns the repository component (including registry host if present).
+    ///
+    /// # Returns
+    ///
+    /// Repository `&str`.
+    pub fn repository(&self) -> &str {
+        &self.repository
+    }
+
+    /// Returns the optional image tag.
+    ///
+    /// # Returns
+    ///
+    /// `Some(&str)` if a tag was specified, otherwise `None`.
+    pub fn tag(&self) -> Option<&str> {
+        self.tag.as_deref()
+    }
+
+    /// Returns the optional immutable SHA-256 content digest.
+    ///
+    /// # Returns
+    ///
+    /// `Some(&Sha256Digest)` if `@sha256:...` was specified, otherwise `None`.
+    pub const fn digest(&self) -> Option<&Sha256Digest> {
+        self.digest.as_ref()
+    }
+}
+
+impl fmt::Display for OciImageReference {
+    /// Formats the OCI image reference.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(&self.raw)
+    }
+}
+
+impl FromStr for OciImageReference {
+    type Err = ArbiterError;
+
+    /// Parses a string slice into an [`OciImageReference`].
+    ///
+    /// # Arguments
+    ///
+    /// * `s` - Candidate OCI image reference string slice.
+    ///
+    /// # Returns
+    ///
+    /// Validated [`OciImageReference`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if validation fails.
+    fn from_str(s: &str) -> ArbiterResult<Self> {
+        Self::new(s)
+    }
+}
+
+/// Strongly-typed POSIX / OS signal number (`1..=64`).
+#[must_use]
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    Serialize,
+    Deserialize,
+    Archive,
+    RkyvSerialize,
+    RkyvDeserialize,
+)]
+pub struct SignalNumber(i32);
+
+impl Default for SignalNumber {
+    /// Returns `SIGTERM` (`15`) as the default graceful termination [`SignalNumber`].
+    ///
+    /// # Returns
+    ///
+    /// `SignalNumber(15)`.
+    fn default() -> Self {
+        Self::SIGTERM
+    }
+}
+
+impl SignalNumber {
+    /// POSIX `SIGINT` (`2`) interrupt signal.
+    pub const SIGINT: Self = Self(2);
+    /// POSIX `SIGKILL` (`9`) unconditional termination signal.
+    pub const SIGKILL: Self = Self(9);
+    /// POSIX `SIGTERM` (`15`) graceful termination signal.
+    pub const SIGTERM: Self = Self(15);
+    /// POSIX `SIGSTOP` (`19`) process pause signal.
+    pub const SIGSTOP: Self = Self(19);
+    /// POSIX `SIGCONT` (`18`) process resume signal.
+    pub const SIGCONT: Self = Self(18);
+
+    /// Validates and constructs a [`SignalNumber`] in `1..=64`.
+    ///
+    /// # Arguments
+    ///
+    /// * `signum` - Numeric signal identifier (`1..=64`).
+    ///
+    /// # Returns
+    ///
+    /// Validated [`SignalNumber`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::InvalidResourceQuantity`] if `signum` is outside `1..=64`.
+    pub fn new(signum: i32) -> ArbiterResult<Self> {
+        if !(1..=64).contains(&signum) {
+            return Err(ArbiterError::InvalidResourceQuantity {
+                resource: "SignalNumber".to_owned(),
+                quantity: 0,
+                reason: format!("signal number {signum} must be in 1..=64"),
+            });
+        }
+        Ok(Self(signum))
+    }
+
+    /// Returns the raw `i32` signal number.
+    ///
+    /// # Returns
+    ///
+    /// Raw `i32` signal number.
+    pub const fn get(self) -> i32 {
+        self.0
+    }
+}
+
+impl fmt::Display for SignalNumber {
+    /// Formats the signal number.
+    ///
+    /// # Arguments
+    ///
+    /// * `f` - The formatter.
+    ///
+    /// # Returns
+    ///
+    /// `fmt::Result`.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Validated `PCIe` Bus:Device.Function (`BDF`) address (`DDDD:BB:DD.F`, e.g., `0000:c1:00.0`).
 #[derive(
     Debug,
@@ -1572,6 +1976,78 @@ mod tests {
     check_id_type!(test_principal_name, PrincipalName, "scheduler-principal:01");
     check_id_type!(test_netns_handle, NetNsHandle, "netns-ctr-01");
     check_id_type!(test_stream_id, StreamId, "stream-fw-01:9001");
+    check_id_type!(
+        test_operation_uuid,
+        OperationUuid,
+        "op-uuid-550e8400-e29b-41d4-a716-446655440000"
+    );
+    check_id_type!(test_offer_filter_id, OfferFilterId, "filter-fw-01:agent-01");
+
+    #[test]
+    fn test_zfs_dataset_oci_image_and_signal_number() {
+        let zfs = ZfsDatasetName::from_str("tank/arbiter/vol-01:snap_1").unwrap_or_default();
+        assert_eq!(zfs.as_str(), "tank/arbiter/vol-01:snap_1");
+        assert_eq!(zfs.to_string(), "tank/arbiter/vol-01:snap_1");
+        for bad_zfs in [
+            "",
+            "/tank/vol",
+            "tank/vol/",
+            "tank//vol",
+            "tank/../vol",
+            "tank/vol@bad",
+        ] {
+            assert!(ZfsDatasetName::new(bad_zfs).is_err());
+        }
+
+        let hex64 = "b".repeat(64);
+        let oci_full =
+            OciImageReference::from_str(&format!("localhost:5000/org/app:v1.2.0@sha256:{hex64}"))
+                .unwrap_or_default();
+        assert_eq!(oci_full.repository(), "localhost:5000/org/app");
+        assert_eq!(oci_full.tag(), Some("v1.2.0"));
+        assert!(oci_full.digest().is_some());
+        assert_eq!(
+            oci_full.to_string(),
+            format!("localhost:5000/org/app:v1.2.0@sha256:{hex64}")
+        );
+        assert_eq!(
+            oci_full.as_str(),
+            format!("localhost:5000/org/app:v1.2.0@sha256:{hex64}")
+        );
+
+        let oci_simple = OciImageReference::new("alpine:3.20").unwrap_or_default();
+        assert_eq!(oci_simple.repository(), "alpine");
+        assert_eq!(oci_simple.tag(), Some("3.20"));
+        assert_eq!(oci_simple.digest(), None);
+
+        let oci_reg_no_tag =
+            OciImageReference::new("localhost:5000/library/ubuntu").unwrap_or_default();
+        assert_eq!(oci_reg_no_tag.repository(), "localhost:5000/library/ubuntu");
+        assert_eq!(oci_reg_no_tag.tag(), None);
+
+        for bad_oci in [
+            "",
+            "alpine :latest",
+            "alpine@md5:1234",
+            "alpine@sha256:short",
+            "/leading/slash:v1",
+            "trailing/slash/:v1",
+            "emptytag:",
+            ":tagonly",
+        ] {
+            assert!(OciImageReference::new(bad_oci).is_err());
+        }
+
+        assert_eq!(SignalNumber::default(), SignalNumber::SIGTERM);
+        let sig = SignalNumber::new(9).unwrap_or_default();
+        assert_eq!(sig, SignalNumber::SIGKILL);
+        assert_eq!(sig.get(), 9);
+        assert_eq!(sig.to_string(), "9");
+        assert!(SignalNumber::new(0).is_err());
+        assert!(SignalNumber::new(65).is_err());
+
+        let _ = rkyv::to_bytes::<rkyv::rancor::Error>(&(zfs, oci_full, sig));
+    }
 
     #[test]
     fn test_pcie_bdf_address() {

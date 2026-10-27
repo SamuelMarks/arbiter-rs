@@ -2,6 +2,7 @@
 
 [![License](https://img.shields.io/badge/license-Apache--2.0%20OR%20MIT-blue.svg)](https://github.com/SamuelMarks/arbiter-rs)
 [![Rust Edition](https://img.shields.io/badge/rust-2024%20(1.85%2B)-orange.svg)](https://www.rust-lang.org/)
+[![CI](https://github.com/SamuelMarks/arbiter-rs/actions/workflows/ci.yml/badge.svg)](https://github.com/SamuelMarks/arbiter-rs/actions/workflows/ci.yml)
 [![% doc coverage](https://img.shields.io/badge/doc%20coverage-100%25-brightgreen.svg)](#verification--quality-gates)
 [![% test coverage](https://img.shields.io/badge/test%20coverage-100%25-brightgreen.svg)](#verification--quality-gates)
 
@@ -14,7 +15,6 @@ Arbiter schedules, isolates, and coordinates workloads natively across **[Linux]
 - **[`ARCHITECTURE.md`](./ARCHITECTURE.md)**: Deep dive into the hybrid two-level/direct scheduler, three-tier STONITH fencing hierarchy, replicated service state machines, and L2–L7 wire framing.
 - **[`BENCHMARKS.md`](./BENCHMARKS.md)**: Methodology and empirical results comparing multicluster federation against monolithic and siloed topologies, plus 3-, 5-, 7-, and $N$-node PostgreSQL + `etcd` vs. Arbiter CaaS failover and L2–L7 wire-traffic benchmarks.
 - **[`SECURITY.md`](./SECURITY.md)**: Zero-trust SPIFFE/SPIRE mTLS identity, RBAC/ABAC policy enforcement, AEAD secret envelopes, split-brain linearizability guarantees, and compile-time safety gates.
-- **[`TODO_PLAN.md`](./TODO_PLAN.md)**: Completed engineering and verification roadmap.
 
 ---
 
@@ -44,9 +44,9 @@ flowchart TB
     %% 2. Wire Transport & Zero-Trust Security
     subgraph Wire["Dual-Protocol Transport & Zero-Trust Security (arbiter-proto, arbiter-net)"]
         direction LR
-        QUIC["Multiplexed QUIC Binary Framing<br/>(rkyv Zero-Copy: Control | Telemetry | P2P)"]:::net
-        HTTP["Mesos v1-Compatible HTTP/REST + SSE<br/>(serde_json: /api/v1/{scheduler,executor,operator,jobs})"]:::net
-        Sec["SPIFFE / SPIRE mTLS & SVID Rotation<br/>RBAC / ABAC Policy + AEAD Secret Envelopes"]:::net
+        QUIC["Multiplexed QUIC + ARBW Binary Framing<br/>(Quinn + rkyv Zero-Copy: Control | Telemetry | P2P)"]:::net
+        HTTP["Mesos v1-Compatible HTTP/1.1, HTTP/2, RecordIO & WebSocket<br/>(Axum: /api/v1/{scheduler,executor,operator,resource_provider,jobs})"]:::net
+        Sec["SPIFFE / SPIRE mTLS & SVID Rotation<br/>Cedar ABAC Policy + AES-256-GCM / ChaCha20-Poly1305 Envelopes"]:::net
     end
 
     %% 3. Master Control Plane
@@ -55,35 +55,35 @@ flowchart TB
 
         subgraph AllocEngine["Hybrid Allocation & Scheduling Engine (arbiter-alloc)"]
             direction LR
-            HDRF["Hierarchical DRF (HdrfRanker)<br/>Fixed-Point SharePartsPerBillion<br/>Zero f32/f64 Drift"]:::master
-            Packer["Topology-Aware Bin-Packer<br/>NUMA | NVSwitch/NVLink Islands<br/>MIG Slicing (1g.5gb..7g.80gb) & MPS"]:::master
-            Gang["Multi-Host Gang & TPU Torus Scheduler<br/>Deadlock-Free Global Agent Ordering<br/>3D (x, y, z) Wrap-Around ICI Validation"]:::master
-            Preempt["Idle Quota Borrowing & Preemption<br/>Minimal-Disruption Victim Eviction<br/>(CheckpointAndSuspend / Kill)"]:::master
+            HDRF["2-Stage Mesos DRF & HDRF (HdrfRanker)<br/>Fixed-Point SharePartsPerBillion<br/>Zero f32/f64 Drift"]:::master
+            Packer["Topology-Aware Bin-Packer<br/>NUMA | NVSwitch/NVLink & xGMI Islands<br/>MIG Slicing (1g.5gb..7g.80gb) & MPS"]:::master
+            Gang["Multi-Host Gang & TPU Torus Scheduler<br/>Deadlock-Free Global Agent Ordering<br/>3D (x, y, z) Wrap-Around ICI & Backfill"]:::master
+            Preempt["Idle Quota Borrowing & Preemption FSM<br/>Minimal-Disruption Victim Eviction<br/>(PreemptPending -> Checkpointing -> Reclaimed)"]:::master
         end
 
         subgraph StateConsensus["State Store & Consensus-as-a-Service (arbiter-store)"]
             direction LR
-            Raft["Embedded Raft Log + CRC32 WalEntry<br/>& Pluggable etcd / PostgreSQL / Memory Backends"]:::store
+            Raft["Embedded Raft + Redb / CRC32 WAL<br/>& Pluggable etcd / Postgres / ZK / Consul / SQLite / Memory"]:::store
             CaaSMaster["CaaS Election & Lease Manager<br/>Monotonic FencingToken Issuance<br/>ReplicatedStatefulWorkloadTrait"]:::store
             STONITH["3-Tier Deterministic STONITH Engine<br/>Tier 1: In-Band Agent | Tier 2: OOB BMC/Storage/ToR<br/>Tier 3: Local CaaS Watchdog Self-Demotion"]:::store
         end
 
-        FedRouter["Multi-Cluster Co-Location & Global Federation Router<br/>Cross-Cluster Bursting | Regional DR Failover | *.arbiter.internal"]:::fed
+        FedRouter["Multi-Cluster Co-Location & Global Federation Router<br/>Ed25519 Signed ClaimTickets | Cross-Cluster Bursting | Regional DR | *.arbiter.internal"]:::fed
     end
 
     %% 4. Agent Node Supervisor
     subgraph AgentPlane["Cross-Platform Agent & Executor Plane (arbiter-agent, arbiter-executor, arbiter-storage)"]
         direction TB
-        AgentSup["Agent Supervisor (AgentNode)<br/>Resource Accounting | Multi-Cluster Slice Enforcement | Heartbeat Multiplexer"]:::agent
+        AgentSup["Agent Supervisor (AgentSupervisor)<br/>Resource Accounting | Multi-Cluster Slice Enforcement | Heartbeat Multiplexer"]:::agent
         LocalCaaS["Zero-Packet Local CaaS Lease Cache (AgentCaasLeaseCache)<br/>Nanosecond Primary Verification via Unix Socket / Named Pipe"]:::agent
-        Storage["Artifact & Volume Manager (arbiter-storage)<br/>SHA-256 LRU Cache | ZFS Datasets (jail/zone) | APFS clonefile | CSI"]:::agent
-        ExecSup["Task Executor (TaskExecutor)<br/>Process Lifecycle | Bounded Log Ring Buffer | Active Health Probes"]:::agent
+        Storage["Artifact & Volume Manager (arbiter-storage)<br/>SHA-256 LRU & ObjectStore Cache | ZFS Datasets | APFS clonefile | CSI v1 gRPC UDS"]:::agent
+        ExecSup["Task Executor (TaskExecutor)<br/>Process & PTY Lifecycle | Bounded Log Ring Buffer | Active Health Probes"]:::agent
     end
 
     %% 5. Native 5-OS Isolation Pipeline
     subgraph Isolation["Transactional Rollback Isolation Pipeline (arbiter-iso::IsolatorPipeline)"]
         direction LR
-        IsoLinux["Linux (LinuxIsolator)<br/>cgroups v2 | Namespaces | seccomp-bpf<br/>CRIU Checkpoint | OCI (runc/crun) | Firecracker"]:::iso
+        IsoLinux["Linux (LinuxIsolator)<br/>cgroups v2 | Namespaces | seccomp-bpf & eBPF<br/>CRIU Checkpoint | OCI v1.2 (runc/crun) | Firecracker"]:::iso
         IsoFreeBSD["FreeBSD (FreeBsdIsolator)<br/>Jails (jail_set) | cpuset | RCTL/RACCT<br/>zfs jail | VNET | bhyve MicroVM"]:::iso
         IsoIllumos["illumos / OmniOS (IllumosIsolator)<br/>Zones (zonecfg/zoneadm) | pset_bind<br/>Crossbow VNIC (dladm) | ZFS | bhyve"]:::iso
         IsoWindows["Windows (WindowsIsolator)<br/>Job Objects | GROUP_AFFINITY<br/>HNS Port ACL | HCS (runhcs) | Hyper-V VM"]:::iso
@@ -94,7 +94,7 @@ flowchart TB
     subgraph Hardware["Hardware Topology & Accelerator Discovery Probes (arbiter-probe)"]
         direction LR
         ProbeCPU["Heterogeneous CPU & NUMA Probe<br/>Intel P/E, AMD Zen/Zen-c, Apple M-Series, ARM big.LITTLE<br/>SLIT Distance Matrix | L1/L2/L3 Cache | AVX-512 / AMX / NEON / SVE2"]:::hw
-        ProbeGPU["Multi-Vendor GPU Probe<br/>NVIDIA NVML (MIG, MPS, NVLink/NVSwitch)<br/>AMD ROCm (amd_smi, xGMI) | Apple Metal & ANE | Intel Level Zero"]:::hw
+        ProbeGPU["Multi-Vendor GPU Probe<br/>NVIDIA NVML (MIG, MPS, NVLink/NVSwitch)<br/>AMD ROCm (MI300X SPX..CPX / NPS1..4, xGMI) | Apple Metal & ANE | Intel Level Zero"]:::hw
         ProbeTPU["Google Cloud & Edge TPU Probe<br/>TPU v4 / v5e / v5p / v6e (Trillium) / Coral Edge<br/>HBM Capacity | 2D/3D ICI Torus Coordinates & Healthy Links"]:::hw
         ProbeFabric["RDMA & High-Speed Fabric Probe<br/>InfiniBand (mlx5) | RoCEv2 | AWS EFA | GPUDirect RDMA<br/>PCIe Root-Complex Affinity | Crossbow VNIC | FreeBSD VNET"]:::hw
     end
@@ -120,20 +120,21 @@ flowchart TB
 
 ### 1. Hybrid 2-Level Offer + Direct/Gang Scheduling (`arbiter-alloc`)
 
-- **[Hierarchical Dominant Resource Fairness (HDRF)](https://people.eecs.berkeley.edu/~alig/papers/drf.pdf)**: Computes multi-resource fair shares across `(CPU, Memory, GPU Compute, VRAM, TPU Chips, Disk, Network Bandwidth)` using exact 128-bit intermediate fixed-point arithmetic (`SharePartsPerBillion`), eliminating IEEE 754 floating-point (`f32`/`f64`) drift across nodes and architectures.
-- **2-Level Resource Offers & Direct Scheduling**: Supports external Mesos-style frameworks (`FrameworkScheduler`) alongside a built-in first-party direct and gang scheduler (`ArbiterClient`), avoiding offer round-trips for standard batch, service, and accelerator jobs.
-- **Topology-Aware Bin-Packing**: Co-locates tasks within NUMA domains, [NVIDIA NVLink/NVSwitch](https://www.nvidia.com/en-us/data-center/nvlink/) GPU islands, and PCIe root-complex-affinitized RDMA NICs ([GPUDirect RDMA](https://docs.nvidia.com/cuda/gpudirect-rdma/index.html)). Dynamically slices [NVIDIA Multi-Instance GPU (MIG)](https://www.nvidia.com/en-us/technologies/multi-instance-gpu/) profiles (`1g.5gb`..`7g.80gb`) or assigns fractional [MPS](https://docs.nvidia.com/deploy/mps/index.html) compute weights.
-- **Multi-Host Gang & TPU Pod Co-Scheduling**: Performs atomic all-or-nothing placement across hosts using deterministic global agent ordering for deadlock prevention, with contiguous 2D/3D `(x, y, z)` sub-torus selection and wrap-around [Inter-Chip Interconnect (ICI)](https://dl.acm.org/doi/pdf/10.1145/3579371.3589350) link health validation.
-- **Idle Quota Borrowing & Minimum-Disruption Preemption**: Allows `SpotPreemptible` and `Batch` tasks to borrow idle reserved quota as revocable capacity, evicting the minimal-weight victim set (`CheckpointAndSuspend` or `Kill`) when quota owners reclaim resources.
+- **[2-Stage Mesos DRF & Hierarchical Dominant Resource Fairness (HDRF)](https://people.eecs.berkeley.edu/~alig/papers/drf.pdf)**: Computes multi-resource fair shares across `(CPU, Memory, GPU Compute, VRAM, TPU Chips, Disk, Network Bandwidth)` using exact 128-bit intermediate fixed-point arithmetic (`SharePartsPerBillion`), eliminating IEEE 754 floating-point (`f32`/`f64`) drift across nodes and architectures, with two-stage role-then-framework DRF candidate ranking (`rank_two_stage_mesos_candidates`).
+- **2-Level Resource Offers & Direct Scheduling**: Supports external Mesos-style frameworks (`FrameworkScheduler`) with dynamic role/suppression/filter updates (`UpdateFramework`, `OfferFilterId`, `MesosStreamId`) alongside a built-in first-party direct and gang scheduler (`ArbiterClient`), avoiding offer round-trips for standard batch, service, and accelerator jobs.
+- **Topology-Aware Bin-Packing**: Co-locates tasks within NUMA domains, `petgraph`-discovered [NVIDIA NVLink/NVSwitch](https://www.nvidia.com/en-us/data-center/nvlink/) and AMD xGMI GPU islands, and PCIe root-complex-affinitized RDMA NICs ([GPUDirect RDMA](https://docs.nvidia.com/cuda/gpudirect-rdma/index.html)). Dynamically slices [NVIDIA Multi-Instance GPU (MIG)](https://www.nvidia.com/en-us/technologies/multi-instance-gpu/) profiles (`1g.5gb`..`7g.80gb`), AMD Instinct MI300X compute (`SPX`/`DPX`/`TPX`/`QPX`/`CPX`) and memory (`NPS1`/`NPS2`/`NPS4`) partitions, or assigns fractional [MPS](https://docs.nvidia.com/deploy/mps/index.html) compute weights.
+- **Multi-Host Gang & TPU Pod Co-Scheduling**: Performs atomic all-or-nothing placement across hosts using deterministic global agent ordering for deadlock prevention, gang barrier short-task backfilling and timeout rollback (`GangBarrierHoldState`), and contiguous 2D/3D `(x, y, z)` sub-torus selection with wrap-around [Inter-Chip Interconnect (ICI)](https://dl.acm.org/doi/pdf/10.1145/3579371.3589350) link health validation.
+- **Idle Quota Borrowing & Preemption State Machine**: Allows `SpotPreemptible` and `Batch` tasks to borrow idle reserved quota and cgroup EWMA revocable slack (`compute_agent_revocable_slack`), evicting the minimal-weight victim set through a deterministic `PreemptionLifecycleStateMachine` (`PreemptPending -> Checkpointing -> SigtermGrace -> Reclaimed`).
 
 ### 2. Consensus-as-a-Service (CaaS) & 3-Tier STONITH Fencing (`arbiter-store`, `arbiter-agent`)
 
 Instead of running dedicated external `etcd` or Consul clusters plus per-service sidecars (such as Patroni) for stateful workloads, Arbiter exposes control-plane leader election, monotonic fencing tokens (`FencingToken`), and deterministic STONITH fencing directly to hosted tasks:
 
+- **Embedded Raft + Redb WAL & Pluggable External State Stores**: Supports an embedded Raft state store (`RaftStateStore`, `RaftConsensusDaemon`, `OpenRaftMembershipAdapter`) backed by `redb` (`RedbWalBackend`) and CRC32-verified WAL segments, plus pluggable external state-store drivers for `etcd` v3 (`EtcdStore`), PostgreSQL (`PostgresStore`), Apache ZooKeeper (`ZooKeeperStateStore`), HashiCorp Consul (`ConsulStateStore`), SQLite WAL (`SqliteStateStore`), and deterministic fault-injecting in-memory storage (`MemoryStateStore`).
 - **Single-Wire Multiplexed Heartbeats & Zero-Packet Local Lease Reads**: Co-located stateful services piggyback liveness and lease renewals onto the single Agent $\leftrightarrow$ Master [QUIC](https://datatracker.ietf.org/doc/html/rfc9000) stream (`MultiplexedAgentHeartbeat`). Local primaries verify lease validity against the agent's `AgentCaasLeaseCache` over a local Unix domain socket or Windows named pipe with **zero network packets (`0 B` wire overhead)**.
 - **3-Tier Deterministic Fencing Hierarchy (`FenceVerificationReceipt`)**: Guarantees split-brain-free standby promotion even under asymmetric network partitions (`iptables DROP`), process freezes (`SIGSTOP`), or simultaneous Master + Primary power loss:
-  1. **Tier 1 — Cooperative In-Band Agent STONITH (`InBandAgentStonith`)**: Synchronous `SIGKILL` / `TerminateJobObject`, forced storage detach (`zfs unmount -f` / CSI detach), and VNIC/VNET/eBPF network severance in 1 RTT when the agent is reachable.
-  2. **Tier 2 — Out-of-Band Hardware, Storage & Fabric Fence (`OutOfBandHardwareOrStorageFence`)**: Immediate IPMI/Redfish BMC chassis power-off (`BmcPowerOffReceipt`), shared-storage SCSI-3 Persistent Reservation / NVMe-oF key preemption (`StorageEpochFenceReceipt`), and ToR switch port shutdown (`SwitchFabricPortIsolateReceipt`) when the host is unreachable in-band.
+  1. **Tier 1 — Cooperative In-Band Agent STONITH (`InBandAgentStonith`)**: Synchronous `SIGKILL` / `TerminateJobObject`, forced storage detach (`zfs unmount -f` / CSI detach), and VNIC/VNET/eBPF cgroup socket severance in 1 RTT when the agent is reachable.
+  2. **Tier 2 — Out-of-Band Hardware, Storage & Fabric Fence (`OutOfBandHardwareOrStorageFence`)**: Immediate IPMI RMCP+ / Redfish BMC chassis power-off (`BmcPowerOffReceipt`), shared-storage SCSI-3 Persistent Reservation / NVMe-oF key preemption (`StorageEpochFenceReceipt`), and ToR switch port shutdown (`SwitchFabricPortIsolateReceipt`) when the host is unreachable in-band.
   3. **Tier 3 — Bounded Local Watchdog Self-Demotion (`LocalCaasWatchdogSelfFence`)**: A hardware-monotonic deadline (`/dev/watchdog` / `CLOCK_MONOTONIC_RAW`) on the isolated node revokes local UDS primary leases and terminates local primary processes before any remote standby promotion can complete.
 - **Pluggable Stateful Workload & Coordinator Models (`arbiter-store::ha_generic`)**: Provides state-machine models for streaming primary/standby databases (PostgreSQL `walsender`/`walreceiver`), key-value replicas (Redis/Valkey `PSYNC2`), and partitioned log brokers (Kafka ISR), validated against `etcd`/Patroni, Consul, and Kubernetes Lease baselines.
 
@@ -141,7 +142,7 @@ Instead of running dedicated external `etcd` or Consul clusters plus per-service
 
 `IsolatorPipeline` executes preparation and isolation steps transactionally, automatically rolling back all previously applied stages in reverse order if any step fails:
 
-- **Linux**: [`cgroups v2`](https://docs.kernel.org/admin-guide/cgroup-v2.html) (`cpu.max`, `cpuset`, `memory.max`, `io.max`, `pids.max`), namespaces (`pid`, `net`, `mnt`, `uts`, `ipc`, `user`), `seccomp-bpf`, [CRIU](https://criu.org/) live checkpoint/restore, OCI containers (`runc`/`crun`), and [Firecracker](https://firecracker-microvm.github.io/) MicroVMs.
+- **Linux**: [`cgroups v2`](https://docs.kernel.org/admin-guide/cgroup-v2.html) (`cpu.max`, `cpuset`, `memory.max`, `io.max`, `pids.max`), namespaces (`pid`, `net`, `mnt`, `uts`, `ipc`, `user`), `seccomp-bpf` filter compilation, eBPF cgroup socket fencing filters, CNI network plugins, [CRIU](https://criu.org/) live checkpoint/restore, OCI v1.2 containers (`runc`/`crun`), and [Firecracker](https://firecracker-microvm.github.io/) MicroVMs.
 - **FreeBSD**: [Jails](https://docs.freebsd.org/en/books/handbook/jails/) (`jail_set`/`jail_remove`), `cpuset` NUMA/core pinning, `RCTL`/`RACCT` resource limits, `zfs jail` dataset delegation, [VNET](https://man.freebsd.org/cgi/man.cgi?query=vnet&sektion=9) virtual network stacks, and [`bhyve`](https://www.freebsd.org/cgi/man.cgi?query=bhyve&sektion=8) MicroVMs.
 - **illumos (OmniOS)**: [Zones](https://illumos.org/man/7/zones) (`zonecfg`/`zoneadm`), processor sets (`pset_bind`), resource controls (`zone.cpu-shares`, `zone.max-physical-memory`), [Crossbow VNICs](https://illumos.org/man/8/dladm), ZFS zone delegation, and `bhyve`.
 - **Windows**: [Job Objects](https://learn.microsoft.com/en-us/windows/win32/procthread/job-objects) (`CreateJobObject`, hard CPU rate caps, memory/I/O/process limits, `TerminateJobObject`), `GROUP_AFFINITY` processor groups (>64 logical processors), Host Compute System (`runhcs`) containers, and Hyper-V MicroVMs.
@@ -149,7 +150,7 @@ Instead of running dedicated external `etcd` or Consul clusters plus per-service
 
 ### 4. Multi-Cluster Federation & L2–L7 Wire Accounting (`arbiter-alloc::federation`, `arbiter-telemetry::wire_accounting`)
 
-- **Co-Located Logical Cluster Slicing & Cross-Cluster Bursting**: Partitions shared bare-metal hosts into isolated `LogicalClusterSlice` envelopes while bursting overflow direct tasks (`burst_task_to_federation`) and atomic multi-host gang workloads (`burst_gang_to_federation`) across federated peer clusters.
+- **Co-Located Logical Cluster Slicing & Signed Cross-Cluster Bursting**: Partitions shared bare-metal hosts into isolated `LogicalClusterSlice` envelopes while bursting overflow direct tasks (`burst_task_to_federation`) and atomic multi-host gang workloads (`burst_gang_to_federation`) across federated peer clusters using Ed25519-signed `ClaimTicket`s and TTL-bounded `RemoteExecutionLease` reclamation.
 - **L2–L7 Framing-Accurate Wire Accounting**: Tracks both L7 payload bytes and full L2–L4 protocol framing (`Ethernet 18B + IPv4 20B + TCP/TLS 1.3/HTTP/2 gRPC` vs. `UDP/QUIC 1-RTT + AEAD`) across steady-state, fault-detection/fencing, and standby-promotion windows, calibrated within `< 5%` of empirical Vagrant NIC packet captures.
 
 ---
@@ -158,8 +159,8 @@ Instead of running dedicated external `etcd` or Consul clusters plus per-service
 
 | Dimension | Supported Platforms / Vendors | Probing Mechanism (`arbiter-probe`) | Scheduling & Isolation Capabilities (`arbiter-alloc`, `arbiter-iso`) |
 | :--- | :--- | :--- | :--- |
-| **CPUs & NUMA** | `x86_64` (Intel Hybrid P/E, AMD Zen 4/5 & Zen-c), `AArch64` (Apple M-Series, ARM Neoverse / big.LITTLE), `riscv64gc` | Linux `sysfs`, FreeBSD/macOS `sysctl`, illumos `kstat`, Windows `GetLogicalProcessorInformationEx` | ACPI SLIT NUMA distance minimization, P-core vs. E-core pinning, ISA feature matching (`AVX-512`, `AMX`, `NEON`, `SVE2`) |
-| **GPUs** | NVIDIA Data Center (H100/H200/B200), AMD Instinct (MI300X), Apple Silicon (M1–M4 Ultra), Intel Data Center GPU Max | NVIDIA NVML, AMD ROCm SMI (`amd_smi`), Apple Metal & ANE, oneAPI Level Zero | NVIDIA MIG dynamic slicing, MPS fractional sharing, NVLink/NVSwitch & AMD xGMI island packing, `/dev/nvidia*` & `/dev/dri/renderD*` device whitelisting |
+| **CPUs & NUMA** | `x86_64` (Intel Hybrid P/E, AMD Zen 4/5 & Zen-c), `AArch64` (Apple M-Series, ARM Neoverse / big.LITTLE), `riscv64gc` | Linux `sysfs`, FreeBSD/macOS `sysctl`, illumos `kstat`, Windows `GetLogicalProcessorInformationEx`, `sysinfo` | ACPI SLIT NUMA distance minimization, P-core vs. E-core pinning, ISA feature matching (`AVX-512`, `AMX`, `NEON`, `SVE2`) |
+| **GPUs** | NVIDIA Data Center (H100/H200/B200), AMD Instinct (MI300X), Apple Silicon (M1–M4 Ultra), Intel Data Center GPU Max | NVIDIA NVML (`nvml-wrapper`), AMD ROCm SMI (`amd_smi` & MI300X `sysfs` partition scanner), Apple Metal & ANE, oneAPI Level Zero | NVIDIA MIG dynamic slicing, AMD MI300X (`SPX`/`DPX`/`TPX`/`QPX`/`CPX` & `NPS1`/`NPS2`/`NPS4`) partitioning, MPS fractional sharing, NVLink/NVSwitch & AMD xGMI island packing, `/dev/nvidia*` & `/dev/dri/renderD*` device whitelisting |
 | **TPUs** | Google Cloud TPU (v4, v5e, v5p, v6e Trillium) & Coral Edge TPU | `/dev/accel*` & `/dev/vfio/*` discovery, HBM capacity & 2D/3D ICI torus coordinate probing | Multi-host atomic gang scheduling with contiguous `(x, y, z)` sub-torus selection and healthy wrap-around ICI link verification |
 | **RDMA & Fabrics** | InfiniBand (`mlx5`), RoCEv2, AWS EFA, illumos Crossbow, FreeBSD VNET | `/sys/class/infiniband`, `dladm`, `ifconfig` | PCIe root-complex co-location (GPUDirect RDMA), hardware bandwidth enforcement, synchronous STONITH VNIC/VNET severance |
 
@@ -170,33 +171,37 @@ Instead of running dedicated external `etcd` or Consul clusters plus per-service
 ```text
 arbiter-rs/
 ├── .github/workflows/      # Pre-commit CI quality gates (pre-commit.yml) & OS+arch binary releases (release.yml)
+├── .pre-commit-config.yaml # 5-stage pre-commit hook configuration (fmt, build, clippy, test, shields)
 ├── ARCHITECTURE.md         # System design, 3-tier fencing & wire-protocol mechanics
 ├── BENCHMARKS.md           # Multicluster & 3/5/7/N-node failover wire-traffic benchmark results
 ├── SECURITY.md             # Zero-trust SPIFFE mTLS, RBAC/ABAC, AEAD secrets & safety invariants
-├── TODO_PLAN.md            # Completed engineering and verification roadmap
+├── scripts/
+│   └── pre_commit.py       # Cross-platform pre-commit verification & README coverage shield updater
 ├── crates/
 │   ├── arbiter-core/       # Unified ArbiterError (derive_more), validated IDs, fixed-point units,
-│   │                       # OS/Arch taxonomy, CPU/GPU/TPU/RDMA models, DAG topology graph, TaskState FSM
-│   ├── arbiter-alloc/      # HDRF fair-share ranker, NUMA/NVLink/MIG topology bin-packer,
-│   │                       # multi-host gang & 3D TPU torus scheduler, preemption & hybrid engine
+│   │                       # OS/Arch taxonomy, CPU/GPU/TPU/RDMA models, petgraph DAG topology, TaskState FSM
+│   ├── arbiter-alloc/      # 2-stage Mesos DRF & HDRF ranker, NUMA/NVLink/MIG/MI300X topology bin-packer,
+│   │                       # multi-host gang & 3D TPU torus scheduler, preemption FSM, Ed25519 federation claims
 │   ├── arbiter-store/      # StateStore trait, deterministic fault-injecting MemoryStateStore,
-│   │                       # embedded Raft + CRC32 log, CaaS election/STONITH plane, generic HA models
-│   │                       # (ha_generic), federation, etcd/Postgres external adapters
-│   ├── arbiter-proto/      # Dual-protocol rkyv zero-copy binary & serde JSON wire envelopes
-│   ├── arbiter-net/        # Multiplexed QUIC transport, HTTP/SSE gateway, SPIFFE mTLS, RBAC/ABAC, AEAD secrets
+│   │                       # embedded Raft + Redb/CRC32 WAL, CaaS election/STONITH plane, generic HA models
+│   │                       # (ha_generic), federation, etcd/Postgres/ZooKeeper/Consul/SQLite adapters
+│   ├── arbiter-proto/      # Dual-protocol rkyv zero-copy ARBW binary, Mesos v1 RecordIO & serde JSON wire envelopes
+│   ├── arbiter-net/        # Quinn/Rustls pooled QUIC transport, Axum HTTP/1.1+HTTP/2+SSE+WebSocket gateway,
+│   │                       # SPIFFE mTLS, Cedar ABAC policy engine, AES-256-GCM & ChaCha20-Poly1305 secret envelopes
 │   ├── arbiter-probe/      # Pluggable CPU/NUMA (sysfs, sysctl, kstat, Win32), Multi-Vendor GPU
-│   │                       # (NVML, ROCm, Metal, Level Zero), TPU, and RDMA/Crossbow/VNET fabric probes
+│   │                       # (NVML, ROCm/MI300X, Metal, Level Zero), TPU, and RDMA/Crossbow/VNET fabric probes
 │   ├── arbiter-iso/        # Transactional rollback IsolatorPipeline, 5-OS native isolators, GPU/TPU device
-│   │                       # whitelisting, OCI container & Firecracker/bhyve/Hyper-V/Apple VZ MicroVM drivers
-│   ├── arbiter-storage/    # SHA-256 content-addressable LRU artifact cache, ZFS dataset manager, APFS/CSI volumes
-│   ├── arbiter-telemetry/  # Prometheus & OpenTelemetry metrics, L2-L7 NetworkTrafficAccountant
-│   │                       # (wire_accounting), DNS/SRV service discovery, active health probes
+│   │                       # whitelisting, CNI/eBPF filters, OCI v1.2 & Firecracker/bhyve/Hyper-V/Apple VZ MicroVMs
+│   ├── arbiter-storage/    # SHA-256 content-addressable LRU & ObjectStore artifact cache, OCI layer whiteout (.wh.)
+│   │                       # extractor, ZFS dataset manager, APFS clonefile & CSI v1 Tonic gRPC UDS volumes
+│   ├── arbiter-telemetry/  # Prometheus OpenMetrics & OpenTelemetry metrics/traces, L2-L7 NetworkTrafficAccountant
+│   │                       # (wire_accounting), Hickory DNS/SRV service discovery, active health probes
 │   ├── arbiter-master/     # Master control-plane state machine, multicluster & failover benchmark suite
 │   │                       # (bench), and 7-node multi-OS chaos simulator (sim)
-│   ├── arbiter-agent/      # Agent node supervisor loop & zero-packet local CaaS lease verification socket
-│   ├── arbiter-executor/   # Task process supervisor, bounded stdout/stderr ring buffer, health & preemption handler
-│   ├── arbiter-sdk/        # Rust FrameworkScheduler trait, FrameworkRunner, and ArbiterClient SDK
-│   └── arbiter-tui/        # Terminal UI (TUI) state model/renderer & embedded Web Dashboard HTTP/SSE handlers
+│   ├── arbiter-agent/      # Agent node supervisor loop, QoS controller & zero-packet local CaaS lease IPC server
+│   ├── arbiter-executor/   # Task process & PTY supervisor, bounded stdout/stderr ring buffer, health & preemption handler
+│   ├── arbiter-sdk/        # Rust FrameworkScheduler trait, FrameworkRunner, RecordIO driver & ArbiterClient SDK
+│   └── arbiter-tui/        # Ratatui/Crossterm Terminal UI (TUI) & embedded Web Dashboard HTTP/SSE handlers
 ├── bins/
 │   ├── arbiter/            # Multicall umbrella binary dispatching via argv[0] or subcommand
 │   ├── arbiter-master/     # Standalone Master control-plane binary (arbiter-master-bin)
@@ -215,9 +220,9 @@ Every crate and binary in `arbiter-rs` enforces strict compile-time and CI invar
 
 - **100% Documentation Coverage**:
   - Enforced via `#![forbid(missing_docs)]`, `#![forbid(clippy::missing_docs_in_private_items)]`, and `#![forbid(rustdoc::broken_intra_doc_links, rustdoc::private_intra_doc_links, rustdoc::bare_urls)]`.
-  - Every module, struct, enum, variant, field, trait, and function (including private items) is documented.
-- **100% Test Coverage (Function, Line, Region, and Branch)**:
-  - Verified with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) (`cargo +nightly llvm-cov --workspace --all-targets --branch`), maintaining **100.00% coverage across all metrics** (`11,251 / 11,251` regions, `743 / 743` functions, `12,266 / 12,266` lines, `760 / 760` branches).
+  - Every module, struct, enum, variant, field, trait, and function (including private items) is documented (`7,101 / 7,101` documented items).
+- **100% Test Coverage**:
+  - Verified with [`cargo-llvm-cov`](https://github.com/taiki-e/cargo-llvm-cov) and `python3 scripts/pre_commit.py shields --check`, maintaining **100.00% function and line coverage** across all 14 crates and 5 binaries (`3,142 / 3,142` functions, `54,733 / 54,733` lines).
 - **Strict Memory & Arithmetic Safety**:
   - `#![forbid(unsafe_code)]` across the entire workspace.
   - `#![forbid(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::todo, clippy::unimplemented, clippy::unreachable, clippy::indexing_slicing)]`.
@@ -341,17 +346,21 @@ fn main() -> ArbiterResult<()> {
 The `arbiter` umbrella binary supports both explicit subcommands and BusyBox-style `argv[0]` symlink dispatch:
 
 ```bash
-# Invoke control-plane & agent daemons via subcommand:
-arbiter master --bind-addr 0.0.0.0:5050 --raft-node-id 1 --offer-ttl-ticks 50
+# Invoke control-plane & agent daemons via subcommand (--state-store supports raft|etcd|postgres|zookeeper|consul|sqlite|memory):
+arbiter master --bind-addr 0.0.0.0:5050 --http-addr 0.0.0.0:5051 --raft-node-id 1 --state-store raft --offer-ttl-ticks 50
 arbiter agent --agent-id node-01 --master-endpoint 10.0.0.1:5050 --cache-bytes 10737418240
 arbiter executor --executor-id exec-01 --task-id task-01 --log-ring-lines 1024
 
-# Operator CLI, TUI & Benchmark Suites:
+# Operator CLI, TUI, Resource Management & Benchmark Suites:
 arbiter cli status
 arbiter cli tui
 arbiter cli submit prod task-01 /bin/echo
+arbiter cli quota prod 4000 16000
+arbiter cli weights prod 20000
+arbiter cli drain node-01
 arbiter cli bench-multicluster
 arbiter cli bench-failover-traffic
+arbiter cli bench-failover-traffic --live-processes
 
 # Or invoke via symlinked argv[0] binary name:
 ln -s arbiter arbiter-master
@@ -365,17 +374,20 @@ ln -s arbiter arbiter-master
 Run the full verification suite locally:
 
 ```bash
+# 0. Run the complete 5-stage pre-commit verification pipeline (fmt, build, clippy+rustdoc, test, shields)
+python3 scripts/pre_commit.py all --check
+
 # 1. Check deterministic formatting
 cargo fmt --all -- --check
 
 # 2. Run strict Clippy lints (all, pedantic, nursery, cargo, zero unwrap/indexing/float)
-cargo clippy --workspace --all-targets -- -D warnings
+cargo clippy --workspace --all-targets --all-features -- -D warnings
 
 # 3. Verify 100% documentation coverage (including private items and intra-doc links)
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps --document-private-items
 
-# 4. Verify 100.00% region, function, line, and branch test coverage
-cargo +nightly llvm-cov --workspace --all-targets --branch --summary-only
+# 4. Verify 100.00% test coverage
+cargo llvm-cov --workspace --all-targets --summary-only
 
 # 5. Run the 3/5/7-node PostgreSQL+etcd vs. arbiter-rs & 7-OS Vagrant matrix
 ./tests/vagrant/run_matrix.sh

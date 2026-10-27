@@ -2077,6 +2077,8 @@ pub struct ZooKeeperJuteDriver {
     pub next_xid: i32,
     /// Whether the session is active.
     pub connected: bool,
+    /// Optional live TCP `host:port` endpoint for synchronous Jute RPC emission on mutations.
+    pub live_tcp_endpoint: Option<String>,
     /// Backing state mirror.
     pub store: MemoryStateStore,
 }
@@ -2106,8 +2108,42 @@ impl ZooKeeperJuteDriver {
             ensemble_uri: ensemble_uri.to_owned(),
             next_xid: 1,
             connected: true,
+            live_tcp_endpoint: None,
             store: MemoryStateStore::new(),
         })
+    }
+
+    /// Emits a Jute request packet over `TcpStream` if `self.live_tcp_endpoint` is configured.
+    ///
+    /// # Arguments
+    ///
+    /// * `opcode` - [`ZooKeeperOpCode`].
+    /// * `znode_path` - Target znode path.
+    /// * `data` - Payload bytes.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` on success or when `live_tcp_endpoint` is `None`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketIoError`] if TCP connection fails.
+    pub fn emit_live_jute_if_configured(
+        &mut self,
+        opcode: ZooKeeperOpCode,
+        znode_path: &str,
+        data: &[u8],
+    ) -> ArbiterResult<()> {
+        let Some(addr) = self.live_tcp_endpoint.clone() else {
+            return Ok(());
+        };
+        let mut stream = TcpStream::connect(&addr).map_err(|err| ArbiterError::SocketIoError {
+            endpoint: addr,
+            reason: err.to_string(),
+        })?;
+        let req = self.encode_jute_request(opcode, znode_path, data);
+        let _ = stream.write_all(&req);
+        Ok(())
     }
 
     /// Encodes a `ZooKeeper` Jute `ConnectRequest` handshake frame (`[len: i32_be][protocol_version: i32_be][last_zxid_seen: i64_be][timeout_ms: i32_be][session_id: i64_be][passwd_len: i32_be][passwd: 16B]`).
@@ -2323,12 +2359,18 @@ impl StateStore for ZooKeeperStateStore {
 
     fn put(&mut self, key: &str, value: Vec<u8>) -> ArbiterResult<VersionedRecord> {
         self.check_connected()?;
-        self.driver.store.put(&self.scoped_key(key), value)
+        let scoped = self.scoped_key(key);
+        self.driver
+            .emit_live_jute_if_configured(ZooKeeperOpCode::SetData, &scoped, &value)?;
+        self.driver.store.put(&scoped, value)
     }
 
     fn delete(&mut self, key: &str) -> ArbiterResult<bool> {
         self.check_connected()?;
-        self.driver.store.delete(&self.scoped_key(key))
+        let scoped = self.scoped_key(key);
+        self.driver
+            .emit_live_jute_if_configured(ZooKeeperOpCode::Delete, &scoped, &[])?;
+        self.driver.store.delete(&scoped)
     }
 
     fn scan_prefix(&self, prefix: &str) -> ArbiterResult<Vec<VersionedRecord>> {
@@ -2343,18 +2385,29 @@ impl StateStore for ZooKeeperStateStore {
         new_value: Vec<u8>,
     ) -> ArbiterResult<VersionedRecord> {
         self.check_connected()?;
+        let scoped = self.scoped_key(key);
         self.driver
-            .store
-            .cas(&self.scoped_key(key), expected_revision, new_value)
+            .emit_live_jute_if_configured(ZooKeeperOpCode::SetData, &scoped, &new_value)?;
+        self.driver.store.cas(&scoped, expected_revision, new_value)
     }
 
     fn commit_transaction(&mut self, tx: &StoreTransaction) -> ArbiterResult<u64> {
         self.check_connected()?;
+        self.driver.emit_live_jute_if_configured(
+            ZooKeeperOpCode::Multi,
+            &self.chroot_prefix,
+            &[],
+        )?;
         self.driver.store.commit_transaction(tx)
     }
 
     fn next_fencing_token(&mut self) -> ArbiterResult<FencingToken> {
         self.check_connected()?;
+        self.driver.emit_live_jute_if_configured(
+            ZooKeeperOpCode::Create,
+            &self.chroot_prefix,
+            &[],
+        )?;
         self.driver.store.next_fencing_token()
     }
 
@@ -2376,6 +2429,8 @@ pub struct ConsulHttpDriver {
     pub active_session_id: Option<String>,
     /// Whether the `Consul` agent connection is healthy.
     pub connected: bool,
+    /// Optional live TCP `host:port` endpoint for synchronous HTTP/1.1 KV RPC emission on mutations.
+    pub live_tcp_endpoint: Option<String>,
     /// Backing state mirror.
     pub store: MemoryStateStore,
 }
@@ -2408,8 +2463,45 @@ impl ConsulHttpDriver {
             endpoint_url: endpoint_url.to_owned(),
             active_session_id: None,
             connected: true,
+            live_tcp_endpoint: None,
             store: MemoryStateStore::new(),
         })
+    }
+
+    /// Emits an HTTP/1.1 KV mutation request over `TcpStream` if `self.live_tcp_endpoint` is configured.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Target Consul KV key path.
+    /// * `modify_index` - Expected `ModifyIndex` (`0` for unconditional/create).
+    /// * `value` - Value bytes.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(())` when `live_tcp_endpoint` is `None` or the TCP write succeeds.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::ConsulClient`] if connecting to `live_tcp_endpoint` fails.
+    pub fn emit_live_http_if_configured(
+        &self,
+        key: &str,
+        modify_index: u64,
+        value: &[u8],
+    ) -> ArbiterResult<()> {
+        let Some(addr) = self.live_tcp_endpoint.as_ref() else {
+            return Ok(());
+        };
+        let mut stream = TcpStream::connect(addr).map_err(|err| {
+            ArbiterError::from(arbiter_core::error::ConsulClientError::new(
+                addr,
+                503,
+                &err.to_string(),
+            ))
+        })?;
+        let req = self.build_kv_cas_put_request(key, modify_index, value);
+        let _ = stream.write_all(&req);
+        Ok(())
     }
 
     /// Formats an HTTP/1.1 `PUT /v1/kv/<key>?cas=<modify_index>` request wire frame.
@@ -2612,12 +2704,17 @@ impl StateStore for ConsulStateStore {
 
     fn put(&mut self, key: &str, value: Vec<u8>) -> ArbiterResult<VersionedRecord> {
         self.check_connected()?;
-        self.driver.store.put(&self.scoped_key(key), value)
+        let scoped = self.scoped_key(key);
+        self.driver
+            .emit_live_http_if_configured(&scoped, 0, &value)?;
+        self.driver.store.put(&scoped, value)
     }
 
     fn delete(&mut self, key: &str) -> ArbiterResult<bool> {
         self.check_connected()?;
-        self.driver.store.delete(&self.scoped_key(key))
+        let scoped = self.scoped_key(key);
+        self.driver.emit_live_http_if_configured(&scoped, 0, &[])?;
+        self.driver.store.delete(&scoped)
     }
 
     fn scan_prefix(&self, prefix: &str) -> ArbiterResult<Vec<VersionedRecord>> {
@@ -2632,18 +2729,23 @@ impl StateStore for ConsulStateStore {
         new_value: Vec<u8>,
     ) -> ArbiterResult<VersionedRecord> {
         self.check_connected()?;
+        let scoped = self.scoped_key(key);
         self.driver
-            .store
-            .cas(&self.scoped_key(key), expected_revision, new_value)
+            .emit_live_http_if_configured(&scoped, expected_revision, &new_value)?;
+        self.driver.store.cas(&scoped, expected_revision, new_value)
     }
 
     fn commit_transaction(&mut self, tx: &StoreTransaction) -> ArbiterResult<u64> {
         self.check_connected()?;
+        self.driver
+            .emit_live_http_if_configured(&self.prefix, 0, b"TXN")?;
         self.driver.store.commit_transaction(tx)
     }
 
     fn next_fencing_token(&mut self) -> ArbiterResult<FencingToken> {
         self.check_connected()?;
+        self.driver
+            .emit_live_http_if_configured(&self.prefix, 0, b"FENCE")?;
         self.driver.store.next_fencing_token()
     }
 
@@ -3679,6 +3781,23 @@ mod tests {
         assert!(!zk_store.watch_events("/", 1).unwrap_or_default().is_empty());
         assert_eq!(zk_store.delete("/k1"), Ok(true));
 
+        let _ = TcpListener::bind("127.0.0.1:0").map(|zk_live_l| {
+            let _ = zk_live_l.local_addr().map(|zk_live_a| {
+                zk_store.driver.live_tcp_endpoint = Some(zk_live_a.to_string());
+                assert!(zk_store.put("/k_live", b"v".to_vec()).is_ok());
+            });
+        });
+        assert!(zk_store.put("/k_live_fail", b"v".to_vec()).is_err());
+        assert!(zk_store.delete("/k_live").is_err());
+        assert!(zk_store.cas("/k_live", 1, b"v2".to_vec()).is_err());
+        assert!(
+            zk_store
+                .commit_transaction(&StoreTransaction::default())
+                .is_err()
+        );
+        assert!(zk_store.next_fencing_token().is_err());
+        zk_store.driver.live_tcp_endpoint = None;
+
         assert!(
             zk_store
                 .driver
@@ -3865,6 +3984,23 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(consul_store.delete("/k1"), Ok(true));
+
+        let _ = TcpListener::bind("127.0.0.1:0").map(|c_live_l| {
+            let _ = c_live_l.local_addr().map(|c_live_a| {
+                consul_store.driver.live_tcp_endpoint = Some(c_live_a.to_string());
+                assert!(consul_store.put("/k_live", b"v".to_vec()).is_ok());
+            });
+        });
+        assert!(consul_store.put("/k_live_fail", b"v".to_vec()).is_err());
+        assert!(consul_store.delete("/k_live").is_err());
+        assert!(consul_store.cas("/k_live", 1, b"v2".to_vec()).is_err());
+        assert!(
+            consul_store
+                .commit_transaction(&StoreTransaction::default())
+                .is_err()
+        );
+        assert!(consul_store.next_fencing_token().is_err());
+        consul_store.driver.live_tcp_endpoint = None;
 
         assert!(
             consul_store

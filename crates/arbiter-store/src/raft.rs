@@ -2397,6 +2397,125 @@ impl<W: WalStorageBackend> RaftQuicPeerTransport<W> {
     }
 }
 
+/// Autonomous multi-node Raft consensus daemon (`RaftConsensusDaemon`) coordinating election
+/// timeouts, leader heartbeats, WAL log compaction, and quorum-replicated `StateStore` mutations.
+#[derive(Debug)]
+pub struct RaftConsensusDaemon<W: WalStorageBackend> {
+    /// Local QUIC-backed Raft transport and state machine.
+    pub transport: RaftQuicPeerTransport<W>,
+    /// Randomized election timeout threshold in ticks (`150..=300`).
+    pub election_timeout_ticks: u64,
+    /// Leader heartbeat emission interval in ticks (`50`).
+    pub heartbeat_interval_ticks: u64,
+    /// Maximum WAL log entries before automatic background snapshot compaction.
+    pub compaction_threshold_entries: usize,
+}
+
+impl<W: WalStorageBackend> RaftConsensusDaemon<W> {
+    /// Creates a new [`RaftConsensusDaemon`].
+    ///
+    /// # Arguments
+    ///
+    /// * `store` - Local [`RaftStateStore`].
+    /// * `wal` - Durable [`WalStorageBackend`].
+    /// * `election_timeout_ticks` - Election timeout in ticks.
+    /// * `heartbeat_interval_ticks` - Heartbeat interval in ticks.
+    /// * `compaction_threshold_entries` - Automatic snapshot compaction threshold (`>= 1`).
+    ///
+    /// # Returns
+    ///
+    /// Initialized [`RaftConsensusDaemon`].
+    pub fn new(
+        store: RaftStateStore,
+        wal: W,
+        election_timeout_ticks: u64,
+        heartbeat_interval_ticks: u64,
+        compaction_threshold_entries: usize,
+    ) -> Self {
+        Self {
+            transport: RaftQuicPeerTransport::new(store, wal),
+            election_timeout_ticks,
+            heartbeat_interval_ticks,
+            compaction_threshold_entries: compaction_threshold_entries.max(1),
+        }
+    }
+
+    /// Advances one daemon tick across `peers`, triggering elections or leader heartbeats and
+    /// automatically compacting the WAL when `log_entries().len() >= compaction_threshold_entries`.
+    ///
+    /// # Arguments
+    ///
+    /// * `bind_addr` - Local UDP bind address (`"127.0.0.1:0"`).
+    /// * `elapsed_ticks` - Ticks elapsed since last leader contact or heartbeat.
+    /// * `peers` - Mutable slice of peer [`RaftQuicPeerTransport`] nodes.
+    /// * `lease_until_tick` - Leader lease expiration tick.
+    ///
+    /// # Returns
+    ///
+    /// Optional [`RaftSnapshot`] if automatic log compaction was triggered during this tick.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError`] if QUIC peer RPC exchange or WAL persistence fails.
+    pub fn step_daemon_tick(
+        &mut self,
+        bind_addr: &str,
+        elapsed_ticks: u64,
+        peers: &mut [RaftQuicPeerTransport<W>],
+        lease_until_tick: u64,
+    ) -> ArbiterResult<Option<RaftSnapshot>> {
+        let timeout = if self.transport.net_node.store.role() == RaftRole::Leader {
+            self.heartbeat_interval_ticks
+        } else {
+            self.election_timeout_ticks
+        };
+        if let Some(rpc) = self.transport.net_node.tick_election_or_heartbeat(
+            elapsed_ticks,
+            timeout,
+            self.transport.net_node.store.commit_index,
+        ) {
+            if matches!(rpc, RaftRpcMessage::PreVote(..)) {
+                self.transport.net_node.store.pre_votes_received.clear();
+                self.transport
+                    .net_node
+                    .store
+                    .pre_votes_received
+                    .insert(self.transport.net_node.store.node_id.clone());
+            }
+            for peer in peers.iter_mut() {
+                let _ = self.transport.exchange_quic_raft_rpc(
+                    bind_addr,
+                    rpc.clone(),
+                    peer,
+                    lease_until_tick,
+                )?;
+            }
+            if self.transport.net_node.store.role() == RaftRole::Candidate {
+                let rv = RaftRpcMessage::RequestVote(
+                    self.transport.net_node.store.current_term(),
+                    self.transport.net_node.store.node_id().to_owned(),
+                    self.transport.net_node.store.commit_index,
+                    self.transport.net_node.store.current_term(),
+                );
+                for peer in peers.iter_mut() {
+                    let _ = self.transport.exchange_quic_raft_rpc(
+                        bind_addr,
+                        rv.clone(),
+                        peer,
+                        lease_until_tick,
+                    );
+                }
+            }
+        }
+        if self.transport.net_node.store.log_entries().len() >= self.compaction_threshold_entries {
+            let snap = self.transport.net_node.store.compact_to_snapshot();
+            self.transport.net_node.wal.write_snapshot_atomic(&snap)?;
+            return Ok(Some(snap));
+        }
+        Ok(None)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use arbiter_core::ids::AgentId;
@@ -3332,5 +3451,49 @@ mod tests {
         let adapt_l = OpenRaftMembershipAdapter::from_raft_store(&peer_alpha.net_node.store, 1);
         assert!(adapt_l.vote.is_committed());
         assert!(adapt_l.committed_log_id.is_some());
+
+        // Test RaftConsensusDaemon election, heartbeat, and automatic WAL snapshot compaction
+        let d_voters = vec!["n1".to_owned(), "n2".to_owned()];
+        let d_s1 = RaftStateStore::new("n1", d_voters.clone()).unwrap_or_default();
+        let d_s2 = RaftStateStore::new("n2", d_voters).unwrap_or_default();
+        let mut daemon = RaftConsensusDaemon::new(d_s1, InMemoryWalBackend::default(), 200, 50, 0);
+        assert_eq!(daemon.compaction_threshold_entries, 1);
+        let mut d_peer = RaftQuicPeerTransport::new(d_s2, InMemoryWalBackend::default());
+        assert_eq!(
+            daemon.step_daemon_tick("127.0.0.1:0", 10, std::slice::from_mut(&mut d_peer), 500),
+            Ok(None)
+        );
+        // Trigger election timeout (200 ticks) -> elects n1 as Leader!
+        assert_eq!(
+            daemon.step_daemon_tick("127.0.0.1:0", 200, std::slice::from_mut(&mut d_peer), 500),
+            Ok(None)
+        );
+        assert_eq!(daemon.transport.net_node.store.role(), RaftRole::Leader);
+        let _ = daemon
+            .transport
+            .net_node
+            .store
+            .put("/d_key", b"d_val".to_vec());
+        // Trigger leader heartbeat + automatic compaction (since log_entries().len() == 1 >= threshold 1)
+        let compacted = daemon
+            .step_daemon_tick("127.0.0.1:0", 50, std::slice::from_mut(&mut d_peer), 500)
+            .unwrap_or_default();
+        assert!(compacted.is_some());
+        assert!(
+            daemon
+                .step_daemon_tick("invalid-addr", 50, std::slice::from_mut(&mut d_peer), 500)
+                .is_err()
+        );
+        let _ = daemon
+            .transport
+            .net_node
+            .store
+            .put("/d_key2", b"v2".to_vec());
+        daemon.transport.net_node.wal.fail_writes = true;
+        assert!(
+            daemon
+                .step_daemon_tick("127.0.0.1:0", 10, &mut [], 500)
+                .is_err()
+        );
     }
 }

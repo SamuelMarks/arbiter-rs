@@ -60,6 +60,82 @@ impl GangReservation {
     }
 }
 
+/// Gang co-scheduling barrier constraint (`GangConstraint`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GangConstraint {
+    /// Gang group identifier.
+    pub group_id: TaskGroupId,
+    /// Minimum number of placed members required to launch (`min_members <= total_members`).
+    pub min_members: usize,
+    /// Total desired members in the gang.
+    pub total_members: usize,
+    /// Maximum duration in ticks to hold partial gang claims before atomic rollback.
+    pub holding_timeout_ticks: u64,
+}
+
+/// Active partial gang reservation hold state supporting short-task backfilling.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GangBarrierHoldState {
+    /// Governing [`GangConstraint`].
+    pub constraint: GangConstraint,
+    /// Partial placements currently held across agents.
+    pub held_placements: Vec<(TaskId, TopologyPlacementPlan)>,
+    /// Monotonic tick when the barrier hold expires (`started_at_tick + holding_timeout_ticks`).
+    pub barrier_expires_at_tick: u64,
+}
+
+impl GangBarrierHoldState {
+    /// Checks whether a short single-node backfill task with `estimated_runtime_ticks` can run on
+    /// resources held by this gang barrier before `barrier_expires_at_tick`.
+    ///
+    /// # Arguments
+    ///
+    /// * `current_tick` - Current monotonic scheduler tick.
+    /// * `estimated_runtime_ticks` - Estimated execution duration of the backfill task (`> 0`).
+    ///
+    /// # Returns
+    ///
+    /// `true` if `estimated_runtime_ticks > 0` and `current_tick + estimated_runtime_ticks < self.barrier_expires_at_tick`.
+    pub const fn admits_backfill_task(
+        &self,
+        current_tick: u64,
+        estimated_runtime_ticks: u64,
+    ) -> bool {
+        estimated_runtime_ticks > 0
+            && current_tick.saturating_add(estimated_runtime_ticks) < self.barrier_expires_at_tick
+    }
+
+    /// Checks whether the partial gang hold has satisfied `min_members` or expired at `current_tick`.
+    ///
+    /// # Arguments
+    ///
+    /// * `current_tick` - Current monotonic scheduler tick.
+    ///
+    /// # Returns
+    ///
+    /// `Ok(true)` if `held_placements.len() >= constraint.min_members`, `Ok(false)` if still waiting
+    /// before timeout, or `Err(ArbiterError::GangConstraintUnsatisfied)` if the barrier timeout expired
+    /// before `min_members` could be assembled (triggering atomic release of held claims).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::GangConstraintUnsatisfied`] when `current_tick >= self.barrier_expires_at_tick`
+    /// and `self.held_placements.len() < self.constraint.min_members`.
+    pub fn evaluate_barrier_or_release(&self, current_tick: u64) -> ArbiterResult<bool> {
+        if self.held_placements.len() >= self.constraint.min_members {
+            return Ok(true);
+        }
+        if current_tick >= self.barrier_expires_at_tick {
+            return Err(ArbiterError::GangConstraintUnsatisfied {
+                group_id: self.constraint.group_id.to_string(),
+                placed: self.held_placements.len(),
+                required: self.constraint.min_members,
+            });
+        }
+        Ok(false)
+    }
+}
+
 /// Matches a contiguous 3D torus of healthy [`TpuDevice`]s of dimensions `(dim_x, dim_y, dim_z)`.
 ///
 /// Searches origin `(0, 0, 0)` first and then any shifted sub-torus origin `(x0, y0, z0)`
@@ -659,5 +735,29 @@ mod tests {
             lease_expires_at_tick: 100,
         };
         assert!(compute_gang_fabric_communication_cost(&custom_res, &profiles) > 5_000);
+
+        let mut hold = GangBarrierHoldState {
+            constraint: GangConstraint {
+                group_id: TaskGroupId::new("g-hold").unwrap_or_default(),
+                min_members: 2,
+                total_members: 4,
+                holding_timeout_ticks: 100,
+            },
+            held_placements: vec![(
+                TaskId::new("t-hold-1").unwrap_or_default(),
+                TopologyPlacementPlan::default(),
+            )],
+            barrier_expires_at_tick: 200,
+        };
+        assert!(!hold.admits_backfill_task(100, 0));
+        assert!(hold.admits_backfill_task(100, 50));
+        assert!(!hold.admits_backfill_task(100, 100));
+        assert_eq!(hold.evaluate_barrier_or_release(150), Ok(false));
+        assert!(hold.evaluate_barrier_or_release(200).is_err());
+        hold.held_placements.push((
+            TaskId::new("t-hold-2").unwrap_or_default(),
+            TopologyPlacementPlan::default(),
+        ));
+        assert_eq!(hold.evaluate_barrier_or_release(250), Ok(true));
     }
 }
