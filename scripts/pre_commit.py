@@ -217,10 +217,11 @@ def calculate_test_coverage(repo_root: Path, force_run: bool = True) -> float:
     if force_run or not cov_path.exists():
         print("==> [shields] Generating test coverage report via cargo llvm-cov...")
         cov_path.parent.mkdir(parents=True, exist_ok=True)
-        run_command(["cargo", "llvm-cov", "clean", "--workspace"], cwd=repo_root)
+        run_command(["cargo", "+stable", "llvm-cov", "clean", "--workspace"], cwd=repo_root)
         run_command(
             [
                 "cargo",
+                "+stable",
                 "llvm-cov",
                 "--workspace",
                 "--all-targets",

@@ -30,15 +30,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install Rust nightly toolchain with rust-docs
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy, llvm-tools-preview, rust-docs
+
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy, rust-docs
-
-      - name: Install Rust nightly toolchain with llvm-tools-preview
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: llvm-tools-preview, rust-docs
+          components: rustfmt, clippy, llvm-tools-preview, rust-docs
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -106,15 +106,7 @@ jobs:
             bin_ext: ""
             use_cross: false
 
-          # macOS / Darwin (Intel x86_64 & Apple Silicon aarch64)
-          - runner: macos-latest
-            target: x86_64-apple-darwin
-            os_name: macos
-            arch_name: x86_64
-            archive_ext: tar.gz
-            bin_ext: ""
-            use_cross: false
-
+          # macOS / Darwin (Apple Silicon aarch64)
           - runner: macos-latest
             target: aarch64-apple-darwin
             os_name: macos

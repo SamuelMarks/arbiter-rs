@@ -684,7 +684,6 @@ impl MicroVmDriver {
     ///
     /// Returns [`ArbiterError::MicroVmError`] if `build_vm_config` fails or
     /// [`ArbiterError::SocketBindError`] if binding the UDS socket fails.
-    #[cfg(unix)]
     pub fn execute_firecracker_uds_roundtrip(
         &self,
         socket_path: &std::path::Path,
@@ -692,18 +691,39 @@ impl MicroVmDriver {
         limits: &ResourceBundle,
     ) -> ArbiterResult<String> {
         use std::io::{Read, Write};
-        use std::os::unix::net::UnixListener;
 
         if let Ok(resp) = self.send_firecracker_uds_http_request(socket_path, task_id, limits) {
             return Ok(resp);
         }
         let cfg = self.build_vm_config(task_id, limits)?;
         let _ = std::fs::remove_file(socket_path);
-        let listener =
-            UnixListener::bind(socket_path).map_err(|err| ArbiterError::SocketBindError {
+        #[cfg(unix)]
+        let listener = std::os::unix::net::UnixListener::bind(socket_path).map_err(|err| {
+            ArbiterError::SocketBindError {
                 endpoint: socket_path.display().to_string(),
                 reason: err.to_string(),
+            }
+        })?;
+        #[cfg(not(unix))]
+        let listener = {
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| {
+                ArbiterError::SocketBindError {
+                    endpoint: socket_path.display().to_string(),
+                    reason: err.to_string(),
+                }
             })?;
+            let addr_str = tcp
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+            std::fs::write(socket_path, addr_str.as_bytes()).map_err(|err| {
+                ArbiterError::SocketBindError {
+                    endpoint: socket_path.display().to_string(),
+                    reason: err.to_string(),
+                }
+            })?;
+            tcp
+        };
         let req_len = Self::format_hypervisor_launch_command(task_id, &cfg).len();
         let srv_handle = std::thread::spawn(move || {
             let _ = listener.accept().map(|(mut srv, _)| {
@@ -737,7 +757,6 @@ impl MicroVmDriver {
     ///
     /// Returns [`ArbiterError::MicroVmError`] if `build_vm_config` fails or
     /// [`ArbiterError::SocketIoError`] if connecting to `socket_path` fails.
-    #[cfg(unix)]
     pub fn send_firecracker_uds_http_request(
         &self,
         socket_path: &std::path::Path,
@@ -745,14 +764,30 @@ impl MicroVmDriver {
         limits: &ResourceBundle,
     ) -> ArbiterResult<String> {
         use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
 
         let cfg = self.build_vm_config(task_id, limits)?;
-        let mut stream =
-            UnixStream::connect(socket_path).map_err(|err| ArbiterError::SocketIoError {
+        #[cfg(unix)]
+        let mut stream = std::os::unix::net::UnixStream::connect(socket_path).map_err(|err| {
+            ArbiterError::SocketIoError {
                 endpoint: socket_path.display().to_string(),
                 reason: err.to_string(),
+            }
+        })?;
+        #[cfg(not(unix))]
+        let mut stream = {
+            let addr_str = std::fs::read_to_string(socket_path).map_err(|err| {
+                ArbiterError::SocketIoError {
+                    endpoint: socket_path.display().to_string(),
+                    reason: err.to_string(),
+                }
             })?;
+            std::net::TcpStream::connect(addr_str.trim()).map_err(|err| {
+                ArbiterError::SocketIoError {
+                    endpoint: socket_path.display().to_string(),
+                    reason: err.to_string(),
+                }
+            })?
+        };
         let req_wire = Self::format_hypervisor_launch_command(task_id, &cfg);
         let _ = stream.write_all(req_wire.as_bytes());
         let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -1030,7 +1065,18 @@ mod tests {
         );
         let fc_ext_sock = std::env::temp_dir().join("arbiter_fc_ext_uds_test.sock");
         let _ = std::fs::remove_file(&fc_ext_sock);
-        let _ = std::os::unix::net::UnixListener::bind(&fc_ext_sock).map(|fc_l| {
+        #[cfg(unix)]
+        let fc_l_opt = std::os::unix::net::UnixListener::bind(&fc_ext_sock).ok();
+        #[cfg(not(unix))]
+        let fc_l_opt = std::net::TcpListener::bind("127.0.0.1:0").ok().map(|tcp| {
+            let addr_str = tcp
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+            let _ = std::fs::write(&fc_ext_sock, addr_str.as_bytes());
+            tcp
+        });
+        let _ = fc_l_opt.map(|fc_l| {
             let h = std::thread::spawn(move || {
                 use std::io::{Read, Write};
                 for _ in 0..2 {

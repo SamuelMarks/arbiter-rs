@@ -1441,7 +1441,6 @@ impl AgentSupervisor {
     ///
     /// Returns [`ArbiterError::SocketBindError`] if a checkpointed executor Unix Domain Socket cannot
     /// be connected, or propagates any [`ArbiterError`] from [`Self::process_executor_http_recordio_payload`].
-    #[cfg(unix)]
     pub fn reconnect_executor_unix_sockets(&mut self) -> ArbiterResult<Vec<(ExecutorId, Vec<u8>)>> {
         use std::io::{Read, Write};
 
@@ -1452,12 +1451,28 @@ impl AgentSupervisor {
             .collect();
         let mut reconnected = Vec::with_capacity(sockets.len());
         for (exec_id, sock_path) in sockets {
+            #[cfg(unix)]
             let mut stream = std::os::unix::net::UnixStream::connect(&sock_path).map_err(|e| {
                 ArbiterError::SocketBindError {
                     endpoint: sock_path.clone(),
                     reason: format!("failed to reconnect executor UDS: {e}"),
                 }
             })?;
+            #[cfg(not(unix))]
+            let mut stream = {
+                let addr_str = std::fs::read_to_string(&sock_path).map_err(|e| {
+                    ArbiterError::SocketBindError {
+                        endpoint: sock_path.clone(),
+                        reason: format!("failed to reconnect executor UDS: {e}"),
+                    }
+                })?;
+                std::net::TcpStream::connect(addr_str.trim()).map_err(|e| {
+                    ArbiterError::SocketBindError {
+                        endpoint: sock_path.clone(),
+                        reason: format!("failed to reconnect executor UDS: {e}"),
+                    }
+                })?
+            };
             let mut rx_buf = Vec::new();
             let _ = stream.read_to_end(&mut rx_buf);
             let resp_bytes = self.process_executor_http_recordio_payload(&rx_buf)?;
@@ -2892,7 +2907,17 @@ mod tests {
         let uds_path =
             std::env::temp_dir().join(format!("arbiter_exec_reconn_{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&uds_path);
+        #[cfg(unix)]
         let listener = std::os::unix::net::UnixListener::bind(&uds_path).ok();
+        #[cfg(not(unix))]
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok().map(|tcp| {
+            let addr_str = tcp
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+            let _ = std::fs::write(&uds_path, addr_str.as_bytes());
+            tcp
+        });
         let uds_str = uds_path.to_string_lossy().into_owned();
         agent.executor_sockets.insert(ex_id.clone(), uds_str);
 
@@ -2936,7 +2961,17 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_file(&bad_uds_path);
+        #[cfg(unix)]
         let bad_listener = std::os::unix::net::UnixListener::bind(&bad_uds_path).ok();
+        #[cfg(not(unix))]
+        let bad_listener = std::net::TcpListener::bind("127.0.0.1:0").ok().map(|tcp| {
+            let addr_str = tcp
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+            let _ = std::fs::write(&bad_uds_path, addr_str.as_bytes());
+            tcp
+        });
         agent
             .executor_sockets
             .insert(ex_id, bad_uds_path.to_string_lossy().into_owned());

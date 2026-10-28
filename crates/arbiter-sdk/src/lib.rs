@@ -679,10 +679,10 @@ impl CaasLeaseClient {
     /// # Errors
     ///
     /// Returns [`ArbiterError::SocketIoError`] if connecting to `self.uds_socket_path` fails.
-    #[cfg(unix)]
     pub fn exchange_uds_request(&self, request_json: &str) -> ArbiterResult<String> {
         use std::io::{Read, Write};
 
+        #[cfg(unix)]
         let mut stream =
             std::os::unix::net::UnixStream::connect(&self.uds_socket_path).map_err(|e| {
                 ArbiterError::SocketIoError {
@@ -690,6 +690,21 @@ impl CaasLeaseClient {
                     reason: e.to_string(),
                 }
             })?;
+        #[cfg(not(unix))]
+        let mut stream = {
+            let addr_str = std::fs::read_to_string(&self.uds_socket_path).map_err(|e| {
+                ArbiterError::SocketIoError {
+                    endpoint: self.uds_socket_path.clone(),
+                    reason: e.to_string(),
+                }
+            })?;
+            std::net::TcpStream::connect(addr_str.trim()).map_err(|e| {
+                ArbiterError::SocketIoError {
+                    endpoint: self.uds_socket_path.clone(),
+                    reason: e.to_string(),
+                }
+            })?
+        };
         let _ = stream.write_all(request_json.as_bytes());
         let _ = stream.shutdown(std::net::Shutdown::Write);
         let mut resp = Vec::new();
@@ -1564,7 +1579,17 @@ mod tests {
         let uds_path =
             std::env::temp_dir().join(format!("arbiter_sdk_caas_{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&uds_path);
+        #[cfg(unix)]
         let uds_listener = std::os::unix::net::UnixListener::bind(&uds_path).ok();
+        #[cfg(not(unix))]
+        let uds_listener = std::net::TcpListener::bind("127.0.0.1:0").ok().map(|tcp| {
+            let addr_str = tcp
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+            let _ = std::fs::write(&uds_path, addr_str.as_bytes());
+            tcp
+        });
         let uds_srv = std::thread::spawn(move || {
             let _ = uds_listener
                 .as_ref()

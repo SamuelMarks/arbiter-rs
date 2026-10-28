@@ -159,11 +159,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Rust stable toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Install Rust nightly toolchain with llvm-tools-preview
+      - name: Install Rust nightly toolchain with rust-docs
         uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: llvm-tools-preview, rust-docs
+
+      - name: Install Rust stable toolchain with llvm-tools-preview
+        uses: dtolnay/rust-toolchain@stable
         with:
           components: llvm-tools-preview, rust-docs
 
@@ -194,15 +196,15 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
+      - name: Install Rust nightly toolchain with rust-docs
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy, llvm-tools-preview, rust-docs
+
       - name: Install Rust stable toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy, rust-docs
-
-      - name: Install Rust nightly toolchain with llvm-tools-preview
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: llvm-tools-preview, rust-docs
+          components: rustfmt, clippy, llvm-tools-preview, rust-docs
 
       - name: Install cargo-llvm-cov
         uses: taiki-e/install-action@cargo-llvm-cov
@@ -242,7 +244,6 @@ jobs:
           - x86_64-unknown-freebsd
           - x86_64-unknown-illumos
           - x86_64-pc-windows-gnu
-          - x86_64-apple-darwin
           - aarch64-apple-darwin
     steps:
       - name: Checkout repository
@@ -252,6 +253,16 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
+
+      - name: Install C cross-compiler and archiver tools for ${{ matrix.target }}
+        shell: bash
+        run: |
+          if [[ "${{ matrix.target }}" == "riscv64gc-unknown-linux-gnu" ]]; then
+            sudo apt-get update
+            sudo apt-get install -y gcc-riscv64-linux-gnu
+          elif [[ "${{ matrix.target }}" == "x86_64-unknown-illumos" ]]; then
+            sudo ln -sf /usr/bin/ar /usr/local/bin/gar
+          fi
 
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2

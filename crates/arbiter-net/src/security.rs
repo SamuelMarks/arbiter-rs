@@ -2329,7 +2329,6 @@ impl LiveSpireUdsTransport {
 }
 
 impl SpireTransport for LiveSpireUdsTransport {
-    #[cfg(unix)]
     fn fetch_workload_svid(
         &mut self,
         socket_path: &str,
@@ -2348,25 +2347,27 @@ impl SpireTransport for LiveSpireUdsTransport {
 }
 
 /// Standalone SPIRE Agent Unix Domain Socket server (`SpireMockAgentServer`) accepting external
-/// `UnixStream` client connections from [`SpireUnixSocketClient`].
-#[cfg(unix)]
+/// `UnixStream` (or loopback `TcpStream` on non-Unix) client connections from [`SpireUnixSocketClient`].
 #[derive(Debug)]
 pub struct SpireMockAgentServer {
-    /// Bound `UnixListener`.
+    /// Bound `UnixListener` on Unix targets.
+    #[cfg(unix)]
     listener: std::os::unix::net::UnixListener,
+    /// Bound loopback `TcpListener` on non-Unix targets.
+    #[cfg(not(unix))]
+    listener: std::net::TcpListener,
     /// Socket path on disk.
     socket_path: String,
     /// Backing [`SvidAuthority`].
     authority: SvidAuthority,
 }
 
-#[cfg(unix)]
 impl SpireMockAgentServer {
     /// Binds a persistent [`SpireMockAgentServer`] at `socket_path`.
     ///
     /// # Arguments
     ///
-    /// * `socket_path` - Filesystem UDS path.
+    /// * `socket_path` - Filesystem UDS path (or loopback TCP anchor file path on non-Unix).
     /// * `authority` - [`SvidAuthority`] issuing SVIDs.
     ///
     /// # Returns
@@ -2378,12 +2379,33 @@ impl SpireMockAgentServer {
     /// Returns [`ArbiterError::SocketBindError`] if binding fails.
     pub fn bind(socket_path: &str, authority: SvidAuthority) -> ArbiterResult<Self> {
         let _ = std::fs::remove_file(socket_path);
+        #[cfg(unix)]
         let listener = std::os::unix::net::UnixListener::bind(socket_path).map_err(|err| {
             ArbiterError::SocketBindError {
                 endpoint: socket_path.to_owned(),
                 reason: err.to_string(),
             }
         })?;
+        #[cfg(not(unix))]
+        let listener = {
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| {
+                ArbiterError::SocketBindError {
+                    endpoint: socket_path.to_owned(),
+                    reason: err.to_string(),
+                }
+            })?;
+            let addr_str = tcp
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+            std::fs::write(socket_path, addr_str.as_bytes()).map_err(|err| {
+                ArbiterError::SocketBindError {
+                    endpoint: socket_path.to_owned(),
+                    reason: err.to_string(),
+                }
+            })?;
+            tcp
+        };
         let _ = listener.set_nonblocking(true);
         Ok(Self {
             listener,
@@ -2393,7 +2415,7 @@ impl SpireMockAgentServer {
     }
 
     /// Polls for an incoming [`SpireUnixSocketClient`] connection, reads the requested `spiffe_uri`,
-    /// issues an [`SpiffeSvid`] at `current_tick`, and writes it back over the `UnixStream`.
+    /// issues an [`SpiffeSvid`] at `current_tick`, and writes it back over the socket stream.
     ///
     /// # Arguments
     ///
@@ -2423,7 +2445,6 @@ impl SpireMockAgentServer {
     }
 }
 
-#[cfg(unix)]
 impl Drop for SpireMockAgentServer {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
@@ -2468,6 +2489,44 @@ impl SpireUnixSocketClient {
         Ok(stream)
     }
 
+    /// Connects to the SPIRE Agent loopback socket advertised at `socket_path` on non-Unix hosts
+    /// and sends `spiffe_uri`.
+    ///
+    /// # Arguments
+    ///
+    /// * `socket_path` - Path to the SPIRE Agent socket anchor file.
+    /// * `spiffe_uri` - Requested `spiffe://...` URI.
+    ///
+    /// # Returns
+    ///
+    /// Connected `TcpStream` ready to read the issued [`SpiffeSvid`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketIoError`] if connecting fails.
+    #[cfg(not(unix))]
+    pub fn send_svid_request(
+        socket_path: &str,
+        spiffe_uri: &str,
+    ) -> ArbiterResult<std::net::TcpStream> {
+        use std::io::Write;
+        use std::net::TcpStream;
+
+        let addr_str =
+            std::fs::read_to_string(socket_path).map_err(|err| ArbiterError::SocketIoError {
+                endpoint: socket_path.to_owned(),
+                reason: err.to_string(),
+            })?;
+        let mut stream =
+            TcpStream::connect(addr_str.trim()).map_err(|err| ArbiterError::SocketIoError {
+                endpoint: socket_path.to_owned(),
+                reason: err.to_string(),
+            })?;
+        let _ = stream.write_all(spiffe_uri.as_bytes());
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        Ok(stream)
+    }
+
     /// Reads and decodes the issued [`SpiffeSvid`] from `stream`.
     ///
     /// # Arguments
@@ -2485,6 +2544,34 @@ impl SpireUnixSocketClient {
     #[cfg(unix)]
     pub fn read_svid_response(
         mut stream: std::os::unix::net::UnixStream,
+        spiffe_uri: &str,
+    ) -> ArbiterResult<SpiffeSvid> {
+        use std::io::Read;
+        let mut resp_bytes = Vec::new();
+        let _ = stream.read_to_end(&mut resp_bytes);
+        serde_json::from_slice(&resp_bytes).map_err(|err| ArbiterError::SpiffeIdentityInvalid {
+            uri: spiffe_uri.to_owned(),
+            reason: format!("invalid SPIRE Agent response JSON: {err}"),
+        })
+    }
+
+    /// Reads and decodes the issued [`SpiffeSvid`] from `stream` on non-Unix hosts.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream` - Connected `TcpStream` returned by [`Self::send_svid_request`].
+    /// * `spiffe_uri` - Requested `spiffe://...` URI for error context.
+    ///
+    /// # Returns
+    ///
+    /// Decoded [`SpiffeSvid`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SpiffeIdentityInvalid`] if the response JSON is invalid.
+    #[cfg(not(unix))]
+    pub fn read_svid_response(
+        mut stream: std::net::TcpStream,
         spiffe_uri: &str,
     ) -> ArbiterResult<SpiffeSvid> {
         use std::io::Read;

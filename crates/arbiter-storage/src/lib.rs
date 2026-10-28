@@ -1139,7 +1139,6 @@ impl VolumeManager {
     ///
     /// Returns [`ArbiterError::StoreReadError`] if `volume_id` is unknown or
     /// [`ArbiterError::SocketBindError`] if binding the UDS socket fails.
-    #[cfg(unix)]
     pub fn execute_csi_uds_rpc(
         &self,
         csi_socket_path: &std::path::Path,
@@ -1148,7 +1147,6 @@ impl VolumeManager {
         target_path: &str,
     ) -> ArbiterResult<String> {
         use std::io::{Read, Write};
-        use std::os::unix::net::UnixListener;
 
         if !self.volumes.contains_key(volume_id) {
             return Err(ArbiterError::StoreReadError {
@@ -1162,11 +1160,33 @@ impl VolumeManager {
             return Ok(ext_resp);
         }
         let _ = std::fs::remove_file(csi_socket_path);
-        let listener =
-            UnixListener::bind(csi_socket_path).map_err(|err| ArbiterError::SocketBindError {
+        #[cfg(unix)]
+        let listener = std::os::unix::net::UnixListener::bind(csi_socket_path).map_err(|err| {
+            ArbiterError::SocketBindError {
                 endpoint: csi_socket_path.display().to_string(),
                 reason: err.to_string(),
+            }
+        })?;
+        #[cfg(not(unix))]
+        let listener = {
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| {
+                ArbiterError::SocketBindError {
+                    endpoint: csi_socket_path.display().to_string(),
+                    reason: err.to_string(),
+                }
             })?;
+            let addr_str = tcp
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+            std::fs::write(csi_socket_path, addr_str.as_bytes()).map_err(|err| {
+                ArbiterError::SocketBindError {
+                    endpoint: csi_socket_path.display().to_string(),
+                    reason: err.to_string(),
+                }
+            })?;
+            tcp
+        };
         let resp_wire = format!("CSI_OK:{}:{volume_id}", op.as_grpc_path());
         let srv_handle = std::thread::spawn(move || {
             let _ = listener.accept().map(|(mut srv, _)| {
@@ -1201,7 +1221,6 @@ impl VolumeManager {
     ///
     /// Returns [`ArbiterError::StoreReadError`] if `volume_id` is unknown or
     /// [`ArbiterError::SocketIoError`] if connecting to `csi_socket_path` fails.
-    #[cfg(unix)]
     pub fn execute_external_csi_uds_client(
         &self,
         csi_socket_path: &std::path::Path,
@@ -1210,7 +1229,6 @@ impl VolumeManager {
         target_path: &str,
     ) -> ArbiterResult<String> {
         use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
 
         if !self.volumes.contains_key(volume_id) {
             return Err(ArbiterError::StoreReadError {
@@ -1218,11 +1236,28 @@ impl VolumeManager {
                 reason: "unknown CSI volume_id".to_owned(),
             });
         }
-        let mut cli =
-            UnixStream::connect(csi_socket_path).map_err(|err| ArbiterError::SocketIoError {
+        #[cfg(unix)]
+        let mut cli = std::os::unix::net::UnixStream::connect(csi_socket_path).map_err(|err| {
+            ArbiterError::SocketIoError {
                 endpoint: csi_socket_path.display().to_string(),
                 reason: err.to_string(),
+            }
+        })?;
+        #[cfg(not(unix))]
+        let mut cli = {
+            let addr_str = std::fs::read_to_string(csi_socket_path).map_err(|err| {
+                ArbiterError::SocketIoError {
+                    endpoint: csi_socket_path.display().to_string(),
+                    reason: err.to_string(),
+                }
             })?;
+            std::net::TcpStream::connect(addr_str.trim()).map_err(|err| {
+                ArbiterError::SocketIoError {
+                    endpoint: csi_socket_path.display().to_string(),
+                    reason: err.to_string(),
+                }
+            })?
+        };
         let req_wire = format!("{}:{volume_id}:{target_path}\n", op.as_grpc_path());
         let _ = cli.write_all(req_wire.as_bytes());
         let _ = cli.shutdown(std::net::Shutdown::Write);
@@ -1499,6 +1534,8 @@ impl SandboxMaterializer {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(path_obj, std::fs::Permissions::from_mode(0o755));
             }
+            #[cfg(not(unix))]
+            let _ = executable;
             materialized.push(full_path);
             let padded = file_size.div_ceil(512) * 512;
             offset = offset.saturating_add(padded);
@@ -2275,10 +2312,9 @@ impl SandboxMaterializer {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(path_obj, std::fs::Permissions::from_mode(0o755));
             }
+            #[cfg(not(unix))]
+            let _ = executable;
             materialized.push(full_path);
-        }
-        if materialized.is_empty() {
-            return self.extract_ustar_bytes_into_sandbox(task_sandbox, tar_bytes, executable);
         }
         Ok(materialized)
     }
@@ -2355,6 +2391,8 @@ impl SandboxMaterializer {
                 use std::os::unix::fs::PermissionsExt;
                 let _ = std::fs::set_permissions(path_obj, std::fs::Permissions::from_mode(0o755));
             }
+            #[cfg(not(unix))]
+            let _ = executable;
             materialized.push(full_path);
         }
         Ok(materialized)
@@ -2674,19 +2712,35 @@ impl UnixSocketCsiClient {
     ///
     /// Returns [`ArbiterError::SocketIoError`] if connecting to `socket_path` fails or
     /// [`ArbiterError::CsiGrpc`] if response decoding fails.
-    #[cfg(unix)]
     pub fn call_volume_rpc(
         &self,
         req: &CsiV1ProtoVolumeRequest,
     ) -> ArbiterResult<CsiV1ProtoVolumeResponse> {
         use std::io::{Read, Write};
-        use std::os::unix::net::UnixStream;
 
+        #[cfg(unix)]
         let mut stream =
-            UnixStream::connect(&self.socket_path).map_err(|err| ArbiterError::SocketIoError {
-                endpoint: self.socket_path.clone(),
-                reason: err.to_string(),
+            std::os::unix::net::UnixStream::connect(&self.socket_path).map_err(|err| {
+                ArbiterError::SocketIoError {
+                    endpoint: self.socket_path.clone(),
+                    reason: err.to_string(),
+                }
             })?;
+        #[cfg(not(unix))]
+        let mut stream = {
+            let addr_str = std::fs::read_to_string(&self.socket_path).map_err(|err| {
+                ArbiterError::SocketIoError {
+                    endpoint: self.socket_path.clone(),
+                    reason: err.to_string(),
+                }
+            })?;
+            std::net::TcpStream::connect(addr_str.trim()).map_err(|err| {
+                ArbiterError::SocketIoError {
+                    endpoint: self.socket_path.clone(),
+                    reason: err.to_string(),
+                }
+            })?
+        };
         let tx_frame = CsiV1TonicGrpcFrameCodec::encode_grpc_frame(req);
         let _ = stream.write_all(&tx_frame);
         let _ = stream.shutdown(std::net::Shutdown::Write);
@@ -3299,13 +3353,24 @@ mod tests {
             });
         });
 
-        // 2. External CSI UDS client connecting to an external UnixListener
+        // 2. External CSI UDS client connecting to an external UnixListener (or loopback TCP on non-Unix)
         let mut vmgr = VolumeManager::new();
         let vid = VolumeId::new("vol-ext-1").unwrap_or_default();
         let _ = vmgr.create_volume(vid.clone(), Bytes::new(4096));
         let ext_sock = std::env::temp_dir().join("arbiter_ext_csi_srv.sock");
         let _ = std::fs::remove_file(&ext_sock);
-        let _ = std::os::unix::net::UnixListener::bind(&ext_sock).map(|listener| {
+        #[cfg(unix)]
+        let ext_listener_opt = std::os::unix::net::UnixListener::bind(&ext_sock).ok();
+        #[cfg(not(unix))]
+        let ext_listener_opt = std::net::TcpListener::bind("127.0.0.1:0").ok().map(|tcp| {
+            let addr_str = tcp
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+            let _ = std::fs::write(&ext_sock, addr_str.as_bytes());
+            tcp
+        });
+        let _ = ext_listener_opt.map(|listener| {
             let handle = std::thread::spawn(move || {
                 let _ = listener.accept().map(|(mut srv, _)| {
                     let mut req = Vec::new();
@@ -3918,7 +3983,18 @@ mod tests {
         let _ = std::fs::remove_file(&uds_csi_path);
         let uds_cli = UnixSocketCsiClient::new(&uds_csi_path.display().to_string());
         assert!(uds_cli.call_volume_rpc(&csi_req).is_err());
-        let _ = std::os::unix::net::UnixListener::bind(&uds_csi_path).map(|listener| {
+        #[cfg(unix)]
+        let csi_proto_listener_opt = std::os::unix::net::UnixListener::bind(&uds_csi_path).ok();
+        #[cfg(not(unix))]
+        let csi_proto_listener_opt = std::net::TcpListener::bind("127.0.0.1:0").ok().map(|tcp| {
+            let addr_str = tcp
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+            let _ = std::fs::write(&uds_csi_path, addr_str.as_bytes());
+            tcp
+        });
+        let _ = csi_proto_listener_opt.map(|listener| {
             let expected_resp = csi_resp.clone();
             let srv_h = std::thread::spawn(move || {
                 use std::io::{Read, Write};

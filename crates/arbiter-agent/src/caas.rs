@@ -365,7 +365,6 @@ impl CaasLocalIpcServer {
     /// # Errors
     ///
     /// Returns [`ArbiterError::SocketIoError`] if connecting to a subscriber UDS path fails.
-    #[cfg(unix)]
     pub fn push_notifications_to_uds_subscribers(
         &mut self,
         subscriber_paths: &[&std::path::Path],
@@ -374,12 +373,27 @@ impl CaasLocalIpcServer {
         let payload = serde_json::to_vec(&notifications).unwrap_or_default();
         let mut delivered = 0_usize;
         for path in subscriber_paths {
+            #[cfg(unix)]
             let mut stream = std::os::unix::net::UnixStream::connect(path).map_err(|err| {
                 ArbiterError::SocketIoError {
                     endpoint: path.display().to_string(),
                     reason: err.to_string(),
                 }
             })?;
+            #[cfg(not(unix))]
+            let mut stream = {
+                let addr_str =
+                    std::fs::read_to_string(path).map_err(|err| ArbiterError::SocketIoError {
+                        endpoint: path.display().to_string(),
+                        reason: err.to_string(),
+                    })?;
+                std::net::TcpStream::connect(addr_str.trim()).map_err(|err| {
+                    ArbiterError::SocketIoError {
+                        endpoint: path.display().to_string(),
+                        reason: err.to_string(),
+                    }
+                })?
+            };
             let _ = stream.write_all(&payload);
             let _ = stream.shutdown(std::net::Shutdown::Write);
             delivered = delivered.saturating_add(1);
@@ -755,18 +769,20 @@ impl CaasLocalIpcServer {
 
 /// Persistent non-blocking Unix Domain Socket server (`PersistentCaasUdsServer`) bound at
 /// `/var/run/arbiter/caas.sock` serving co-located [`CaasLeaseClient`] connections without self-loopback.
-#[cfg(unix)]
 #[derive(Debug)]
 pub struct PersistentCaasUdsServer {
-    /// Bound `UnixListener`.
+    /// Bound `UnixListener` on Unix targets.
+    #[cfg(unix)]
     listener: std::os::unix::net::UnixListener,
+    /// Bound loopback `TcpListener` on non-Unix targets.
+    #[cfg(not(unix))]
+    listener: std::net::TcpListener,
     /// Socket path on disk.
     socket_path: String,
     /// Underlying [`CaasLocalIpcServer`] state machine.
     ipc_server: CaasLocalIpcServer,
 }
 
-#[cfg(unix)]
 impl PersistentCaasUdsServer {
     /// Binds a persistent [`PersistentCaasUdsServer`] at `socket_path`.
     ///
@@ -784,12 +800,33 @@ impl PersistentCaasUdsServer {
     /// Returns [`ArbiterError::SocketBindError`] if binding fails.
     pub fn bind(socket_path: &str, ipc_server: CaasLocalIpcServer) -> ArbiterResult<Self> {
         let _ = std::fs::remove_file(socket_path);
+        #[cfg(unix)]
         let listener = std::os::unix::net::UnixListener::bind(socket_path).map_err(|err| {
             ArbiterError::SocketBindError {
                 endpoint: socket_path.to_owned(),
                 reason: err.to_string(),
             }
         })?;
+        #[cfg(not(unix))]
+        let listener = {
+            let tcp = std::net::TcpListener::bind("127.0.0.1:0").map_err(|err| {
+                ArbiterError::SocketBindError {
+                    endpoint: socket_path.to_owned(),
+                    reason: err.to_string(),
+                }
+            })?;
+            let addr_str = tcp
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+            std::fs::write(socket_path, addr_str.as_bytes()).map_err(|err| {
+                ArbiterError::SocketBindError {
+                    endpoint: socket_path.to_owned(),
+                    reason: err.to_string(),
+                }
+            })?;
+            tcp
+        };
         let _ = listener.set_nonblocking(true);
         Ok(Self {
             listener,
@@ -807,7 +844,7 @@ impl PersistentCaasUdsServer {
         &mut self.ipc_server
     }
 
-    /// Polls for an incoming [`CaasLeaseClient`] `UnixStream` connection, processes its
+    /// Polls for an incoming [`CaasLeaseClient`] connection, processes its
     /// [`CaasIpcRequest`] at `current_tick`, and writes back the JSON [`CaasIpcResponse`].
     ///
     /// # Arguments
@@ -837,7 +874,6 @@ impl PersistentCaasUdsServer {
     }
 }
 
-#[cfg(unix)]
 impl Drop for PersistentCaasUdsServer {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
@@ -975,6 +1011,40 @@ impl CaasLeaseClient {
         Ok(stream)
     }
 
+    /// Connects to the local Agent's [`PersistentCaasUdsServer`] at `socket_path` on non-Unix hosts
+    /// and transmits a serialized [`CaasIpcRequest`].
+    ///
+    /// # Arguments
+    ///
+    /// * `request` - [`CaasIpcRequest`] to transmit.
+    ///
+    /// # Returns
+    ///
+    /// Open `TcpStream` ready to read the server's [`CaasIpcResponse`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::SocketIoError`] if connecting fails.
+    #[cfg(not(unix))]
+    pub fn send_ipc_request(&self, request: &CaasIpcRequest) -> ArbiterResult<std::net::TcpStream> {
+        let addr_str = std::fs::read_to_string(&self.socket_path).map_err(|err| {
+            ArbiterError::SocketIoError {
+                endpoint: self.socket_path.clone(),
+                reason: err.to_string(),
+            }
+        })?;
+        let mut stream = std::net::TcpStream::connect(addr_str.trim()).map_err(|err| {
+            ArbiterError::SocketIoError {
+                endpoint: self.socket_path.clone(),
+                reason: err.to_string(),
+            }
+        })?;
+        let req_bytes = serde_json::to_vec(request).unwrap_or_default();
+        let _ = stream.write_all(&req_bytes);
+        let _ = stream.shutdown(std::net::Shutdown::Write);
+        Ok(stream)
+    }
+
     /// Reads and decodes a [`CaasIpcResponse`] from `stream`.
     ///
     /// # Arguments
@@ -992,6 +1062,29 @@ impl CaasLeaseClient {
     pub fn read_ipc_response(
         mut stream: std::os::unix::net::UnixStream,
     ) -> ArbiterResult<CaasIpcResponse> {
+        let mut resp_bytes = Vec::new();
+        let _ = stream.read_to_end(&mut resp_bytes);
+        serde_json::from_slice(&resp_bytes).map_err(|err| ArbiterError::DeserializationError {
+            format: "CaasIpcResponse".to_owned(),
+            reason: err.to_string(),
+        })
+    }
+
+    /// Reads and decodes a [`CaasIpcResponse`] from `stream` on non-Unix hosts.
+    ///
+    /// # Arguments
+    ///
+    /// * `stream` - Connected `TcpStream` returned by [`Self::send_ipc_request`].
+    ///
+    /// # Returns
+    ///
+    /// Decoded [`CaasIpcResponse`].
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ArbiterError::DeserializationError`] if the response JSON is malformed.
+    #[cfg(not(unix))]
+    pub fn read_ipc_response(mut stream: std::net::TcpStream) -> ArbiterResult<CaasIpcResponse> {
         let mut resp_bytes = Vec::new();
         let _ = stream.read_to_end(&mut resp_bytes);
         serde_json::from_slice(&resp_bytes).map_err(|err| ArbiterError::DeserializationError {
@@ -2425,13 +2518,18 @@ mod tests {
                     let resp = CaasLeaseClient::read_ipc_response(cli_stream);
                     assert!(resp.is_ok());
                 });
-                let _ =
-                    std::os::unix::net::UnixStream::connect(&persist_sock_str).map(|mut bad| {
-                        let _ = bad.write_all(b"{invalid");
-                        let _ = bad.shutdown(std::net::Shutdown::Write);
-                        assert!(persist_srv.poll_once(50).is_err());
-                        assert!(CaasLeaseClient::read_ipc_response(bad).is_err());
-                    });
+                #[cfg(unix)]
+                let bad_conn_opt = std::os::unix::net::UnixStream::connect(&persist_sock_str).ok();
+                #[cfg(not(unix))]
+                let bad_conn_opt = std::fs::read_to_string(&persist_sock_str)
+                    .ok()
+                    .and_then(|addr| std::net::TcpStream::connect(addr.trim()).ok());
+                let _ = bad_conn_opt.map(|mut bad| {
+                    let _ = bad.write_all(b"{invalid");
+                    let _ = bad.shutdown(std::net::Shutdown::Write);
+                    assert!(persist_srv.poll_once(50).is_err());
+                    assert!(CaasLeaseClient::read_ipc_response(bad).is_err());
+                });
             },
         );
 
@@ -2829,7 +2927,17 @@ mod tests {
         let sub_push_sock =
             std::env::temp_dir().join(format!("arbiter_caas_push_{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&sub_push_sock);
+        #[cfg(unix)]
         let push_listener = std::os::unix::net::UnixListener::bind(&sub_push_sock).ok();
+        #[cfg(not(unix))]
+        let push_listener = std::net::TcpListener::bind("127.0.0.1:0").ok().map(|tcp| {
+            let addr_str = tcp
+                .local_addr()
+                .map(|a| a.to_string())
+                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+            let _ = std::fs::write(&sub_push_sock, addr_str.as_bytes());
+            tcp
+        });
         let push_thread = std::thread::spawn(move || {
             let _ = push_listener
                 .as_ref()
