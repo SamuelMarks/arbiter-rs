@@ -516,7 +516,6 @@ impl CaasLocalIpcServer {
     ///
     /// Returns [`ArbiterError::SocketBindError`] if binding the UDS socket fails, or an
     /// [`ArbiterError`] if `handle_ipc_json` rejects the request.
-    #[cfg(unix)]
     pub fn execute_uds_ipc_roundtrip(
         &mut self,
         socket_path: &std::path::Path,
@@ -2930,14 +2929,15 @@ mod tests {
         #[cfg(unix)]
         let push_listener = std::os::unix::net::UnixListener::bind(&sub_push_sock).ok();
         #[cfg(not(unix))]
-        let push_listener = std::net::TcpListener::bind("127.0.0.1:0").ok().map(|tcp| {
-            let addr_str = tcp
-                .local_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
-            let _ = std::fs::write(&sub_push_sock, addr_str.as_bytes());
-            tcp
-        });
+        let push_listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .ok()
+            .inspect(|tcp| {
+                let addr_str = tcp
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+                let _ = std::fs::write(&sub_push_sock, addr_str.as_bytes());
+            });
         let push_thread = std::thread::spawn(move || {
             let _ = push_listener
                 .as_ref()

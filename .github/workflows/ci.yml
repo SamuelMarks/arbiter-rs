@@ -231,7 +231,7 @@ jobs:
   # ---------------------------------------------------------------------------
   cross-target-matrix:
     name: "Cross-Target Check (${{ matrix.target }})"
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.target == 'aarch64-apple-darwin' && 'macos-latest' || 'ubuntu-latest' }}
     strategy:
       fail-fast: false
       matrix:
@@ -257,12 +257,33 @@ jobs:
       - name: Install C cross-compiler and archiver tools for ${{ matrix.target }}
         shell: bash
         run: |
-          if [[ "${{ matrix.target }}" == "riscv64gc-unknown-linux-gnu" ]]; then
-            sudo apt-get update
-            sudo apt-get install -y gcc-riscv64-linux-gnu
-          elif [[ "${{ matrix.target }}" == "x86_64-unknown-illumos" ]]; then
-            sudo ln -sf /usr/bin/ar /usr/local/bin/gar
-          fi
+          case "${{ matrix.target }}" in
+            x86_64-unknown-linux-musl)
+              sudo ln -sf /usr/bin/gcc /usr/local/bin/x86_64-linux-musl-gcc
+              sudo ln -sf /usr/bin/ar /usr/local/bin/x86_64-linux-musl-ar
+              ;;
+            aarch64-unknown-linux-gnu)
+              sudo apt-get update
+              sudo apt-get install -y gcc-aarch64-linux-gnu
+              ;;
+            aarch64-unknown-linux-musl)
+              sudo apt-get update
+              sudo apt-get install -y gcc-aarch64-linux-gnu
+              sudo ln -sf /usr/bin/aarch64-linux-gnu-gcc /usr/local/bin/aarch64-linux-musl-gcc
+              sudo ln -sf /usr/bin/aarch64-linux-gnu-ar /usr/local/bin/aarch64-linux-musl-ar
+              ;;
+            riscv64gc-unknown-linux-gnu)
+              sudo apt-get update
+              sudo apt-get install -y gcc-riscv64-linux-gnu
+              ;;
+            x86_64-unknown-illumos)
+              sudo ln -sf /usr/bin/ar /usr/local/bin/gar
+              ;;
+            x86_64-pc-windows-gnu)
+              sudo apt-get update
+              sudo apt-get install -y gcc-mingw-w64-x86-64
+              ;;
+          esac
 
       - name: Cache Cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2

@@ -109,7 +109,7 @@ impl HighSpeedFabricProbe {
     /// Host-discovered [`HighSpeedFabricProbe`].
     pub fn from_host() -> Self {
         let text = std::fs::read_to_string("/sys/class/infiniband/ports_summary")
-            .unwrap_or_else(|_| "mlx5_0:200:0:4\n".to_owned());
+            .unwrap_or("mlx5_0:200:0:4\n".to_owned());
         Self::from_sysfs_or_dladm_lines(&text, RdmaFabricKind::RoCEv2).unwrap_or(Self {
             probe_healthy: true,
             nics: Vec::new(),

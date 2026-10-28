@@ -1582,14 +1582,15 @@ mod tests {
         #[cfg(unix)]
         let uds_listener = std::os::unix::net::UnixListener::bind(&uds_path).ok();
         #[cfg(not(unix))]
-        let uds_listener = std::net::TcpListener::bind("127.0.0.1:0").ok().map(|tcp| {
-            let addr_str = tcp
-                .local_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
-            let _ = std::fs::write(&uds_path, addr_str.as_bytes());
-            tcp
-        });
+        let uds_listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .ok()
+            .inspect(|tcp| {
+                let addr_str = tcp
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+                let _ = std::fs::write(&uds_path, addr_str.as_bytes());
+            });
         let uds_srv = std::thread::spawn(move || {
             let _ = uds_listener
                 .as_ref()

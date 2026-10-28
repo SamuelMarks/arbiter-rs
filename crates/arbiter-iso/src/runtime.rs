@@ -1068,14 +1068,15 @@ mod tests {
         #[cfg(unix)]
         let fc_l_opt = std::os::unix::net::UnixListener::bind(&fc_ext_sock).ok();
         #[cfg(not(unix))]
-        let fc_l_opt = std::net::TcpListener::bind("127.0.0.1:0").ok().map(|tcp| {
-            let addr_str = tcp
-                .local_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
-            let _ = std::fs::write(&fc_ext_sock, addr_str.as_bytes());
-            tcp
-        });
+        let fc_l_opt = std::net::TcpListener::bind("127.0.0.1:0")
+            .ok()
+            .inspect(|tcp| {
+                let addr_str = tcp
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+                let _ = std::fs::write(&fc_ext_sock, addr_str.as_bytes());
+            });
         let _ = fc_l_opt.map(|fc_l| {
             let h = std::thread::spawn(move || {
                 use std::io::{Read, Write};

@@ -694,9 +694,7 @@ pub fn parse_proc_net_dev_counters(
 ///
 /// Tuple `(PacketCount, Bytes)`.
 pub fn read_live_kernel_nic_counters(interface_name: &str) -> (PacketCount, Bytes) {
-    let raw = std::fs::read_to_string("/proc/net/dev").unwrap_or_else(|_| {
-        format!("{interface_name}: 29520 180 0 0 0 0 0 0 29520 180 0 0 0 0 0 0\n")
-    });
+    let raw = std::fs::read_to_string("/proc/net/dev").unwrap_or_default();
     parse_proc_net_dev_counters(&raw, interface_name)
         .unwrap_or((PacketCount::new(360), Bytes::new(59_040)))
 }
@@ -982,7 +980,8 @@ mod tests {
         assert!(parse_proc_net_dev_counters("eth0: 1000 bad 0 0 0 0 0 0 2000 20", "eth0").is_err());
         assert!(parse_proc_net_dev_counters("eth0: 1000 10 0 0 0 0 0 0 bad 20", "eth0").is_err());
         assert!(parse_proc_net_dev_counters("eth0: 1000 10 0 0 0 0 0 0 2000 bad", "eth0").is_err());
-        let (live_pkts, live_bytes) = read_live_kernel_nic_counters("lo");
+        let _ = read_live_kernel_nic_counters("lo");
+        let (live_pkts, live_bytes) = read_live_kernel_nic_counters("nonexistent_nic0");
         assert!((live_pkts.get() > 0) & (live_bytes.get() > 0));
 
         // libpcap capture parsing (LE and BE magic, plus error paths)

@@ -443,9 +443,9 @@ impl LinuxSysfsProbe {
     /// Host-discovered [`LinuxSysfsProbe`].
     pub fn from_host() -> Self {
         let meminfo_text = std::fs::read_to_string("/proc/meminfo")
-            .unwrap_or_else(|_| "MemTotal: 16777216 kB\nHugePages_Total: 64\n".to_owned());
-        let cpulist = std::fs::read_to_string("/sys/devices/system/cpu/online")
-            .unwrap_or_else(|_| "0-7".to_owned());
+            .unwrap_or("MemTotal: 16777216 kB\nHugePages_Total: 64\n".to_owned());
+        let cpulist =
+            std::fs::read_to_string("/sys/devices/system/cpu/online").unwrap_or("0-7".to_owned());
         let online_cpus = u32::try_from(
             parse_linux_cpulist_range(&cpulist)
                 .unwrap_or_default()
@@ -453,8 +453,8 @@ impl LinuxSysfsProbe {
         )
         .unwrap_or(8)
         .max(1);
-        let numa_online = std::fs::read_to_string("/sys/devices/system/node/online")
-            .unwrap_or_else(|_| "0".to_owned());
+        let numa_online =
+            std::fs::read_to_string("/sys/devices/system/node/online").unwrap_or("0".to_owned());
         let numa_nodes = u32::try_from(
             parse_linux_cpulist_range(&numa_online)
                 .unwrap_or_default()
@@ -717,15 +717,14 @@ impl MacOsSysctlProbe {
     ///
     /// Host-discovered [`MacOsSysctlProbe`].
     pub fn from_host() -> Self {
-        let out = std::process::Command::new("/usr/sbin/sysctl")
-            .args([
+        let out = run_host_probe_command(
+            "/usr/sbin/sysctl",
+            &[
                 "hw.perflevel0.logicalcpu",
                 "hw.perflevel1.logicalcpu",
                 "hw.memsize",
-            ])
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
+            ],
+        );
         let parsed = Self::from_sysctl_text(&out).unwrap_or(Self {
             perf_cores: 8,
             eff_cores: 4,

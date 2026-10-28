@@ -2910,14 +2910,15 @@ mod tests {
         #[cfg(unix)]
         let listener = std::os::unix::net::UnixListener::bind(&uds_path).ok();
         #[cfg(not(unix))]
-        let listener = std::net::TcpListener::bind("127.0.0.1:0").ok().map(|tcp| {
-            let addr_str = tcp
-                .local_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
-            let _ = std::fs::write(&uds_path, addr_str.as_bytes());
-            tcp
-        });
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .ok()
+            .inspect(|tcp| {
+                let addr_str = tcp
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+                let _ = std::fs::write(&uds_path, addr_str.as_bytes());
+            });
         let uds_str = uds_path.to_string_lossy().into_owned();
         agent.executor_sockets.insert(ex_id.clone(), uds_str);
 
@@ -2964,14 +2965,15 @@ mod tests {
         #[cfg(unix)]
         let bad_listener = std::os::unix::net::UnixListener::bind(&bad_uds_path).ok();
         #[cfg(not(unix))]
-        let bad_listener = std::net::TcpListener::bind("127.0.0.1:0").ok().map(|tcp| {
-            let addr_str = tcp
-                .local_addr()
-                .map(|a| a.to_string())
-                .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
-            let _ = std::fs::write(&bad_uds_path, addr_str.as_bytes());
-            tcp
-        });
+        let bad_listener = std::net::TcpListener::bind("127.0.0.1:0")
+            .ok()
+            .inspect(|tcp| {
+                let addr_str = tcp
+                    .local_addr()
+                    .map(|a| a.to_string())
+                    .unwrap_or_else(|_| "127.0.0.1:0".to_owned());
+                let _ = std::fs::write(&bad_uds_path, addr_str.as_bytes());
+            });
         agent
             .executor_sockets
             .insert(ex_id, bad_uds_path.to_string_lossy().into_owned());

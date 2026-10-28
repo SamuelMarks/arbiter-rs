@@ -105,8 +105,7 @@ impl GoogleTpuProbe {
     ///
     /// Host-discovered [`GoogleTpuProbe`].
     pub fn from_host() -> Self {
-        let bounds =
-            std::env::var("TPU_CHIPS_PER_HOST_BOUNDS").unwrap_or_else(|_| "2,2,1".to_owned());
+        let bounds = std::env::var("TPU_CHIPS_PER_HOST_BOUNDS").unwrap_or("2,2,1".to_owned());
         Self::from_tpu_env_bounds(&bounds, "slice-host-0", TpuGeneration::CloudTpuV5p)
             .unwrap_or_default()
     }

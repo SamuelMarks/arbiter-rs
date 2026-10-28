@@ -410,7 +410,7 @@ impl NvidiaNvmlProbe {
     /// Host-discovered [`NvidiaNvmlProbe`].
     pub fn from_host() -> Self {
         let csv_out = std::fs::read_to_string("/proc/driver/nvidia/smi_summary")
-            .unwrap_or_else(|_| "0, NVIDIA H100, 81920, 0\n".to_owned());
+            .unwrap_or("0, NVIDIA H100, 81920, 0\n".to_owned());
         Self::from_nvidia_smi_csv(&csv_out).unwrap_or_default()
     }
 
@@ -559,7 +559,7 @@ impl AmdRocmProbe {
     /// Host-discovered [`AmdRocmProbe`].
     pub fn from_host() -> Self {
         let kfd_text = std::fs::read_to_string("/sys/class/kfd/kfd/topology/nodes/summary")
-            .unwrap_or_else(|_| "gpu_nodes=1\nvram_mib=196608\n".to_owned());
+            .unwrap_or("gpu_nodes=1\nvram_mib=196608\n".to_owned());
         Self::from_rocm_kfd_summary(&kfd_text).unwrap_or(Self {
             rocm_available: true,
             device_count: 1,
@@ -621,11 +621,10 @@ impl AppleMetalProbe {
     ///
     /// Host-discovered [`AppleMetalProbe`].
     pub fn from_host() -> Self {
-        let sp_out = std::process::Command::new("/usr/sbin/system_profiler")
-            .arg("SPDisplaysDataType")
-            .output()
-            .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-            .unwrap_or_default();
+        let sp_out = crate::cpu::run_host_probe_command(
+            "/usr/sbin/system_profiler",
+            &["SPDisplaysDataType"],
+        );
         let parsed = Self::from_system_profiler_summary(&sp_out).unwrap_or(Self {
             metal_available: true,
             gpu_cores: 40,
