@@ -520,7 +520,7 @@ mod tests {
         );
         assert!(HighSpeedFabricProbe::from_host().probe_fabric().is_ok());
         let strict_empty_ib = HighSpeedFabricProbe::from_host_strict_with_dir(
-            std::path::Path::new("/dev/null/missing_ib"),
+            std::path::Path::new("/dev/null\0/missing_ib"),
             RdmaFabricKind::InfiniBand,
         );
         assert!(strict_empty_ib.nics.is_empty());
@@ -536,7 +536,7 @@ mod tests {
 
         assert!(
             HighSpeedFabricProbe::discover_infiniband_from_sysfs_dir(
-                std::path::Path::new("/dev/null/missing_ib"),
+                std::path::Path::new("/dev/null\0/missing_ib"),
                 RdmaFabricKind::InfiniBand
             )
             .is_err()

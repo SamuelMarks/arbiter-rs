@@ -1172,7 +1172,7 @@ impl AgentSupervisor {
                 )?;
                 output_paths.append(&mut extracted);
             } else {
-                let filename = art.uri.rsplit('/').next().unwrap_or("artifact.bin");
+                let filename = art.uri.rsplit(['/', '\\']).next().unwrap_or("artifact.bin");
                 let entries = [(filename, payload.as_slice())];
                 let tid_str = task.task_id.as_str();
                 let cache_ref = &mut self.artifact_cache;
@@ -2457,7 +2457,7 @@ mod tests {
         assert!(
             agent
                 .write_checkpoint_directory(
-                    std::path::Path::new("/dev/null/bad_ckpt_dir"),
+                    std::path::Path::new("/dev/null\0/bad_ckpt_dir"),
                     "boot-1"
                 )
                 .is_err()
@@ -2615,7 +2615,7 @@ mod tests {
                 .fetch_and_materialize_task_artifacts(
                     &bad_sbox_t,
                     &storage,
-                    "/dev/null/impossible_sbox"
+                    "/dev/null\0/impossible_sbox"
                 )
                 .is_err()
         );

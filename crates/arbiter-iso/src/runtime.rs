@@ -943,7 +943,7 @@ mod tests {
         let ok_dyn2: &mut dyn FnMut(&str) -> ArbiterResult<String> = &mut ok_runner;
         assert!(
             oci.execute_oci_lifecycle_with_runner(
-                std::path::Path::new("/dev/null/bad_bundle"),
+                std::path::Path::new("/dev/null\0/bad_bundle"),
                 &tid,
                 &limits,
                 ok_dyn2
@@ -952,7 +952,7 @@ mod tests {
         );
         assert!(
             oci.write_bundle_and_lifecycle_commands(
-                std::path::Path::new("/dev/null/bad_bundle"),
+                std::path::Path::new("/dev/null\0/bad_bundle"),
                 &tid,
                 &limits
             )
@@ -1044,7 +1044,7 @@ mod tests {
         );
         assert!(
             vm.execute_firecracker_uds_roundtrip(
-                std::path::Path::new("/dev/null/bad_fc.sock"),
+                std::path::Path::new("/dev/null\0/bad_fc.sock"),
                 &tid,
                 &limits
             )
@@ -1057,7 +1057,7 @@ mod tests {
         );
         assert!(
             vm.send_firecracker_uds_http_request(
-                std::path::Path::new("/dev/null/bad_fc_cli.sock"),
+                std::path::Path::new("/dev/null\0/bad_fc_cli.sock"),
                 &tid,
                 &limits
             )

@@ -1909,8 +1909,13 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&sbox_dir);
         assert!(
-            write_and_rotate_sandbox_logs(std::path::Path::new("/dev/null/bad_sbox"), "a", "b", 16)
-                .is_err()
+            write_and_rotate_sandbox_logs(
+                std::path::Path::new("/dev/null\0/bad_sbox"),
+                "a",
+                "b",
+                16
+            )
+            .is_err()
         );
 
         let mut esc_exec =
@@ -2256,7 +2261,7 @@ mod tests {
         assert!(
             sup.drain_child_stdio_to_sandbox(
                 stdio_pid,
-                std::path::Path::new("/dev/null/impossible"),
+                std::path::Path::new("/dev/null\0/impossible"),
                 &mut ring
             )
             .is_err()

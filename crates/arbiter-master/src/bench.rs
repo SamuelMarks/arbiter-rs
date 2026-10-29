@@ -1143,8 +1143,8 @@ pub fn run_live_multiprocess_failover_benchmark(
     }
     let mut children = Vec::with_capacity(node_count.get() as usize);
     for _ in 0..node_count.get() {
-        let _ = std::process::Command::new("sh")
-            .args(["-c", "sleep 30"])
+        let _ = std::process::Command::new("sleep")
+            .arg("2")
             .spawn()
             .map(|child| children.push(child));
     }

@@ -1325,7 +1325,7 @@ MemFree: 1024 kB
     fn test_cpu_probes_from_host() {
         // Verify live from_host() constructors and HostSystemProbe across all 5 OS CPU probes
         assert!(run_host_probe_command("echo", &["probe_ok"]).contains("probe_ok"));
-        assert!(run_host_probe_command("/dev/null/nonexistent_probe_bin", &[]).is_empty());
+        assert!(run_host_probe_command("/dev/null\0/nonexistent_probe_bin", &[]).is_empty());
         assert!(LinuxSysfsProbe::from_host().probe_system().is_ok());
         assert!(FreeBsdSysctlProbe::from_host().probe_system().is_ok());
         assert!(
@@ -1423,7 +1423,7 @@ MemFree: 1024 kB
         assert_eq!(exts_amx.len(), 2);
 
         assert!(
-            discover_linux_numa_sysfs_dir(std::path::Path::new("/dev/null/missing_node_dir"))
+            discover_linux_numa_sysfs_dir(std::path::Path::new("/dev/null\0/missing_node_dir"))
                 .is_err()
         );
         let node_dir = std::env::temp_dir().join("arbiter_linux_numa_sysfs_test");
@@ -1456,7 +1456,8 @@ MemFree: 1024 kB
         assert!(parse_freebsd_topology_spec_xml("<cpus count=\"bad\"/>").is_err());
 
         assert!(
-            discover_linux_mm_hugepages_dir(std::path::Path::new("/dev/null/missing_hp")).is_err()
+            discover_linux_mm_hugepages_dir(std::path::Path::new("/dev/null\0/missing_hp"))
+                .is_err()
         );
         let hp_dir = std::env::temp_dir().join("arbiter_linux_mm_hp_test");
         let _ = std::fs::remove_dir_all(&hp_dir);

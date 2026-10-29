@@ -1238,8 +1238,9 @@ mod tests {
                 .is_ok()
         );
         let _ = NvidiaNvmlProbe::from_host_strict();
-        let nv_strict_missing =
-            NvidiaNvmlProbe::from_host_strict_with_path(std::path::Path::new("/dev/null/missing"));
+        let nv_strict_missing = NvidiaNvmlProbe::from_host_strict_with_path(std::path::Path::new(
+            "/dev/null\0/missing",
+        ));
         assert!(nv_strict_missing.devices.is_empty());
         let smi_tmp = std::env::temp_dir().join("arbiter_smi_strict_test.csv");
         let _ = std::fs::write(&smi_tmp, "0, NVIDIA H100, 81920, 0\n");
@@ -1253,11 +1254,12 @@ mod tests {
         );
         let _ = std::fs::remove_file(&smi_tmp);
 
-        let amd_strict_missing =
-            AmdRocmProbe::from_host_strict_with_dir(std::path::Path::new("/dev/null/missing_kfd"));
+        let amd_strict_missing = AmdRocmProbe::from_host_strict_with_dir(std::path::Path::new(
+            "/dev/null\0/missing_kfd",
+        ));
         assert_eq!(amd_strict_missing.device_count, 0);
         let intel_strict_missing = IntelLevelZeroProbe::from_host_strict_with_dir(
-            std::path::Path::new("/dev/null/missing_xe"),
+            std::path::Path::new("/dev/null\0/missing_xe"),
         );
         assert_eq!(intel_strict_missing.tile_count, 0);
 
@@ -1278,7 +1280,7 @@ mod tests {
 
         // Test discover_gpus_from_sysfs_dir across NVIDIA (0x10de), AMD (0x1002), and Intel (0x8086)
         assert!(
-            discover_gpus_from_sysfs_dir(std::path::Path::new("/dev/null/missing_drm")).is_err()
+            discover_gpus_from_sysfs_dir(std::path::Path::new("/dev/null\0/missing_drm")).is_err()
         );
         let drm_dir = std::env::temp_dir().join("arbiter_sysfs_drm_test");
         let _ = std::fs::remove_dir_all(&drm_dir);
@@ -1303,12 +1305,14 @@ mod tests {
         let _ = std::fs::create_dir_all(drm_dir.join("card2").join("gt").join("other"));
         let xe_probe = discover_intel_xe_tiles_dir(&drm_dir).unwrap_or(xpu_intel);
         assert_eq!(xe_probe.tile_count, 2);
-        assert!(discover_intel_xe_tiles_dir(std::path::Path::new("/dev/null/missing_xe")).is_err());
+        assert!(
+            discover_intel_xe_tiles_dir(std::path::Path::new("/dev/null\0/missing_xe")).is_err()
+        );
         let _ = std::fs::remove_dir_all(&drm_dir);
 
         // AMD KFD topology directory discovery
         assert!(
-            discover_rocm_kfd_nodes_dir(std::path::Path::new("/dev/null/missing_kfd")).is_err()
+            discover_rocm_kfd_nodes_dir(std::path::Path::new("/dev/null\0/missing_kfd")).is_err()
         );
         let kfd_dir = std::env::temp_dir().join("arbiter_kfd_nodes_test");
         let _ = std::fs::remove_dir_all(&kfd_dir);

@@ -4133,7 +4133,7 @@ mod tests {
         assert!(sqlite_store.driver.recover_from_disk().is_err());
         let _ = std::fs::remove_file(&sqlite_tmp);
         assert!(sqlite_store.driver.recover_from_disk().is_err());
-        sqlite_store.driver.db_path = "/dev/null/impossible_dir/test.db".to_owned();
+        sqlite_store.driver.db_path = "/dev/null\0/impossible_dir/test.db".to_owned();
         assert!(sqlite_store.driver.checkpoint_wal_to_disk().is_err());
         assert!(sqlite_store.driver.sync_to_rusqlite_engine().is_err());
         assert!(sqlite_store.driver.load_from_rusqlite_engine().is_err());

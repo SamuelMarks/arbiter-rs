@@ -1088,7 +1088,7 @@ mod tests {
         }
         let _ = std::fs::remove_dir_all(&wal_tmp);
         let mut cfg_raft_ro = custom.clone();
-        "/dev/null/impossible_wal_dir".clone_into(&mut cfg_raft_ro.wal_dir);
+        "/dev/null\0/impossible_wal_dir".clone_into(&mut cfg_raft_ro.wal_dir);
         "raft".clone_into(&mut cfg_raft_ro.state_store);
         let mut sig_ro = BoundedTickSignalSource {
             max_ticks: 1,

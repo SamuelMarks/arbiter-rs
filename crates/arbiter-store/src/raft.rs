@@ -2837,11 +2837,11 @@ mod tests {
         assert!(fs_wal.read_hard_state().is_err());
         assert!(fs_wal.read_wal_entries().is_err());
         assert!(
-            FileSystemWalBackend::open(std::path::Path::new("/dev/null/impossible_subdir"))
+            FileSystemWalBackend::open(std::path::Path::new("/dev/null\0/impossible_subdir"))
                 .is_err()
         );
         let mut bad_fs_wal = FileSystemWalBackend {
-            dir_path: std::path::PathBuf::from("/dev/null/impossible_subdir"),
+            dir_path: std::path::PathBuf::from("/dev/null\0/impossible_subdir"),
         };
         assert!(
             bad_fs_wal
@@ -3150,7 +3150,7 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&rot_dir);
         let bad_rot_wal = FileSystemWalBackend {
-            dir_path: std::path::PathBuf::from("/dev/null/impossible_dir"),
+            dir_path: std::path::PathBuf::from("/dev/null\0/impossible_dir"),
         };
         assert!(
             bad_rot_wal
@@ -3160,7 +3160,8 @@ mod tests {
 
         // Test WalDirectoryManager multi-segment rotation, CRC32 verification, and snapshot compaction
         assert!(
-            WalDirectoryManager::open(std::path::Path::new("/dev/null/impossible_dir"), 2).is_err()
+            WalDirectoryManager::open(std::path::Path::new("/dev/null\0/impossible_dir"), 2)
+                .is_err()
         );
         let mgr_dir = std::env::temp_dir().join("arbiter_wal_dir_mgr_test");
         let _ = std::fs::remove_dir_all(&mgr_dir);
@@ -3195,7 +3196,7 @@ mod tests {
 
         let mut bad_mgr = WalDirectoryManager {
             backend: FileSystemWalBackend {
-                dir_path: std::path::PathBuf::from("/dev/null/impossible_dir"),
+                dir_path: std::path::PathBuf::from("/dev/null\0/impossible_dir"),
             },
             active_segment_seq: 1,
             max_entries_per_segment: 1,
@@ -3408,7 +3409,7 @@ mod tests {
         assert_eq!(chunks, Ok(2));
 
         // Test RedbWalBackend ACID persistence and OpenRaftMembershipAdapter
-        assert!(RedbWalBackend::open(std::path::Path::new("/dev/null/bad.redb")).is_err());
+        assert!(RedbWalBackend::open(std::path::Path::new("/dev/null\0/bad.redb")).is_err());
         let redb_path = std::env::temp_dir().join("arbiter_raft_redb_wal_test.redb");
         let _ = std::fs::remove_file(&redb_path);
         let _ = RedbWalBackend::open(&redb_path).map(|mut redb_wal| {

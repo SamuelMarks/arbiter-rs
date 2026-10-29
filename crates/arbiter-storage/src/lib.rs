@@ -2911,7 +2911,7 @@ mod tests {
         assert!(
             cache
                 .stage_and_verify_blob_file(
-                    std::path::Path::new("/dev/null/bad_cache_dir"),
+                    std::path::Path::new("/dev/null\0/bad_cache_dir"),
                     &blob_spec,
                     &[b"abc", b"def"]
                 )
@@ -3034,7 +3034,7 @@ mod tests {
         }
         assert!(
             vmgr.execute_csi_uds_rpc(
-                std::path::Path::new("/dev/null/bad_csi.sock"),
+                std::path::Path::new("/dev/null\0/bad_csi.sock"),
                 CsiNodeOperation::NodeStageVolume,
                 &vid,
                 "/mnt"
@@ -3124,7 +3124,7 @@ mod tests {
             mat.unpack_archive_into_sandbox("https://x/a.tar", "t1", &[("../bad", b"x")])
                 .is_err()
         );
-        let bad_mat = SandboxMaterializer::new("/dev/null/impossible_sbox");
+        let bad_mat = SandboxMaterializer::new("/dev/null\0/impossible_sbox");
         assert!(
             bad_mat
                 .unpack_archive_into_sandbox("https://x/a.tar", "t1", &[("f.txt", b"x")])
@@ -3219,7 +3219,7 @@ mod tests {
             )
             .is_err()
         );
-        let bad_mat = SandboxMaterializer::new("/dev/null/impossible_root");
+        let bad_mat = SandboxMaterializer::new("/dev/null\0/impossible_root");
         assert!(
             bad_mat
                 .fetch_and_materialize_archive(
@@ -3393,7 +3393,7 @@ mod tests {
         let _ = std::fs::remove_file(&ext_sock);
         assert!(
             vmgr.execute_external_csi_uds_client(
-                std::path::Path::new("/dev/null/missing_csi.sock"),
+                std::path::Path::new("/dev/null\0/missing_csi.sock"),
                 CsiNodeOperation::NodePublishVolume,
                 &vid,
                 "/mnt/data"
@@ -3465,7 +3465,7 @@ mod tests {
                 .is_err()
         );
         // Unwritable destination rejected
-        let bad_mat = SandboxMaterializer::new("/dev/null/impossible_sbox");
+        let bad_mat = SandboxMaterializer::new("/dev/null\0/impossible_sbox");
         assert!(
             bad_mat
                 .extract_ustar_bytes_into_sandbox("t-ustar", &tar_bytes, false)
@@ -3685,7 +3685,7 @@ mod tests {
                 .deduplicate_blob_to_sandbox_via_hardlink_or_cow(
                     &tmp_dir,
                     &digest,
-                    std::path::Path::new("/dev/null/impossible_link")
+                    std::path::Path::new("/dev/null\0/impossible_link")
                 )
                 .is_err()
         );
@@ -3849,7 +3849,7 @@ mod tests {
             mat.extract_tar_archive_with_crate("t-empty-tar", &zero_tar, false),
             Ok(Vec::new())
         );
-        let bad_mat = SandboxMaterializer::new("/dev/null/impossible_sbox");
+        let bad_mat = SandboxMaterializer::new("/dev/null\0/impossible_sbox");
         assert!(
             bad_mat
                 .extract_tar_archive_with_crate("t-crate-tar", &crate_tar, false)
@@ -4031,7 +4031,7 @@ mod tests {
         );
         assert!(
             UnixSocketCsiClient::apply_oci_layer_with_whiteouts(
-                std::path::Path::new("/dev/null/bad_wh"),
+                std::path::Path::new("/dev/null\0/bad_wh"),
                 &[("a.txt", b"x")]
             )
             .is_err()

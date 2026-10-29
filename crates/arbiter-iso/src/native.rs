@@ -1193,10 +1193,10 @@ mod tests {
         assert!(linux_fs.isolate(&tid, 999).is_ok());
         let _ = std::fs::remove_dir_all(&tmp_cg);
         assert!(
-            FilesystemOsSyscallBackend::open(std::path::Path::new("/dev/null/bad_cg")).is_err()
+            FilesystemOsSyscallBackend::open(std::path::Path::new("/dev/null\0/bad_cg")).is_err()
         );
         let mut bad_fs_backend = FilesystemOsSyscallBackend {
-            root_dir: std::path::PathBuf::from("/dev/null/bad_cg"),
+            root_dir: std::path::PathBuf::from("/dev/null\0/bad_cg"),
         };
         assert!(bad_fs_backend.invoke_os_op("cgroup2", "cmd").is_err());
         // Test write error when control.ops is a directory
@@ -1341,7 +1341,7 @@ mod tests {
     fn test_live_os_syscall_backend_error_paths() {
         let tid = TaskId::new("t-fs-1").unwrap_or_default();
         let limits = ResourceBundle::zero();
-        let mut bad_live = LiveOsSyscallBackend::new(std::path::Path::new("/dev/null/bad_live"));
+        let mut bad_live = LiveOsSyscallBackend::new(std::path::Path::new("/dev/null\0/bad_live"));
         assert!(bad_live.write_cgroup_v2_knobs(&tid, &limits, 1).is_err());
         assert!(
             bad_live

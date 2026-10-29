@@ -2412,7 +2412,11 @@ mod tests {
         assert!(!matches!(acq_resp, CaasIpcResponse::Subscribed { .. }));
         assert!(
             ipc_srv
-                .execute_uds_ipc_roundtrip(std::path::Path::new("/dev/null/bad.sock"), &acq_req, 50)
+                .execute_uds_ipc_roundtrip(
+                    std::path::Path::new("/dev/null\0/bad.sock"),
+                    &acq_req,
+                    50
+                )
                 .is_err()
         );
 
@@ -2448,7 +2452,7 @@ mod tests {
             Ok(None)
         );
         let _ = std::fs::remove_file(&wd_path);
-        let bad_wd = std::path::Path::new("/dev/null/impossible_wd");
+        let bad_wd = std::path::Path::new("/dev/null\0/impossible_wd");
         assert!(
             ipc_srv
                 .pet_or_trip_hardware_watchdog(bad_wd, 100, tok2)
@@ -2498,9 +2502,9 @@ mod tests {
 
         // Test PersistentCaasUdsServer + CaasLeaseClient across separate UDS sockets
         assert!(
-            PersistentCaasUdsServer::bind("/dev/null/impossible.sock", ipc_srv.clone()).is_err()
+            PersistentCaasUdsServer::bind("/dev/null\0/impossible.sock", ipc_srv.clone()).is_err()
         );
-        let bad_caas_cli = CaasLeaseClient::new("/dev/null/impossible.sock");
+        let bad_caas_cli = CaasLeaseClient::new("/dev/null\0/impossible.sock");
         assert!(bad_caas_cli.send_ipc_request(&acq_req).is_err());
 
         let persist_sock_path = std::env::temp_dir().join("arbiter_persist_caas_uds.sock");
@@ -2559,7 +2563,7 @@ mod tests {
         );
         let _ = std::fs::remove_file(&wd_dev_path);
         let mut bad_hw_wd =
-            HardwareWatchdogDriver::new(std::path::Path::new("/dev/null/impossible_wd"));
+            HardwareWatchdogDriver::new(std::path::Path::new("/dev/null\0/impossible_wd"));
         assert!(bad_hw_wd.tick_watchdog(&mut ipc_srv, 100, tok2).is_err());
 
         // Test NvmePersistentReservationDriver
@@ -2956,7 +2960,7 @@ mod tests {
         assert!(
             srv_exec
                 .push_notifications_to_uds_subscribers(&[std::path::Path::new(
-                    "/dev/null/bad_sub.sock"
+                    "/dev/null\0/bad_sub.sock"
                 )])
                 .is_err()
         );
@@ -3099,7 +3103,7 @@ mod tests {
                 .handle_push_notification(&notify_demote, "192.168.56.102", 5432, &mut pg_exec)
                 .is_err()
         );
-        pg_hook.pgdata_dir = std::path::PathBuf::from("/dev/null/impossible_pgdata");
+        pg_hook.pgdata_dir = std::path::PathBuf::from("/dev/null\0/impossible_pgdata");
         assert!(
             pg_hook
                 .handle_push_notification(&notify_peer, "192.168.56.101", 5432, &mut pg_exec)

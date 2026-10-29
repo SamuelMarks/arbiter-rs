@@ -336,7 +336,7 @@ mod tests {
         );
         assert!(GoogleTpuProbe::from_host().probe_tpus().is_ok());
         let strict_empty_tpu = GoogleTpuProbe::from_host_strict_with_dir(
-            std::path::Path::new("/dev/null/missing_accel"),
+            std::path::Path::new("/dev/null\0/missing_accel"),
             "s1",
         );
         assert!(strict_empty_tpu.records.is_empty());
@@ -350,7 +350,7 @@ mod tests {
 
         assert!(
             GoogleTpuProbe::discover_tpus_from_sysfs_dir(
-                std::path::Path::new("/dev/null/missing_accel"),
+                std::path::Path::new("/dev/null\0/missing_accel"),
                 "s1"
             )
             .is_err()
